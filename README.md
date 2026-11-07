@@ -1,0 +1,157 @@
+# Mac — a voice agent that lives in your menu bar
+
+Say **"Hey Mac, …"** and your Mac does it: searches the web in your own Chrome, drafts and sends
+email, works across apps (Mail → WhatsApp → send), finds people on LinkedIn, reads your screen,
+runs commands — and talks back like a human assistant while it works. It can also *teach*:
+"Hey Mac, teach me consistent hashing" turns it into a conversational tutor.
+
+The brain is **Claude** (the full Claude Code agent loop, through the Claude Agent SDK) using
+your own Claude login. Everything else — wake word, speech recognition, voice — runs **locally
+and free** on Apple Silicon.
+
+- Wake word, STT and TTS are on-device (sherpa-onnx + Parakeet, Kokoro). Nothing is sent
+  anywhere except your conversation with Claude.
+- Always on with a small idle footprint (the app idles at ~1 % and the daemon at ~5 % of one core; ~1.8 GB RAM with
+  all speech models resident): the Claude process starts when you say the wake word and shuts
+  itself down after 10 idle minutes.
+- A real **Off** switch releases the microphone entirely; **Mute** keeps it open but deaf.
+- Safety by capability, not by prompt: anything irreversible (send, post, pay, delete, upload)
+  is blocked by a hook until you say **"yes"** to a spoken summary of that exact action.
+- Optional: talk to your Mac from your phone over LiveKit (QR code, 15-minute link, spoken PIN).
+- **Give Mac your voice**: record 15 seconds (or pick a file) in the *Voice…* panel and Mac answers
+  in that voice — cloned locally with Kyutai Pocket TTS (free, ~200 ms to first audio). Short
+  fillers stay on Kokoro, and anything the clone can't handle falls back to it automatically.
+
+## Requirements
+
+- Apple Silicon Mac, macOS 14 or newer (built and tested on macOS 26).
+- [Claude Code](https://docs.claude.com/claude-code) installed and signed in (`claude`), **or**
+  an Anthropic API key (see *Authentication*).
+- Google Chrome with the **Claude in Chrome** extension paired (for browser tasks; optional).
+- ~800 MB disk for speech models (downloaded on install), ~1.8 GB RAM while running.
+- If you want Mac to answer while the display is off, set *Prevent automatic sleeping when the
+  display is off* in System Settings → Battery/Energy (`macctl doctor` warns if system sleep is on).
+
+## Install
+
+```bash
+git clone https://github.com/<you>/Mac.git && cd Mac
+./install.sh
+```
+
+The installer checks your Mac, installs `uv` if needed, sets up the Python daemon, downloads the
+speech models (~700 MB), builds and signs `Mac.app`, installs it to `~/Applications`, and opens it.
+The **Meet Mac** window then walks you through the permissions (Microphone, Accessibility,
+Automation, Screen Recording, Notifications) and checks that Claude Code is signed in and
+Chrome is paired. Then say *"Hey Mac, what can you do?"*
+
+Flags: `--yes` (non-interactive) · `--no-models` · `--no-open` · `--app-only` · `--uninstall`.
+
+## Using it
+
+| Say | Mac does |
+|---|---|
+| "Hey Mac, what's on my calendar tomorrow?" | answers by voice |
+| "Hey Mac, find me 20 product managers in Bangalore on LinkedIn" | drives Chrome, narrates progress, reads the names, saves the list to `~/Documents/Mac/`, notifies you |
+| "Hey Mac, draft an email to Sam about the demo" → "paste it in WhatsApp to Sam" → "looks good, send it" | multi-app flow; the send waits for your spoken **yes** |
+| "Hey Mac, teach me system design interviews" | tutor mode, in short spoken chunks |
+| "stop" / "never mind" (while Mac is talking) | stops immediately |
+| "Hey Mac, go to sleep" | turns listening off (menu bar → Turn On to wake) |
+
+After Mac answers, you have a few seconds to follow up **without** the wake word.
+Menu bar: Talk to Mac (⌥Space push-to-talk), Stop, Turn Off/On, Mute, New Conversation,
+Talk from Phone…, Permissions…, Launch at Login, logs, settings.
+
+Command line (`macctl` is linked into `~/.local/bin`):
+
+```
+macctl status | ask "text" [--wait] | say "text" | stop | mute on|off | listen
+macctl off | on | reset | remote-link | remote-end | logs | doctor [--deep] | models
+macctl voice set sample.wav | voice reset | voice status   # voice cloning (Pocket TTS)
+macctl secret set LIVEKIT_URL      # secrets live in the macOS Keychain
+```
+
+## Settings
+
+Menu bar → **Settings…** (⌘,), also shown right after onboarding:
+
+- **General** — Mac's name (the wake word follows it: "Hey Jarvis"), your name, the language Mac
+  speaks (English US/UK, Spanish, French, Hindi, Italian, Japanese, Portuguese, Chinese — you
+  still speak English for now), idle shutdown, follow-up window, launch at login.
+- **Voice** — 54 built-in voices with ▶ preview, speed, and your cloned voice.
+- **Appearance** — your picture (Mac's portrait), HUD position.
+- **Permissions**, **Phone**, **Advanced** (Chrome, your own Claude MCP servers/skills, results
+  folder, config and logs).
+
+By voice: "Hey Mac, change your name to Jarvis", "use your default voice".
+CLI: `macctl settings get`, `macctl settings set tts.voice=bm_george tts.speed=1.1`, `macctl voices`,
+`macctl voice preview af_sky`.
+
+## Authentication
+
+- **Default (`auth = "claude_cli"`)**: Mac runs your installed `claude` with your own login.
+  Anthropic's Agent SDK terms say third-party products may not *offer* claude.ai login to their
+  users without approval — Mac is an open-source tool you install on your own machine with your
+  own account; if you distribute a build to others, read those terms.
+- **API key (`auth = "api_key"`)**: `macctl secret set ANTHROPIC_API_KEY`, then set
+  `auth = "api_key"` under `[brain]` in `~/.mac-agent/config.toml`.
+
+## Configuration
+
+`~/.mac-agent/config.toml` (created with defaults on first run; `MAC_*` env vars override).
+Notable keys: `wake.phrases` (default `["hey mac", "ok mac"]`), `listen.silence_ms`,
+`listen.followup_s`, `tts.voice`, `tts.engine` (`kokoro` | `clone`; the *Voice…* panel sets it), `brain.idle_shutdown_min`, `brain.setting_sources`
+(`["user"]` loads your own `~/.claude` MCP servers, skills and plugins into Mac; `[]` isolates),
+`results_dir` (`~/Documents/Mac`), `remote.enabled`.
+
+## How it works
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) (design, concurrency model, safety model, latency
+budget) and [docs/DESIGN.md](docs/DESIGN.md) (UI). Short version:
+
+```
+Mac.app (Swift)  ── mic w/ echo cancellation ──►  macd (Python)
+   menu bar, HUD, permissions,                    wake word → VAD → STT → orchestrator
+   supervises the daemon                          → Claude (Agent SDK, --chrome) → TTS
+                 ◄── speech audio ────────────────  safety hook gates outward actions
+```
+
+Everything irreversible goes through a `PreToolUse` hook that classifies each tool call
+(shell commands are parsed, script files are read, the frontmost app and current browser tab
+are checked). An outward action is refused until the orchestrator has heard you say "yes" to a
+spoken summary; the resulting token is bound to that one action and expires in 120 s.
+Prompt injection from web pages cannot bypass it, because the model never holds the token.
+
+## Development
+
+```bash
+make app          # build + sign build/Mac.app
+make test         # Swift + Python tests
+cd daemon && uv run pytest -q -m "not live and not models"   # fast unit suite
+cd daemon && uv run pytest -q -m models                       # needs downloaded models
+cd daemon && uv run pytest -q -m live                         # needs claude login / LiveKit creds
+uv run macd --audio sounddevice   # headless daemon (permissions attribute to your terminal)
+```
+
+Reviews that shaped the code (architecture, code quality, simplicity, UX) are in `docs/reviews/`.
+
+## Memory
+
+Mac keeps a small `~/.mac-agent/workspace/memory.md` — your name, how you like answers, your
+projects, people you mention, recurring tasks — and updates it on its own from what *you* say
+(never from web pages or documents it reads). Ask "what do you remember about me?" or say
+"forget that". Before a conversation is retired, Mac writes a short "recent context" note so
+"what were we doing?" works after a restart.
+
+## Privacy & safety
+
+Audio never leaves your Mac. Your requests, the text Claude produces and tool results go to
+Anthropic as part of your Claude session. Web pages, emails and documents Mac reads are treated
+as untrusted data; the safety hook, not the prompt, decides what can leave your machine.
+Secrets live in the Keychain. Logs are in `~/Library/Logs/Mac/`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Speech models carry their own licenses (sherpa-onnx: Apache-2.0;
+Parakeet: CC-BY-4.0; Kokoro: Apache-2.0; Silero VAD: MIT; Kyutai Pocket TTS weights: CC-BY-4.0 —
+only clone voices you own or have permission to use).

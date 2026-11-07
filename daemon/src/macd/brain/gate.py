@@ -1,0 +1,1197 @@
+"""Safety gate (ARCHITECTURE §6): classify tool calls and hold confirmation tokens.
+
+`classify()` is a pure function (no command is ever executed) that maps a Claude tool call
+to a `GateVerdict`:
+
+- ``catastrophic``  – always denied (rm of roots/home, disk erase, sudo, fork bombs, ...)
+- ``sensitive_read`` – always denied (keys, keychains, cloud creds, browser profiles, ...)
+- ``outward``        – allowed only with a confirmation token minted from a human "yes"
+- ``allow``
+
+`analyze()` returns the richer `GateDecision` (verdict + internal reason code + reason).
+Writes to the workspace CLAUDE.md / memory.md are reported with code ``memory_write`` and
+verdict ``sensitive_read`` (a hard deny) — GateVerdict itself is unchanged.
+
+Desktop and browser rules are heuristics (ARCHITECTURE §6): the frontmost app is queried at
+decision time; coordinate clicks, Return and line breaks in a messaging app are outward; Chrome
+clicks/keys are outward when the element label matches an outward verb OR the tab's host is a
+mail/chat/social/payment site (hosts tracked from navigate/tabs_context). Scripts passed as
+files to osascript/shells/interpreters are read and classified. Remaining blind spots (prompt +
+event log only): values computed at run time (`$(base64 -d …)`), clicks on unknown hosts whose
+labels avoid the verb list, and read-only exfiltration through GET URLs.
+
+`ConfirmationGate` is owned by the orchestrator and shared with the brain: the model asks
+via ``mcp__mac__request_confirmation``; the orchestrator speaks the summary, listens for a
+human yes/no and calls ``resolve()``. Approval mints a token (single turn, TTL, max uses)
+that the PreToolUse hook consumes when it lets an outward action through.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fnmatch
+import logging
+import os
+import posixpath
+import re
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from macd import config
+from macd.brain import shell
+from macd.contracts import GateVerdict
+
+log = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------------- results
+
+_RANK: dict[str, int] = {"allow": 0, "outward": 1, "sensitive_read": 2, "catastrophic": 3}
+
+MEMORY_WRITE = "memory_write"  # internal reason code (verdict: sensitive_read → deny)
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    verdict: GateVerdict
+    code: str = "ok"
+    reason: str = ""
+    target: str = ""  # normalised recipient/host/label; part of the confirmation fingerprint
+
+    @property
+    def always_denied(self) -> bool:
+        return self.verdict in ("catastrophic", "sensitive_read")
+
+
+ALLOW = GateDecision("allow")
+
+
+def _worst(decisions: Iterable[GateDecision]) -> GateDecision:
+    best = ALLOW
+    for d in decisions:
+        if _RANK[d.verdict] > _RANK[best.verdict]:
+            best = d
+    return best
+
+
+# ----------------------------------------------------------------------------- tables
+# Paths use "~" for the user's home; matching is case-insensitive (APFS default).
+
+SENSITIVE_ROOTS: tuple[str, ...] = (
+    "~/.ssh",
+    "~/Library/Keychains",
+    "/Library/Keychains",
+    "~/.aws",
+    "~/.config/gh",
+    "~/.config/gcloud",
+    "~/.azure",
+    "~/.kube/config",
+    "~/.docker/config.json",
+    "~/.netrc",
+    "~/.gnupg",
+    "~/.git-credentials",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.password-store",
+    "~/.claude/.credentials.json",
+    "~/Library/Cookies",
+    "~/Library/Safari",
+    "~/Library/Containers/com.apple.Safari",
+    "~/Library/Application Support/Google/Chrome",
+    "~/Library/Application Support/Chromium",
+    "~/Library/Application Support/BraveSoftware",
+    "~/Library/Application Support/Arc",
+    "~/Library/Application Support/Microsoft Edge",
+    "~/Library/Application Support/Vivaldi",
+    "~/Library/Application Support/Firefox",
+    "~/Library/Application Support/1Password",
+)
+
+SENSITIVE_BASENAMES: tuple[str, ...] = (
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.keychain", "*.keychain-db",
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", ".netrc", ".pgpass", ".env*",
+)
+# Representative names used to decide whether a *glob* could select a sensitive file.
+_SENSITIVE_SAMPLES: tuple[str, ...] = (
+    "id_rsa", "id_ed25519", "server.pem", "server.key", "cert.p12", "login.keychain-db",
+    ".env", ".env.local",
+)
+ENV_TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template", ".env.dist"}
+
+# Deleting / recursively chmod-ing these is catastrophic. "*" matches one path segment.
+PROTECTED_ROOTS: tuple[str, ...] = (
+    "/", "/System", "/Library", "/Applications", "/Users", "/Users/*", "/usr", "/bin",
+    "/sbin", "/etc", "/var", "/private", "/private/etc", "/private/var", "/opt", "/Volumes",
+    "/Volumes/*", "/dev", "/cores",
+    "~", "~/Documents", "~/Desktop", "~/Library", "~/Pictures", "~/Movies", "~/Music",
+    "~/Downloads", "~/.mac-agent",
+)
+
+OUTWARD_VERBS = re.compile(
+    r"\b(send(s|ing)?|post(s|ed|ing)?|publish(es|ed|ing)?|submit(s|ted|ting)?|buy(s|ing)?|"
+    r"purchas(e|es|ed|ing)|pay(s|ing|ment)?|check ?out|order(s|ed|ing)?|place order|"
+    r"delet(e|es|ed|ing)|remove account|transfer(s|red|ring)?|confirm(s|ed|ing)?|"
+    r"tweet(s|ed|ing)?|repl(y|ies|ied|ying)|share now)\b",
+    re.IGNORECASE,
+)
+MESSAGING_APPS = re.compile(
+    r"whatsapp|slack|telegram|discord|messages|signal|teams|messenger|wechat|mail|outlook|"
+    r"spark|airmail|linkedin|twitter|\bx\b",
+    re.IGNORECASE,
+)
+
+# Chrome tabs on these hosts: any click / Enter is outward (labels come from the page itself).
+OUTWARD_HOSTS = re.compile(
+    r"(^|\.)(mail\.google\.com|outlook\.(live|office)\.com|mail\.yahoo\.com|mail\.proton\.me|"
+    r"web\.whatsapp\.com|slack\.com|discord\.com|web\.telegram\.org|teams\.microsoft\.com|"
+    r"messenger\.com|linkedin\.com|twitter\.com|x\.com|facebook\.com|instagram\.com|"
+    r"threads\.net|reddit\.com|paypal\.com|stripe\.com|amazon\.[a-z.]+|ebay\.[a-z.]+|venmo\.com|"
+    r"coinbase\.com|binance\.com|robinhood\.com|[a-z0-9-]*bank[a-z0-9-]*\.[a-z.]+)$",
+    re.IGNORECASE,
+)
+# Unknown user MCP tools (setting_sources=["user"]) whose name suggests a write/send.
+UNKNOWN_MCP_VERBS = re.compile(
+    r"send|post|create|delete|update|write|publish|reply|pay|transfer|upload|remove", re.IGNORECASE)
+
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish", "tcsh", "csh"}
+INTERPRETERS = {
+    "python", "python3", "python2", "pypy", "pypy3", "perl", "ruby", "node", "deno", "bun",
+    "php", "lua", "tclsh", "swift",
+}
+SUDO_LIKE = {"sudo", "su", "doas", "pkexec", "run0"}
+# Commands that only inspect metadata (names, sizes, types) — never file contents.
+METADATA_ONLY = {
+    "ls", "stat", "test", "[", "[[", "file", "du", "echo", "printf", "cd", "pushd", "popd",
+    "mkdir", "which", "type", "true", "false", "eza", "exa", "tree", "basename", "dirname",
+    "realpath", "readlink", "wc",
+}
+READ_ONLY_TEXT = METADATA_ONLY | {"cat", "head", "tail", "less", "more", "grep", "rg", "bat", "diff"}
+BULK_COPY = {"tar", "gtar", "bsdtar", "zip", "7z", "7za", "ditto", "cp", "rsync", "scp", "rclone",
+             "pax", "cpio", "grep", "egrep", "fgrep"}
+REMOTE_SHELLS = {"ssh", "sftp", "mosh", "ftp", "lftp", "telnet", "socat"}
+NETCATS = {"nc", "ncat", "netcat"}
+MAILERS = {"mail", "mailx", "sendmail", "mutt", "msmtp", "neomutt"}
+
+# (command, subcommand words) prefixes that publish/share something.
+OUTWARD_SUBCOMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("git", ("push",)), ("git", ("send-email",)),
+    ("npm", ("publish",)), ("npm", ("unpublish",)), ("pnpm", ("publish",)),
+    ("yarn", ("publish",)), ("yarn", ("npm", "publish")), ("bun", ("publish",)),
+    ("cargo", ("publish",)), ("gem", ("push",)), ("twine", ("upload",)),
+    ("poetry", ("publish",)), ("uv", ("publish",)), ("docker", ("push",)),
+    ("podman", ("push",)), ("hatch", ("publish",)), ("flit", ("publish",)),
+    ("gh", ("pr", "create")), ("gh", ("pr", "merge")), ("gh", ("pr", "comment")),
+    ("gh", ("pr", "review")), ("gh", ("pr", "close")), ("gh", ("issue", "create")),
+    ("gh", ("issue", "comment")), ("gh", ("issue", "close")), ("gh", ("release", "create")),
+    ("gh", ("repo", "create")), ("gh", ("repo", "delete")), ("gh", ("gist", "create")),
+    ("gh", ("secret", "set")), ("shortcuts", ("run",)),
+    ("aws", ("s3", "cp")), ("aws", ("s3", "mv")), ("aws", ("s3", "sync")),
+    ("gsutil", ("cp",)), ("gcloud", ("storage", "cp")),
+)
+
+# AppleScript / JXA patterns (applied to the script text, lowercased).
+_AS_ADMIN = re.compile(r"with\s+administrator\s+privileges")
+_AS_SEND = re.compile(r"(?<![\w.])send\b|\.send\s*\(")
+_AS_SEND_APPS = re.compile(r"\b(mail|messages|outlook|spark|airmail|whatsapp|telegram|slack)\b")
+_AS_RETURN = re.compile(
+    r"keystroke\s+return|key\s+code\s+(36|76)\b|keystroke\s+\"\\r\"|ascii\s+character\s+13|"
+    r"keystroke\s+linefeed"
+)
+_AS_CLICK_VERB = re.compile(r"click\b[^\n]*\"([^\"]*)\"")
+_AS_DELETE = re.compile(r"\bdelete\b[^\n]*\b(message|messages|note|notes|event|events|reminder|"
+                        r"reminders|mailbox|account|contact|file|folder|item|items)\b|empty\s+trash")
+_AS_DO_SHELL = re.compile(r"do\s+shell\s+script\s+\"((?:[^\"\\]|\\.)*)\"")
+
+_FORK_BOMB = re.compile(r"(\S+)\s*\(\s*\)\s*\{[^}]*\1\s*\|\s*\1\s*&[^}]*\}")
+_FORK_BOMB_LITERAL = re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}")
+
+_INTERP_DELETE = re.compile(r"rmtree|os\.remove|os\.unlink|unlink(sync)?\s*\(|rmdir|rm_rf|rimraf|"
+                            r"fs\.rm|shutil\.move|file\.delete|remove_dir_all")
+_INTERP_UPLOAD = re.compile(
+    r"requests\.(post|put|patch|delete)|httpx\.(post|put|patch|delete)|smtplib|"
+    r"urlopen\([^)]*data\s*=|method\s*[:=]\s*['\"](post|put|patch|delete)|sendmail|"
+    r"net::http::post|\.send_message\(|socket\.(create_connection|socket)",
+    re.IGNORECASE,
+)
+_JS_OUTWARD = re.compile(
+    r"\.submit\s*\(|requestsubmit\s*\(|sendbeacon|method\s*:\s*['\"](post|put|patch|delete)|"
+    r"xmlhttprequest",
+    re.IGNORECASE,
+)
+_JS_CLICK = re.compile(r"\.click\s*\(")
+_STRING_LITERAL = re.compile(r"""(['"])((?:\\.|(?!\1).)*)\1""", re.DOTALL)
+
+UI_RETURN_COMBOS = {"return", "enter", "cmd+return", "cmd+enter", "ctrl+return", "ctrl+enter",
+                    "shift+return", "shift+enter", "cmd+shift+d", "kp_enter"}
+
+
+# ----------------------------------------------------------------------------- rules/context
+
+
+@dataclass
+class GateContext:
+    """Environment for classification (all optional; defaults are the real machine)."""
+
+    home: str = field(default_factory=lambda: str(Path.home()))
+    workspace: str = field(default_factory=lambda: str(config.WORKSPACE_DIR))
+    user: str = field(default_factory=lambda: os.environ.get("USER") or Path.home().name)
+    element_label: Callable[[str], str | None] | None = None  # mac ui_tree registry
+    chrome_ref_label: Callable[[str], str | None] | None = None  # Chrome find/read_page refs
+    chrome_tab_host: Callable[[Any], str | None] | None = None  # tabId -> host (navigate/tabs)
+    current_app: Callable[[], str] | None = None  # frontmost app, queried at decision time
+    read_file: Callable[[str], str | None] = lambda p: _read_small_file(p)  # script files
+
+
+def _read_small_file(path: str, limit: int = 256 * 1024) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+# ----------------------------------------------------------------------------- path helpers
+
+
+def _segments(path: str) -> list[str]:
+    return [s for s in path.lower().split("/") if s]
+
+
+def _seg_match(target: list[str], pattern: list[str], target_is_glob: bool) -> bool:
+    if len(target) != len(pattern):
+        return False
+    for t, p in zip(target, pattern, strict=True):
+        if p == "*" or t == p:
+            continue
+        if target_is_glob and fnmatch.fnmatchcase(p, t):
+            continue
+        return False
+    return True
+
+
+class _Paths:
+    """Normalisation and table lookups bound to one GateContext."""
+
+    def __init__(self, ctx: GateContext) -> None:
+        self.ctx = ctx
+        self.home = posixpath.normpath(ctx.home)
+        self.workspace = posixpath.normpath(ctx.workspace).lower()
+        self.sensitive = [self._abs(self.expand_tilde(p), "/").lower() for p in SENSITIVE_ROOTS]
+        self.sensitive_names = tuple(n.lower() for n in SENSITIVE_BASENAMES)
+        self.protected = [_segments(self.expand_tilde(p)) for p in PROTECTED_ROOTS]
+        self.memory_files = {
+            posixpath.join(self.workspace, "claude.md"),
+            posixpath.join(self.workspace, "memory.md"),
+            str(config.MEMORY_PATH).lower(),
+            str(config.WORKSPACE_DIR / "CLAUDE.md").lower(),
+        }
+
+    def expand_tilde(self, p: str) -> str:
+        if p == "~" or p.startswith("~/"):
+            return self.home + p[1:]
+        m = re.match(r"~([A-Za-z0-9_.-]+)(/.*)?$", p)
+        if m:
+            user = m.group(1)
+            base = "/var/root" if user == "root" else f"/Users/{user}"
+            return base + (m.group(2) or "")
+        return p
+
+    @staticmethod
+    def _abs(p: str, cwd: str) -> str:
+        if not p.startswith("/"):
+            p = posixpath.join(cwd, p)
+        p = posixpath.normpath(p)
+        return "/" + p.lstrip("/")
+
+    def norm(self, p: str, cwd: str) -> str:
+        return self._abs(self.expand_tilde(p), cwd)
+
+    # -- tables ------------------------------------------------------------------------
+    def is_protected(self, path: str, glob: bool) -> bool:
+        segs = _segments(path)
+        return any(_seg_match(segs, pat, glob) for pat in self.protected)
+
+    def _under(self, p: str, root: str) -> bool:
+        return p == root or p.startswith(root.rstrip("/") + "/")
+
+    def sensitive_reason(self, raw: str, cwd: str, glob: bool = False) -> str | None:
+        """Return a reason string if `raw` (a path-ish word) names sensitive data."""
+        if not raw or raw.startswith("-") and "=" not in raw:
+            return None
+        path = self.norm(raw, cwd)
+        lowered = path.lower()
+        candidates = {lowered}
+        if not glob:
+            try:
+                candidates.add(os.path.realpath(path).lower())
+            except (OSError, ValueError):
+                pass
+        for cand in candidates:
+            for root in self.sensitive:
+                if self._under(cand, root):
+                    return f"{raw} is inside a protected secrets location"
+                if glob and _seg_match(_segments(cand)[: len(_segments(root))], _segments(root), True):
+                    return f"{raw} may match a protected secrets location"
+        base = posixpath.basename(lowered)
+        if base in ENV_TEMPLATE_NAMES:
+            return None
+        for pat in self.sensitive_names:
+            hit = (fnmatch.fnmatchcase(base, pat) or
+                   (glob and any(fnmatch.fnmatchcase(s, base) and fnmatch.fnmatchcase(s, pat)
+                                 for s in _SENSITIVE_SAMPLES) and base != "*"))
+            if not hit:
+                continue
+            if pat == ".env*" and self._under(lowered, self.workspace):
+                continue
+            return f"{raw} looks like a credential or key file"
+        return None
+
+    def is_ancestor_of_sensitive(self, raw: str, cwd: str) -> bool:
+        p = self.norm(raw, cwd).lower().rstrip("/") + "/"
+        return any(root.startswith(p) for root in self.sensitive)
+
+    def is_memory_file(self, raw: str, cwd: str) -> bool:
+        return self.norm(raw, cwd).lower() in self.memory_files
+
+
+# ----------------------------------------------------------------------------- bash analysis
+
+
+@dataclass
+class _Cmd:
+    name: str
+    args: list[shell.Word]
+    cmd: shell.SimpleCommand
+    via_xargs: bool = False
+
+
+class _BashAnalyzer:
+    MAX_DEPTH = 6
+
+    def __init__(self, paths: _Paths) -> None:
+        self.p = paths
+        self.env: dict[str, list[str]] = {
+            "HOME": [paths.home], "USER": [paths.ctx.user], "LOGNAME": [paths.ctx.user],
+            "TMPDIR": ["/tmp"],
+        }
+        self.cwd = paths.ctx.workspace
+
+    # -- entry -------------------------------------------------------------------------
+    def analyze(self, src: str, depth: int = 0) -> GateDecision:
+        if depth > self.MAX_DEPTH:
+            return GateDecision("catastrophic", "too_nested", "command nesting is too deep to verify")
+        found: list[GateDecision] = []
+        if _FORK_BOMB_LITERAL.search(src) or _FORK_BOMB.search(src):
+            found.append(GateDecision("catastrophic", "fork_bomb", "fork bomb"))
+        script = shell.parse(src)
+        for sub in script.substitutions:
+            found.append(self.analyze(sub, depth + 1))
+        for pipeline in script.pipelines:
+            found.append(self._pipeline(pipeline, depth))
+        return _worst(found)
+
+    # -- expansion ---------------------------------------------------------------------
+    _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
+
+    def expand(self, word: shell.Word) -> list[str]:
+        text = word.text
+        values: list[str] = [""]
+        pos = 0
+        for m in self._VAR.finditer(text):
+            name = m.group(1) or m.group(2)
+            alts = self.env.get(name, [""])
+            if name == "PWD":
+                alts = [self.cwd]
+            lit = text[pos : m.start()]
+            values = [v + lit + a for v in values for a in alts][:64]
+            pos = m.end()
+        values = [v + text[pos:] for v in values]
+        out: list[str] = []
+        for v in values:
+            for e in shell.brace_expand(v):
+                out.append(self.p.expand_tilde(e))
+        return out
+
+    def words(self, ws: Iterable[shell.Word]) -> list[tuple[str, bool]]:
+        out: list[tuple[str, bool]] = []
+        for w in ws:
+            out.extend((e, w.glob) for e in self.expand(w))
+        return out
+
+    # -- wrappers ----------------------------------------------------------------------
+    def _unwrap(self, cmd: shell.SimpleCommand) -> _Cmd | None:
+        ws = list(cmd.words)
+        if len(ws) >= 3 and ws[0].text in ("for", "select") and ws[2].text == "in":
+            self.env[ws[1].text] = [e for e, _ in self.words(ws[3:])][:64] or [""]
+            return None
+        via_xargs = False
+        assignments: list[tuple[str, list[str]]] = []
+        while ws:
+            head = ws[0].text
+            m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", head, re.DOTALL)
+            if m:
+                assignments.append((m.group(1), self.expand(shell.Word(m.group(2), ws[0].glob))))
+                ws.pop(0)
+                continue
+            name = posixpath.basename(head.lstrip("\\")) if head else head
+            if name in ("{", "}", "!", "if", "then", "else", "elif", "do", "while", "until",
+                        "fi", "done", "esac", "time", "nohup", "builtin", "noglob", "-",
+                        "unbuffer", "stdbuf", "caffeinate", "chronic"):
+                ws.pop(0)
+                while name in ("time", "stdbuf", "caffeinate") and ws and ws[0].text.startswith("-"):
+                    ws.pop(0)
+                continue
+            if name == "command":
+                ws.pop(0)
+                if ws and ws[0].text in ("-v", "-V"):
+                    return None
+                while ws and ws[0].text.startswith("-"):
+                    ws.pop(0)
+                continue
+            if name == "exec":
+                ws.pop(0)
+                while ws and ws[0].text.startswith("-"):
+                    flag = ws.pop(0).text
+                    if flag == "-a" and ws:
+                        ws.pop(0)
+                continue
+            if name == "env":
+                ws.pop(0)
+                while ws and (ws[0].text.startswith("-") or "=" in ws[0].text):
+                    flag = ws.pop(0).text
+                    if flag in ("-u", "-P", "-C") and ws:
+                        ws.pop(0)
+                    elif flag in ("-S", "--split-string") and ws:
+                        split = shell.parse(ws.pop(0).text)
+                        extra = split.pipelines[0][0].words if split.pipelines else []
+                        ws = extra + ws
+                    elif "=" in flag and not flag.startswith("-"):
+                        k, _, v = flag.partition("=")
+                        assignments.append((k, [v]))
+                continue
+            if name in ("nice", "renice", "ionice", "timeout", "gtimeout", "arch", "watch"):
+                ws.pop(0)
+                while ws and (ws[0].text.startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", ws[0].text)):
+                    flag = ws.pop(0).text
+                    if flag in ("-n", "-s", "-k", "--signal", "--kill-after", "-c") and ws:
+                        ws.pop(0)
+                continue
+            if name == "xargs":
+                ws.pop(0)
+                via_xargs = True
+                while ws and ws[0].text.startswith("-"):
+                    flag = ws.pop(0).text
+                    if flag in ("-I", "-J", "-n", "-P", "-L", "-s", "-E", "-d", "-R", "-S") and ws:
+                        ws.pop(0)
+                continue
+            break
+        if not ws:
+            for k, v in assignments:  # bare assignment: persists for later commands
+                self.env[k] = v
+            return None
+        name = posixpath.basename(ws[0].text.lstrip("\\")).lower()
+        return _Cmd(name=name, args=ws[1:], cmd=cmd, via_xargs=via_xargs)
+
+    # -- pipelines ---------------------------------------------------------------------
+    def _pipeline(self, pipeline: list[shell.SimpleCommand], depth: int) -> GateDecision:
+        found: list[GateDecision] = []
+        all_words = [w for c in pipeline for w in c.words]
+        prev_text: str | None = None
+        prev_name = ""
+        for idx, sc in enumerate(pipeline):
+            c = self._unwrap(sc)
+            if c is None and (sc.redirects_in or sc.redirects_out):
+                c = _Cmd(name=":", args=[], cmd=sc)  # `done < file`, `} < file`, `exec 3<file`
+            if c is None:
+                prev_text, prev_name = None, ""
+                continue
+            stdin = sc.stdin_text if sc.stdin_text is not None else prev_text
+            feeds = depth > 0 or idx < len(pipeline) - 1  # output becomes someone else's input
+            found.append(self._command(c, depth, stdin, all_words, feeds))
+            if prev_name in ("curl", "wget") and (c.name in SHELLS or c.name in INTERPRETERS):
+                found.append(GateDecision("outward", "remote_exec",
+                                          "runs code downloaded from the internet"))
+            prev_text = None
+            if c.name in ("echo", "printf"):
+                prev_text = " ".join(e for e, _ in self.words(c.args))
+            elif c.name == "cat" and not [w for w in c.args if not w.text.startswith("-")]:
+                prev_text = stdin
+            prev_name = c.name
+        return _worst(found)
+
+    def _command(self, c: _Cmd, depth: int, stdin: str | None,
+                 pipeline_words: list[shell.Word], feeds: bool = False) -> GateDecision:
+        found: list[GateDecision] = []
+        if c.name in SUDO_LIKE:
+            return GateDecision("catastrophic", "sudo", f"{c.name} (privilege escalation) is never allowed")
+        found.append(self._catastrophic(c, pipeline_words))
+        found.append(self._sensitive(c, pipeline_words, feeds))
+        found.append(self._memory(c))
+        found.append(self._outward(c))
+        found.append(self._nested(c, depth, stdin))
+        self._track_cwd(c)
+        return _worst(found)
+
+    # -- nested interpreters -----------------------------------------------------------
+    def _nested(self, c: _Cmd, depth: int, stdin: str | None) -> GateDecision:
+        args = [w.text for w in c.args]
+        positional = [a for a in args if not a.startswith("-")]
+        if c.name in SHELLS:
+            payload = _flag_payload(args, ("c",))
+            if payload is None:
+                payload = self._script_file(positional[0]) if positional else stdin
+            return self.analyze(payload, depth + 1) if payload else ALLOW
+        if c.name == "eval":
+            return self.analyze(" ".join(args), depth + 1)
+        if c.name in ("source", "."):
+            payload = self._script_file(positional[0]) if positional else None
+            return self.analyze(payload, depth + 1) if payload else ALLOW
+        if c.name == "osascript":
+            return self._osascript(args, stdin, depth)
+        if c.name in INTERPRETERS or re.fullmatch(r"python3(\.\d+)?", c.name):
+            payload = _flag_payload(args, ("c", "e", "E", "r"))
+            if payload is None:
+                payload = self._script_file(positional[0]) if positional else stdin
+            return self._interpreter(payload, depth) if payload else ALLOW
+        if c.name == "find":
+            return self._find_exec(c, depth)
+        return ALLOW
+
+    def _script_file(self, path: str) -> str | None:
+        """Contents of a script passed by path (an injected model can write-then-run)."""
+        for cand in self.expand(shell.Word(path)):
+            text = self.p.ctx.read_file(self.p.norm(cand, self.cwd))
+            if text is not None:
+                return text
+        return None
+
+    def _interpreter(self, payload: str, depth: int) -> GateDecision:
+        found: list[GateDecision] = []
+        literals = [m.group(2) for m in _STRING_LITERAL.finditer(payload)]
+        for lit in literals:
+            found.append(self.analyze(lit, depth + 1))
+            reason = self.p.sensitive_reason(lit, self.cwd)
+            if reason and ("/" in lit or lit.startswith("~")):
+                found.append(GateDecision("sensitive_read", "sensitive_path", reason))
+            if _INTERP_DELETE.search(payload) and self.p.is_protected(self.p.norm(lit, self.cwd), False) \
+                    and ("/" in lit or lit.startswith("~")):
+                found.append(GateDecision("catastrophic", "rm_root", f"deletes {lit}"))
+        if _INTERP_UPLOAD.search(payload):
+            found.append(GateDecision("outward", "network_upload", "script sends data over the network"))
+        if "with administrator privileges" in payload.lower():
+            found.append(GateDecision("catastrophic", "admin", "requests administrator privileges"))
+        return _worst(found)
+
+    def _osascript(self, args: list[str], stdin: str | None, depth: int) -> GateDecision:
+        parts = [args[i + 1] for i in range(len(args) - 1) if args[i] == "-e"]
+        if stdin:
+            parts.append(stdin)
+        if not parts:  # `osascript file`: read it (a compiled .scpt is opaque → outward)
+            files = [a for i, a in enumerate(args) if not a.startswith("-") and (i == 0 or args[i - 1] != "-l")]
+            if files:
+                text = self._script_file(files[0])
+                if text is None:
+                    return ALLOW  # not there yet; the run will fail
+                if "\x00" in text:
+                    return GateDecision("outward", "osascript_binary", "runs a compiled AppleScript",
+                                        target=posixpath.basename(files[0]))
+                parts.append(text)
+        script = "\n".join(parts)
+        if not script.strip():
+            return ALLOW
+        return _classify_applescript(script, lambda s: self.analyze(s, depth + 1))
+
+    def _find_exec(self, c: _Cmd, depth: int) -> GateDecision:
+        args = [w.text for w in c.args]
+        if "-exec" not in args and "-execdir" not in args and "-ok" not in args:
+            return ALLOW
+        roots = [a for a in _find_roots(args)] or ["."]
+        found: list[GateDecision] = []
+        for i, a in enumerate(args):
+            if a in ("-exec", "-execdir", "-ok", "-okdir"):
+                end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args))
+                inner = args[i + 1 : end]
+                for root in roots:
+                    cmdline = " ".join(_quote(root if x == "{}" else x) for x in inner)
+                    found.append(self.analyze(cmdline, depth + 1))
+        return _worst(found)
+
+    # -- catastrophic ------------------------------------------------------------------
+    def _catastrophic(self, c: _Cmd, pipeline_words: list[shell.Word]) -> GateDecision:
+        name = c.name
+        raw = [w.text for w in c.args]
+        if name in ("rm", "srm", "shred", "trash", "gio"):
+            return self._rm(c, pipeline_words)
+        if name in ("mkfs", "newfs", "fdisk", "gpt") or name.startswith(("mkfs.", "newfs_")):
+            return GateDecision("catastrophic", "disk_format", f"{name} formats disks")
+        if name == "diskutil" and raw:
+            sub = raw[0].lower()
+            if sub.startswith(("erase", "zero", "secureerase", "partition", "reformat")) or (
+                sub in ("apfs", "cs", "appleraid", "ar") and any(
+                    a.lower().startswith(("delete", "erase")) for a in raw[1:])):
+                return GateDecision("catastrophic", "disk_erase", f"diskutil {sub} erases disks")
+        if name == "dd":
+            for a in raw:
+                if a.startswith("of=") and a[3:].startswith("/dev/"):
+                    return GateDecision("catastrophic", "dd_device", "dd writes to a raw device")
+        if name in ("chmod", "chown", "chgrp", "chflags", "xattr") and any(
+                _has_short(a, "R") or a == "--recursive" for a in raw if a.startswith("-")):
+            for t, g in self.words(a for a in c.args if not a.text.startswith("-")):
+                if self.p.is_protected(self.p.norm(t, self.cwd), g):
+                    return GateDecision("catastrophic", "chmod_root", f"recursive {name} on {t}")
+        if name == "mv":
+            targets = [(t, g) for t, g in self.words(c.args) if not t.startswith("-")]
+            for t, g in targets[:-1]:
+                if self.p.is_protected(self.p.norm(t, self.cwd), g):
+                    return GateDecision("catastrophic", "mv_root", f"moves {t}")
+        if name == "rsync" and any(a.startswith("--delete") for a in raw):
+            targets = [t for t, _ in self.words(c.args) if not t.startswith("-")]
+            if targets and self.p.is_protected(self.p.norm(targets[-1], self.cwd), False):
+                return GateDecision("catastrophic", "rsync_delete", f"rsync --delete into {targets[-1]}")
+        if name == "find" and ("-delete" in raw or _find_exec_rm(raw)):
+            for root in _find_roots(raw):
+                for t in self.expand(shell.Word(root)):
+                    if self.p.is_protected(self.p.norm(t, self.cwd), False):
+                        return GateDecision("catastrophic", "find_delete", f"find {t} deletes files")
+        if name in ("csrutil", "spctl") and any(a in ("disable", "--master-disable") for a in raw):
+            return GateDecision("catastrophic", "security_off", f"{name} disables system security")
+        for w in c.cmd.redirects_out:
+            for t in self.expand(w):
+                if re.match(r"/dev/r?disk\d", t):
+                    return GateDecision("catastrophic", "dd_device", "writes to a raw disk device")
+        return ALLOW
+
+    def _rm(self, c: _Cmd, pipeline_words: list[shell.Word]) -> GateDecision:
+        recursive = c.name in ("srm", "trash", "gio")
+        targets: list[tuple[str, bool]] = []
+        end_opts = False
+        for w in c.args:
+            t = w.text
+            if not end_opts and t == "--":
+                end_opts = True
+                continue
+            if not end_opts and t.startswith("--"):
+                if t == "--no-preserve-root":
+                    return GateDecision("catastrophic", "rm_root", "rm --no-preserve-root")
+                if t in ("--recursive", "--dir"):
+                    recursive = True
+                continue
+            if not end_opts and t.startswith("-") and len(t) > 1:
+                recursive = recursive or _has_short(t, "r") or _has_short(t, "R")
+                continue
+            targets.extend((e, w.glob) for e in self.expand(w))
+        if c.via_xargs and recursive:
+            for w in pipeline_words:
+                for e in self.expand(w):
+                    if e.startswith(("/", "~")) and self.p.is_protected(self.p.norm(e, self.cwd), w.glob):
+                        return GateDecision("catastrophic", "rm_root", f"xargs rm on {e}")
+        for t, glob in targets:
+            if not t:
+                continue
+            path = self.p.norm(t, self.cwd)
+            if (recursive or glob) and self.p.is_protected(path, glob):
+                return GateDecision("catastrophic", "rm_root",
+                                    f"recursive delete of {t} ({path}) would destroy the system or home")
+        return ALLOW
+
+    # -- sensitive ---------------------------------------------------------------------
+    def _sensitive(self, c: _Cmd, pipeline_words: list[shell.Word] | None = None,
+                   feeds: bool = False) -> GateDecision:
+        raw = [w.text for w in c.args]
+        if c.name == "security" and raw:
+            sub = next((a for a in raw if not a.startswith("-")), "")
+            if sub in ("find-generic-password", "find-internet-password", "dump-keychain",
+                       "export", "find-key", "export-identity", "dump-trust-settings") or (
+                    sub == "find-certificate" and "-p" in raw):
+                return GateDecision("sensitive_read", "keychain_cli", f"security {sub} reads the keychain")
+        # Redirects first: `echo key >> ~/.ssh/authorized_keys` is a write by a "harmless" command.
+        for t, glob in self.words(list(c.cmd.redirects_out) + list(c.cmd.redirects_in)):
+            reason = self.p.sensitive_reason(t, self.cwd, glob)
+            if reason:
+                return GateDecision("sensitive_read", "sensitive_redirect", reason)
+        # `echo ~/.ssh/id_rsa | cat` / `cat $(echo ~/.ssh/id_rsa | cat)`: the echoed path is
+        # what the next command reads, so scan it; a plain `echo` is just text.
+        if c.name in METADATA_ONLY and not (c.name in ("echo", "printf") and feeds):
+            return ALLOW
+        words = list(c.args)
+        if c.via_xargs and pipeline_words:  # `ls ~/.ssh | xargs cat`: inputs come from the pipe
+            words += pipeline_words
+        for t, glob in self.words(words):
+            for cand in _path_candidates(t):
+                reason = self.p.sensitive_reason(cand, self.cwd, glob)
+                if reason:
+                    return GateDecision("sensitive_read", "sensitive_path", reason)
+        if c.name in BULK_COPY and _is_recursive_copy(c.name, raw):
+            for t, _ in self.words(c.args):
+                if not t.startswith("-") and (t.startswith(("/", "~", ".")) or "/" in t) \
+                        and self.p.is_ancestor_of_sensitive(t, self.cwd):
+                    return GateDecision("sensitive_read", "bulk_copy_sensitive",
+                                        f"{c.name} of {t} would include protected secrets")
+        return ALLOW
+
+    def _memory(self, c: _Cmd) -> GateDecision:
+        for t, _ in self.words(c.cmd.redirects_out):
+            if self.p.is_memory_file(t, self.cwd):
+                return GateDecision("sensitive_read", MEMORY_WRITE, "memory files are append-only via remember")
+        if c.name in READ_ONLY_TEXT:
+            return ALLOW
+        for t, _ in self.words(c.args):
+            for cand in _path_candidates(t):
+                if self.p.is_memory_file(cand, self.cwd):
+                    return GateDecision("sensitive_read", MEMORY_WRITE, "memory files are append-only via remember")
+        return ALLOW
+
+    # -- outward -----------------------------------------------------------------------
+    def _outward(self, c: _Cmd) -> GateDecision:
+        name = c.name
+        raw = [w.text for w in c.args]
+        words = [r for r in raw if not r.startswith("-")]
+        host = _url_host(words)
+        for cmd, sub in OUTWARD_SUBCOMMANDS:
+            if name == cmd and _has_subcommand(raw, sub):
+                return GateDecision("outward", f"{cmd}_{'_'.join(sub)}", f"{cmd} {' '.join(sub)}",
+                                    target=" ".join([name, *words[: len(sub) + 1]]))
+        if name == "curl" and _curl_uploads(raw):
+            return GateDecision("outward", "http_upload", f"curl sends data to {host or 'a server'}", target=host)
+        if name == "wget" and any(a.startswith(("--post-data", "--post-file", "--body-data", "--body-file"))
+                                  or re.match(r"--method=?(post|put|patch|delete)", a, re.IGNORECASE) for a in raw):
+            return GateDecision("outward", "http_upload", f"wget sends data to {host or 'a server'}", target=host)
+        if name in ("http", "https", "xh", "xhs", "httpie") and _httpie_uploads(raw):
+            return GateDecision("outward", "http_upload", f"httpie sends data to {host or 'a server'}",
+                                target=host)
+        if name == "gh" and raw[:1] == ["api"] and (
+                any(a in ("-f", "-F", "--field", "--raw-field", "--input") for a in raw) or
+                any(re.fullmatch(r"(-X|--method)=?(post|put|patch|delete)?", a, re.IGNORECASE) and
+                    (a.upper().endswith(("POST", "PUT", "PATCH", "DELETE")) or
+                     (i + 1 < len(raw) and raw[i + 1].upper() in ("POST", "PUT", "PATCH", "DELETE")))
+                    for i, a in enumerate(raw))):
+            return GateDecision("outward", "gh_api_write", "gh api write")
+        if name in NETCATS and not any(_has_short(a, "l") or _has_short(a, "z") for a in raw if a.startswith("-")):
+            return GateDecision("outward", "netcat", f"{name} opens a raw network connection",
+                                target=words[0] if words else "")
+        if name in REMOTE_SHELLS:
+            return GateDecision("outward", "remote_shell", f"{name} connects to a remote host",
+                                target=words[0] if words else "")
+        if name in ("scp", "rsync") and any(_is_remote_spec(a) for a in words):
+            remote = next(a for a in words if _is_remote_spec(a))
+            return GateDecision("outward", "remote_copy", f"{name} copies to {remote}", target=remote)
+        if name in MAILERS:
+            return GateDecision("outward", "mail", f"{name} sends email", target=words[-1] if words else "")
+        return ALLOW
+
+    def _track_cwd(self, c: _Cmd) -> None:
+        if c.name not in ("cd", "pushd"):
+            return
+        args = [t for t, _ in self.words(c.args) if not t.startswith("-")]
+        target = args[0] if args else self.p.home
+        if target != "-":
+            self.cwd = self.p.norm(target, self.cwd)
+
+
+# ----------------------------------------------------------------------------- bash helpers
+
+
+def _quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _has_short(flag: str, letter: str) -> bool:
+    return flag.startswith("-") and not flag.startswith("--") and letter in flag[1:]
+
+
+def _flag_payload(args: list[str], letters: tuple[str, ...]) -> str | None:
+    """`bash -lc 'cmd'` / `python3 -c 'code'` / `perl -e'code'` → the payload, else None."""
+    for i, a in enumerate(args):
+        if not a.startswith("-"):
+            return None  # first positional is a script file: not inspectable
+        if a.startswith("--") or not any(ch in a[1:] for ch in letters):
+            continue
+        if a[-1] in letters:
+            return args[i + 1] if i + 1 < len(args) else None
+        if a[1] in letters:
+            return a[2:]  # payload attached: -e'code'
+    return None
+
+
+def _path_candidates(t: str) -> list[str]:
+    """A word plus path-ish pieces inside it (`--key=~/x`, `@file`, `if=...`, `host:path`)."""
+    out = [t]
+    if "=" in t:
+        out.append(t.split("=", 1)[1])
+    if t.startswith("@"):
+        out.append(t[1:])
+    if ":" in t and not re.match(r"^[a-z][a-z0-9+.-]*://", t, re.IGNORECASE):
+        out.append(t.split(":", 1)[1])
+    return [o for o in out if o]
+
+
+def _find_roots(args: list[str]) -> list[str]:
+    roots = []
+    for a in args:
+        if a.startswith("-") or a in ("(", "!", ")"):
+            break
+        roots.append(a)
+    return roots
+
+
+def _find_exec_rm(args: list[str]) -> bool:
+    for i, a in enumerate(args):
+        if a in ("-exec", "-execdir", "-ok", "-okdir"):
+            seg = " ".join(args[i + 1 : i + 8])
+            if re.search(r"(^|[/\s'\"])(rm|srm|shred|unlink)\b", seg):
+                return True
+    return False
+
+
+def _is_recursive_copy(name: str, raw: list[str]) -> bool:
+    if name in ("cp", "scp"):
+        return any(_has_short(a, "r") or _has_short(a, "R") or _has_short(a, "a") or a == "--recursive"
+                   for a in raw)
+    if name in ("zip",):
+        return any(_has_short(a, "r") for a in raw)
+    if name in ("grep", "egrep", "fgrep"):
+        return any(_has_short(a, "r") or _has_short(a, "R") or a.startswith("--recursive") for a in raw)
+    return True
+
+
+def _has_subcommand(raw: list[str], sub: tuple[str, ...]) -> bool:
+    positional: list[str] = []
+    skip = False
+    for a in raw:
+        if skip:
+            skip = False
+            continue
+        if a in ("-C", "-c", "--git-dir", "--work-tree", "-R", "--repo", "--prefix", "--cwd",
+                 "--workspace", "--profile", "--region"):
+            skip = True
+            continue
+        if a.startswith("-"):
+            continue
+        positional.append(a)
+        if len(positional) >= len(sub):
+            break
+    return tuple(p.lower() for p in positional[: len(sub)]) == sub
+
+
+_CURL_DATA_LONG = ("--data", "--data-binary", "--data-raw", "--data-urlencode", "--data-ascii",
+                   "--json", "--form", "--form-string", "--upload-file", "-d", "-F", "-T")
+
+
+def _curl_uploads(raw: list[str]) -> bool:
+    for i, a in enumerate(raw):
+        if a.startswith(_CURL_DATA_LONG):
+            return True
+        if a.startswith(("--request", "-X")):
+            method = a.split("=", 1)[1] if "=" in a else (a[2:] if a.startswith("-X") and len(a) > 2
+                                                          else (raw[i + 1] if i + 1 < len(raw) else ""))
+            if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                return True
+        if a.startswith("-") and not a.startswith("--") and len(a) > 2:
+            cluster = a[1:]
+            for j, ch in enumerate(cluster):
+                if ch in "dFT":
+                    return True
+                if ch == "X":
+                    method = cluster[j + 1 :] or (raw[i + 1] if i + 1 < len(raw) else "")
+                    if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                        return True
+                    break
+                if ch in "oHAeuUwxbcEK":  # options that take an argument: rest is the value
+                    break
+    return False
+
+
+def _httpie_uploads(raw: list[str]) -> bool:
+    if any(a in ("-f", "--form", "--multipart", "--raw") for a in raw):
+        return True
+    positional = [a for a in raw if not a.startswith("-")]
+    if not positional:
+        return False
+    method = positional[0].upper()
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        return True
+    items = positional[2:] if method in ("GET", "HEAD", "OPTIONS") else positional[1:]
+    return any(re.match(r"^[^=:@/]+(:=@?|=@?|@)", it) and not re.match(r"^[^=:@/]+==", it)
+               for it in items)
+
+
+def _url_host(words: list[str]) -> str:
+    for w in words:
+        m = re.match(r"^(?:[a-z][a-z0-9+.-]*://)?([A-Za-z0-9.-]+(?::\d+)?)(?:/|$)", w)
+        if m and ("." in m.group(1) or "localhost" in m.group(1) or ":" in m.group(1)) and "=" not in w:
+            return m.group(1).lower()
+    return ""
+
+
+def _is_remote_spec(a: str) -> bool:
+    if re.match(r"^rsync://", a):
+        return True
+    m = re.match(r"^([^/:@\s]+@)?([A-Za-z0-9._-]+):", a)
+    return bool(m) and not a.startswith("/")
+
+
+# ----------------------------------------------------------------------------- AppleScript
+
+
+def _classify_applescript(script: str, analyze_shell: Callable[[str], GateDecision]) -> GateDecision:
+    low = script.lower()
+    found: list[GateDecision] = []
+    if _AS_ADMIN.search(low):
+        return GateDecision("catastrophic", "admin", "AppleScript asks for administrator privileges")
+    for m in _AS_DO_SHELL.finditer(script):
+        found.append(analyze_shell(m.group(1).replace('\\"', '"').replace("\\\\", "\\")))
+    app = _AS_SEND_APPS.search(low) or MESSAGING_APPS.search(low)
+    app_name = app.group(0) if app else ""
+    if _AS_SEND.search(low) and _AS_SEND_APPS.search(low):
+        found.append(GateDecision("outward", "osascript_send", f"AppleScript sends via {app_name}",
+                                  target=app_name))
+    if _AS_RETURN.search(low) and MESSAGING_APPS.search(low):
+        found.append(GateDecision("outward", "osascript_keystroke_send",
+                                  f"AppleScript presses Return in {app_name}", target=app_name))
+    for m in _AS_CLICK_VERB.finditer(script):
+        if OUTWARD_VERBS.search(m.group(1)):
+            found.append(GateDecision("outward", "osascript_click", f"AppleScript clicks '{m.group(1)}'",
+                                      target=m.group(1)))
+    if _AS_DELETE.search(low):
+        found.append(GateDecision("outward", "osascript_delete", "AppleScript deletes items", target=app_name))
+    return _worst(found)
+
+
+# ----------------------------------------------------------------------------- per-tool
+
+
+_FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_FILE_READ_TOOLS = {"Read", "NotebookRead"}
+_CHROME_CLICKS = {"left_click", "right_click", "double_click", "triple_click", "left_click_drag"}
+
+
+def _file_tool(name: str, inp: dict[str, Any], paths: _Paths) -> GateDecision:
+    cwd = paths.ctx.workspace
+    if name in _FILE_WRITE_TOOLS:
+        target = str(inp.get("file_path") or inp.get("notebook_path") or "")
+        if target and paths.is_memory_file(target, cwd):
+            return GateDecision("sensitive_read", MEMORY_WRITE, "memory files are append-only via remember")
+        reason = paths.sensitive_reason(target, cwd) if target else None
+        return GateDecision("sensitive_read", "sensitive_write", reason) if reason else ALLOW
+    if name in _FILE_READ_TOOLS:
+        target = str(inp.get("file_path") or inp.get("notebook_path") or "")
+        reason = paths.sensitive_reason(target, cwd) if target else None
+        return GateDecision("sensitive_read", "sensitive_path", reason) if reason else ALLOW
+    if name == "Grep":
+        base = str(inp.get("path") or cwd)
+        checks = [(base, False)]
+        if inp.get("glob"):
+            checks.append((posixpath.join(base, str(inp["glob"])), True))
+        for p, g in checks:
+            reason = paths.sensitive_reason(p, cwd, g)
+            if reason:
+                return GateDecision("sensitive_read", "sensitive_path", reason)
+        return ALLOW
+    if name == "Glob":
+        base = str(inp.get("path") or cwd)
+        pattern = str(inp.get("pattern") or "")
+        for p, g in ((base, False), (posixpath.join(base, pattern) if pattern else base, True)):
+            reason = paths.sensitive_reason(p, cwd, g)
+            if reason and not (g and posixpath.basename(pattern) in ("*", "**")
+                               and not paths.sensitive_reason(posixpath.dirname(p), cwd, True)):
+                return GateDecision("sensitive_read", "sensitive_path", reason)
+        return ALLOW
+    return ALLOW
+
+
+def _mac_ui(name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecision:
+    app = ""
+    if ctx.current_app:
+        try:
+            app = ctx.current_app() or ""
+        except Exception:  # noqa: BLE001
+            app = ""
+    messaging = bool(MESSAGING_APPS.search(app))
+    if name == "mcp__mac__ui_click":
+        eid = inp.get("element_id")
+        label = ""
+        if eid not in (None, "") and ctx.element_label:
+            label = ctx.element_label(str(eid)) or ""
+        if label and OUTWARD_VERBS.search(label):
+            return GateDecision("outward", "ui_click_verb", f"clicks '{label}' in {app or 'an app'}",
+                                target=f"{app}:{label}")
+        if not label and messaging:  # coordinate click in a messaging app: could be Send
+            return GateDecision("outward", "ui_click_coord", f"clicks somewhere in {app}", target=app)
+        return ALLOW
+    if name == "mcp__mac__ui_key":
+        combo = re.sub(r"\s+", "", str(inp.get("combo", "")).lower())
+        if combo in UI_RETURN_COMBOS and messaging:
+            return GateDecision("outward", "ui_key_send", f"presses {combo} in {app}", target=app)
+        return ALLOW
+    if name == "mcp__mac__ui_type":
+        text = str(inp.get("text", ""))
+        if ("\n" in text or "\r" in text) and messaging:
+            return GateDecision("outward", "ui_type_send", f"types a line break in {app}", target=app)
+    return ALLOW
+
+
+def _chrome_action(action: dict[str, Any], ctx: GateContext) -> GateDecision:
+    kind = str(action.get("action", ""))
+    labels = [str(action.get("action_summary") or "")]
+    ref = action.get("ref")
+    if ref and ctx.chrome_ref_label:
+        labels.append(ctx.chrome_ref_label(str(ref)) or "")
+    label = " ".join(x for x in labels if x)
+    host = ""
+    if ctx.chrome_tab_host and action.get("tabId") is not None:
+        host = ctx.chrome_tab_host(action["tabId"]) or ""
+    enter = kind == "key" and bool(re.search(r"\b(enter|return)\b", str(action.get("text", "")), re.IGNORECASE))
+    newline = kind == "type" and bool(re.search(r"[\r\n]$", str(action.get("text", ""))))
+    acts = kind in _CHROME_CLICKS or enter or newline
+    if acts and OUTWARD_VERBS.search(label):
+        return GateDecision("outward", f"chrome_{kind}_verb", f"browser {kind}: {label}",
+                            target=f"{host}:{label}")
+    if acts and host and OUTWARD_HOSTS.search(host):
+        return GateDecision("outward", f"chrome_{kind}_host", f"browser {kind} on {host}", target=host)
+    return ALLOW
+
+
+def _iter_dicts(obj: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _iter_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _iter_dicts(v)
+
+
+def _chrome(name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecision:
+    found = [_chrome_action(d, ctx) for d in _iter_dicts(inp) if "action" in d]
+    if name.endswith("javascript_tool"):
+        code = " ".join(str(v) for d in _iter_dicts(inp) for v in d.values() if isinstance(v, str))
+        if _JS_OUTWARD.search(code) or (_JS_CLICK.search(code) and OUTWARD_VERBS.search(code)):
+            found.append(GateDecision("outward", "chrome_js", "page script submits or sends data",
+                                      target="javascript"))
+    return _worst(found)
+
+
+# ----------------------------------------------------------------------------- public API
+
+
+def analyze(tool_name: str, tool_input: dict[str, Any] | None,
+            context: GateContext | None = None) -> GateDecision:
+    """Classify one tool call. Never runs anything (reads script files passed by path)."""
+    inp = tool_input or {}
+    ctx = context or GateContext()
+    try:
+        paths = _Paths(ctx)
+        if tool_name == "Bash":
+            return _BashAnalyzer(paths).analyze(str(inp.get("command", "")))
+        if tool_name in _FILE_WRITE_TOOLS | _FILE_READ_TOOLS | {"Grep", "Glob"}:
+            return _file_tool(tool_name, inp, paths)
+        if tool_name.startswith("mcp__mac__ui_"):
+            return _mac_ui(tool_name, inp, ctx)
+        if tool_name.startswith("mcp__claude-in-chrome__"):
+            return _chrome(tool_name, inp, ctx)
+        if tool_name.startswith("mcp__") and not tool_name.startswith("mcp__mac__"):
+            short = tool_name.rsplit("__", 1)[-1]
+            if UNKNOWN_MCP_VERBS.search(short):  # user's own MCP servers: name-based, conservative
+                return GateDecision("outward", "mcp_write", f"{short} looks like it sends or changes something",
+                                    target=tool_name)
+        return ALLOW
+    except Exception:
+        log.exception("gate: classifier error for %s", tool_name)
+        return GateDecision("outward", "classifier_error", "could not verify this action")
+
+
+def classify(tool_name: str, tool_input: dict[str, Any] | None,
+             context: GateContext | None = None) -> GateVerdict:
+    return analyze(tool_name, tool_input, context).verdict
+
+
+# ----------------------------------------------------------------------------- tokens
+
+
+@dataclass
+class _Token:
+    turn_id: int
+    expires_at: float
+    action: str  # fingerprint of the confirmed action
+
+
+@dataclass
+class _Pending:
+    turn_id: int
+    summary: str
+    future: asyncio.Future[bool]
+
+
+class ConfirmationGate:
+    """Human-in-the-loop confirmation tokens (ARCHITECTURE §6.2).
+
+    The model asks through ``mcp__mac__request_confirmation``; the CONFIRM BrainEvent tells
+    the orchestrator to speak the summary; a human yes/no arrives via ``resolve()``. Approval
+    mints ONE token for ONE action: the fingerprint of the outward action the hook just denied.
+    Only that action may use it, as often as needed (idempotent retry), until the TTL expires,
+    the turn changes or ``revoke_all()``. A token is never minted without an action to bind to.
+    """
+
+    def __init__(self, *, ttl_s: float = 120.0, clock: Callable[[], float] = time.monotonic) -> None:
+        self.ttl_s = ttl_s
+        self._clock = clock
+        self._token: _Token | None = None
+        self._pending: _Pending | None = None
+
+    @property
+    def pending(self) -> tuple[int, str] | None:
+        p = self._pending
+        return (p.turn_id, p.summary) if p and not p.future.done() else None
+
+    async def request(self, turn_id: int, summary: str, timeout: float, action: str) -> bool:
+        """Wait for resolve(); False on timeout/revoke, if another request is pending, or if
+        there is no `action` (fingerprint of a denied outward call) to bind the token to."""
+        if not action:
+            log.warning("gate: refusing to mint an unbound token (no denied action)")
+            return False
+        if self.pending is not None:
+            log.warning("gate: confirmation already pending; rejecting second request")
+            return False
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending = _Pending(turn_id, summary, fut)
+        log.info("gate: confirmation requested turn=%d action=%s summary=%r", turn_id, action, summary)
+        try:
+            approved = await asyncio.wait_for(asyncio.shield(fut), timeout)
+        except TimeoutError:
+            log.info("gate: confirmation timed out turn=%d", turn_id)
+            approved = False
+        finally:
+            if self._pending is not None and self._pending.future is fut:
+                self._pending = None
+            if not fut.done():
+                fut.set_result(False)
+        if approved:
+            self._token = _Token(turn_id, self._clock() + self.ttl_s, action)
+            log.info("gate: token minted turn=%d action=%s", turn_id, action)
+        return approved
+
+    def resolve(self, approved: bool) -> None:
+        p = self._pending
+        if p is None or p.future.done():
+            log.debug("gate: resolve(%s) with nothing pending", approved)
+            return
+        p.future.set_result(bool(approved))
+
+    def has_token(self, turn_id: int, action: str | None = None) -> bool:
+        t = self._token
+        if not t or t.turn_id != turn_id or self._clock() >= t.expires_at:
+            return False
+        return action is None or t.action == action
+
+    def consume(self, turn_id: int, action: str) -> bool:
+        """True if the token covers exactly `action` (retries of it are fine)."""
+        if not self.has_token(turn_id, action):
+            return False
+        log.info("gate: token used turn=%d action=%s", turn_id, action)
+        return True
+
+    def revoke_all(self) -> None:
+        self._token = None
+        self.resolve(False)
