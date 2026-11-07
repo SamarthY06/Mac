@@ -3,14 +3,14 @@
 `classify()` is a pure function (no command is ever executed) that maps a Claude tool call
 to a `GateVerdict`:
 
-- ``catastrophic``  – always denied (rm of roots/home, disk erase, sudo, fork bombs, ...)
-- ``sensitive_read`` – always denied (keys, keychains, cloud creds, browser profiles, ...)
-- ``outward``        – allowed only with a confirmation token minted from a human "yes"
+- ``catastrophic``  - always denied (rm of roots/home, disk erase, sudo, fork bombs, ...)
+- ``sensitive_read`` - always denied (keys, keychains, cloud creds, browser profiles, ...)
+- ``outward``        - allowed only with a confirmation token minted from a human "yes"
 - ``allow``
 
 `analyze()` returns the richer `GateDecision` (verdict + internal reason code + reason).
 Writes to the workspace CLAUDE.md / memory.md are reported with code ``memory_write`` and
-verdict ``sensitive_read`` (a hard deny) — GateVerdict itself is unchanged.
+verdict ``sensitive_read`` (a hard deny), GateVerdict itself is unchanged.
 
 Desktop and browser rules are heuristics (ARCHITECTURE §6): the frontmost app is queried at
 decision time; coordinate clicks, Return and line breaks in a messaging app are outward; Chrome
@@ -161,7 +161,7 @@ INTERPRETERS = {
     "php", "lua", "tclsh", "swift",
 }
 SUDO_LIKE = {"sudo", "su", "doas", "pkexec", "run0"}
-# Commands that only inspect metadata (names, sizes, types) — never file contents.
+# Commands that only inspect metadata (names, sizes, types), never file contents.
 METADATA_ONLY = {
     "ls", "stat", "test", "[", "[[", "file", "du", "echo", "printf", "cd", "pushd", "popd",
     "mkdir", "which", "type", "true", "false", "eza", "exa", "tree", "basename", "dirname",

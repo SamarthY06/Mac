@@ -12,7 +12,7 @@ from macd.connect import (
     EXTENSION_ID,
     FIX_API_KEY,
     FIX_BROWSER,
-    FIX_ENABLE,
+    FIX_CONNECT,
     FIX_EXTENSION,
     FIX_INSTALL_CLAUDE,
     FIX_SIGN_IN,
@@ -108,11 +108,11 @@ def test_chrome_all_good(tmp_path: Path) -> None:
     ("chrome_kw", "running", "auth", "connected", "fix"),
     [({}, [], "claude_ai", "unknown", FIX_BROWSER),
      ({"extension": False}, ["Google Chrome"], "claude_ai", "unknown", FIX_EXTENSION),
-     ({"host": False}, ["Google Chrome"], "claude_ai", "unknown", FIX_ENABLE),
-     ({"origins_ok": False}, ["Google Chrome"], "claude_ai", "unknown", FIX_ENABLE),
-     ({"enabled": False}, ["Google Chrome"], "claude_ai", "unknown", FIX_ENABLE),
-     ({"enabled": None}, ["Google Chrome"], "claude_ai", "unknown", FIX_ENABLE),
-     ({}, ["Google Chrome"], "claude_ai", "not_connected", FIX_ENABLE),
+     ({"host": False}, ["Google Chrome"], "claude_ai", "unknown", FIX_CONNECT),
+     ({"origins_ok": False}, ["Google Chrome"], "claude_ai", "unknown", FIX_CONNECT),
+     ({"enabled": False}, ["Google Chrome"], "claude_ai", "unknown", ""),
+     ({"enabled": None}, ["Google Chrome"], "claude_ai", "unknown", ""),
+     ({}, ["Google Chrome"], "claude_ai", "not_connected", FIX_CONNECT),
      ({}, ["Google Chrome"], "api_key", "unknown", FIX_API_KEY),
      ({}, [], "claude_ai", "unavailable_api_key", FIX_API_KEY)],
 )
@@ -137,6 +137,9 @@ def test_check_all_ready(tmp_path: Path) -> None:
     app, cj = make_chrome(tmp_path)
     d = check_all(cfg, run=run, env={}, app_support=app, claude_json=cj, running=lambda: ["Google Chrome"])
     assert d["ready"] is True and set(d) == {"claude", "chrome", "ready", "checked_at"}
+    app_off, cj_off = make_chrome(tmp_path / "off", enabled=False)
+    d_off = check_all(cfg, run=run, env={}, app_support=app_off, claude_json=cj_off, running=lambda: ["Google Chrome"])
+    assert d_off["ready"] is True and d_off["chrome"]["enabled_by_default"] is False  # informational only
     d2 = check_all(cfg, run=run, env={}, app_support=app, claude_json=cj, running=list)
     assert d2["ready"] is False and d2["chrome"]["fix"] == FIX_BROWSER
     cfg_api, run_api = make_claude(tmp_path, method="apiKey")
@@ -194,3 +197,9 @@ async def test_checker_probe_failure_and_not_signed_in(monkeypatch: pytest.Monke
 
     d = await ConnectChecker(config.Config(), brain=SignedOut(), brain_chrome=lambda: "unknown").command(True)
     assert d["claude"]["signed_in"] == "no" and d["claude"]["fix"] == FIX_SIGN_IN and d["ready"] is False
+
+
+def test_no_dashes_in_fix_strings() -> None:
+    for name in dir(connect):
+        if name.startswith("FIX_"):
+            assert "—" not in getattr(connect, name) and "–" not in getattr(connect, name), name

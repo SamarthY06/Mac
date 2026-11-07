@@ -107,7 +107,7 @@ final class Permissions: ObservableObject {
     }
 }
 
-/// "Meet Mac": one window — hero, connect rows + permission checklist (live), try-it, launch at login.
+/// "Meet Mac": one window: hero, connect rows + permission checklist (live), try-it, launch at login.
 @MainActor
 final class OnboardingWindow {
     private var window: NSWindow?
@@ -140,7 +140,8 @@ final class OnboardingWindow {
             w.setAccessibilityLabel("Meet Mac")
             let hc = NSHostingController(rootView: OnboardingView(perms: perms, model: model,
                                                                   close: { [weak w, weak self] in w?.close(); self?.onDone?() }))
-            hc.sizingOptions = [.preferredContentSize]
+            hc.sizingOptions = []  // crash fix: with .fullSizeContentView, content-driven sizing loops (safe area ↔ frame) until AppKit throws
+            w.setContentSize(NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height)))
             w.contentViewController = hc
             w.center()
             window = w
@@ -294,7 +295,7 @@ struct OnboardingView: View {
                 Text(loginError).font(.footnote).foregroundStyle(.red)
             }
             if model.claudeStage == .connected, model.chromeStage != .connected {
-                Text("Browser tasks need Chrome — connect it above, or later in Settings.")
+                Text("Browser tasks need Chrome. Connect it above, or later in Settings.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Text("Everything stays on this Mac except your conversation with Claude.")
@@ -408,10 +409,10 @@ struct ConnectRows: View {
         return ConnectRow(icon: "sparkle", title: "Claude",
                           steps: ["Install", "Sign in", "Connected"], stage: stage?.rawValue,
                           status: claudeStatus(stage), badge: stage == .connected && apiKey
-                              ? ("API key — browser tasks unavailable", .orange) : nil,
+                              ? ("API key: browser tasks unavailable", .orange) : nil,
                           fix: stage == .connected
                               ? (apiKey ? "Browser tasks need a claude.ai sign-in; the API key covers everything else." : "")
-                              : c.fix) {
+                              : UX.noDash(c.fix)) {
             switch stage {
             case .install: Button("Install Claude Code…") { model.guided?.installClaude() }
             case .signIn: Button("Sign in…") { model.guided?.signIn() }
@@ -425,7 +426,7 @@ struct ConnectRows: View {
         let c = model.connect.claude
         switch stage {
         case .install: return "Claude Code isn’t installed yet. Mac thinks with it."
-        case .signIn: return c.version.isEmpty ? "Installed — not signed in yet." : "Claude Code \(c.version) — not signed in yet."
+        case .signIn: return c.version.isEmpty ? "Installed, not signed in yet." : "Claude Code \(c.version), not signed in yet."
         case .connected:
             let v = c.version.isEmpty ? "Claude Code" : "Claude Code \(c.version)"
             return model.claudeUsesApiKey ? "\(v) · using an API key" : "\(v) · signed in with claude.ai"
@@ -439,37 +440,53 @@ struct ConnectRows: View {
         let stage = model.chromeStage
         let ch = model.connect.chrome
         let checking = model.connect.checking
+        let hint = "Open the Claude extension in Chrome and sign in with the same account."
+        let daemonFix = UX.noDash(ch.fix)
         return ConnectRow(icon: "globe", title: "Claude in Chrome",
-                          steps: ["Install extension", "Connect", "Connected"], stage: stage?.rawValue,
+                          steps: ["Install extension", "Sign in to the extension", "Connect"], stage: stage?.rawValue,
                           status: chromeStatus(stage), badge: nil,
-                          fix: stage == .connected ? "" :
-                              (ch.fix.isEmpty ? "Chrome must be open and the extension signed in to the same claude.ai account." : ch.fix)) {
-            if stage == .install {
-                Button("Install Extension…") { model.guided?.installExtension() }
-            } else if stage == .connect {
-                Button("Connect Chrome…") { model.guided?.connectChrome() }
+                          fix: stage == .connected ? "" : (stage == .connect ? (daemonFix.isEmpty ? hint : "\(hint) \(daemonFix)") : daemonFix)) {
+            switch stage {
+            case .install:
+                Button("Get the Extension…") { model.guided?.installExtension() }
+            case .connect, nil:
+                // Never Terminal: Connect asks the engine for a deep check (it polls until the extension answers).
+                Button {
+                    model.guided?.checkConnection()
+                } label: {
+                    if checking {
+                        HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Connecting, about 10 seconds") }
+                    } else {
+                        Text("Connect")
+                    }
+                }
+                .disabled(checking || !model.connected || model.guided == nil)
+                .accessibilityLabel(checking ? "Connecting to the Chrome extension" : "Connect to the Chrome extension")
+            case .connected:
+                EmptyView()
             }
         } secondary: {
-            Button {
-                model.guided?.checkConnection()
-            } label: {
-                if checking {
-                    HStack(spacing: 5) { ProgressView().controlSize(.mini); Text("Asking Claude… ~10 s") }
-                } else {
-                    Text("Check Connection")
+            if stage == .connected {
+                Button {
+                    model.guided?.checkConnection()
+                } label: {
+                    if checking {
+                        HStack(spacing: 5) { ProgressView().controlSize(.mini); Text("Checking") }
+                    } else {
+                        Text("Check Connection")
+                    }
                 }
+                .buttonStyle(.link)
+                .font(.caption)
+                .fixedSize()
+                .disabled(checking || !model.connected || model.guided == nil)
+                .accessibilityLabel("Check the Chrome connection again")
             }
-            .buttonStyle(.link)
-            .font(.caption)
-            .fixedSize()
-            .disabled(checking || !model.connected || model.guided == nil)
-            .accessibilityLabel(checking ? "Checking the Chrome connection" : "Check the Chrome connection")
         } accessory: {
             HStack(spacing: 5) {
                 chip("Chrome open", ch.browserRunning)
                 chip("Extension", ch.extensionInstalled)
                 chip("Native host", ch.nativeHost)
-                chip("Enabled by default", ch.enabledByDefault)
             }
             .fixedSize()
         }
@@ -477,9 +494,9 @@ struct ConnectRows: View {
 
     private func chromeStatus(_ stage: ChromeStage?) -> String {
         switch stage {
-        case .install: return "For websites. Optional — install the extension in Chrome."
-        case .connect: return "Extension found — Claude can’t reach it yet."
-        case .connected: return "Connected · Claude can browse for you."
+        case .install: return "For websites. Optional: get the extension for Chrome."
+        case .connect: return "Extension found. Sign in to it, then connect."
+        case .connected: return "Connected. Claude can browse for you."
         case nil: return model.connected ? "Checking…" : "Waiting for Mac to connect…"
         }
     }

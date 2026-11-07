@@ -9,7 +9,7 @@ enum AppPrefs {
     static let changed = Notification.Name("io.github.macagent.Mac.prefsChanged")
     static let avatarDir = Paths.home.appendingPathComponent("avatar")
 
-    /// "auto" (only when plugged in, default) | "always" | "never" — Power.swift reads it.
+    /// "auto" (only when plugged in, default) | "always" | "never"; Power.swift reads it.
     static var stayAwake: String {
         get { UserDefaults.standard.string(forKey: "stayAwake") ?? "auto" }
         set { UserDefaults.standard.set(newValue, forKey: "stayAwake"); NotificationCenter.default.post(name: changed, object: nil) }
@@ -84,7 +84,7 @@ final class SettingsStore: ObservableObject {
 
     init(control: ControlClient) { self.control = control }
 
-    /// Reload whenever the connection comes (back) up — a load that raced a reconnect must not stick.
+    /// Reload whenever the connection comes (back) up: a load that raced a reconnect must not stick.
     func observe(_ model: AppModel) {
         self.model = model
         model.$connected.removeDuplicates().dropFirst().receive(on: RunLoop.main).sink { [weak self] up in
@@ -166,7 +166,7 @@ final class SettingsStore: ObservableObject {
                 for k in changes.keys { self.errors[k] = Self.friendly(err) }
             }
         }
-        if !sent { for k in changes.keys { errors[k] = "Mac is still starting — try again in a moment." } }
+        if !sent { for k in changes.keys { errors[k] = "Mac is still starting. Try again in a moment." } }
     }
 
     /// Debounced write (text fields, sliders).
@@ -191,9 +191,9 @@ final class SettingsStore: ObservableObject {
         guard let e = err, !e.isEmpty else { return "Couldn’t save." }
         let low = e.lowercased()
         if low.contains("daemon") || low.contains("disconnected") || low.contains("not running") {
-            return "Mac is still starting — try again in a moment."
+            return "Mac is still starting. Try again in a moment."
         }
-        return e
+        return UX.noDash(e)
     }
 
     private func flashSaved() {
@@ -318,7 +318,7 @@ final class SettingsNav: ObservableObject {
 
 // MARK: - Shared card language (also used by Meet Mac)
 
-/// Accent (or green when done) circle with an SF Symbol — the row glyph everywhere.
+/// Accent (or green when done) circle with an SF Symbol: the row glyph everywhere.
 struct IconBadge: View {
     var symbol: String
     var tint: Color = .accentColor
@@ -552,7 +552,7 @@ struct GeneralSettings: View {
             }
             RowDivider()
             CardRow(symbol: "ear", title: "You speak") {
-                Text("\(Self.spoken(store.sttLanguages)) — more languages soon").font(.system(size: 12)).foregroundStyle(.secondary)
+                Text("\(Self.spoken(store.sttLanguages)) (more languages soon)").font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }
 
@@ -584,7 +584,7 @@ struct GeneralSettings: View {
             CardRow(symbol: "bolt", title: "Stay awake while listening",
                     subtitle: "Keeps the Mac from sleeping while Mac is listening (the display can still turn off). A closed MacBook lid still sleeps the Mac unless an external display and power are attached.") {
                 Picker("", selection: $stayAwake) {
-                    Text("Automatic — when plugged in").tag("auto")
+                    Text("Automatic (when plugged in)").tag("auto")
                     Text("Always").tag("always")
                     Text("Never").tag("never")
                 }

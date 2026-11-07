@@ -179,8 +179,10 @@ class SwiftAudioLink:
             self._pending.clear()
         client.closed.set()
         client.writer.close()
-        with contextlib.suppress(Exception):
+        try:
             await client.writer.wait_closed()
+        except (ConnectionError, OSError) as e:  # the app's socket is usually already gone
+            log.debug("audio client close: %s", e)
 
     async def _read_loop(self, client: _Client) -> None:
         dec = P.FrameDecoder()

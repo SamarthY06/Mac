@@ -38,6 +38,9 @@ enum Log {
         return f
     }()
 
+    /// Block until queued lines are on disk (used by the crash handler).
+    static func flush() { queue.sync { try? handle?.synchronize() } }
+
     static func info(_ msg: String, _ cat: String = "app") { write("INFO", cat, msg) }
     static func warn(_ msg: String, _ cat: String = "app") { write("WARN", cat, msg) }
     static func error(_ msg: String, _ cat: String = "app") { write("ERROR", cat, msg) }

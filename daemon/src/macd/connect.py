@@ -46,11 +46,10 @@ BROWSERS: dict[str, tuple[str, str]] = {  # name -> (profile root, bundle id)
 FIX_INSTALL_CLAUDE = "Install Claude Code: https://claude.com/claude-code"
 FIX_UPDATE_CLAUDE = "Update Claude Code (needs 2.1.0 or newer): run `claude update`"
 FIX_SIGN_IN = "Open Terminal, run `claude` and sign in."
-FIX_API_KEY = "API-key login can't use Chrome — sign in with `claude` instead"
+FIX_API_KEY = "API-key login can't use Chrome: sign in with `claude` instead"
 FIX_BROWSER = "Chrome isn't running"
-FIX_EXTENSION = f"Install the Claude in Chrome extension: {EXTENSION_URL}"
-FIX_ENABLE = ("Open Terminal, run `claude --chrome`, press Enter at the dialog, then type /chrome and choose "
-              "Enabled by default")
+FIX_EXTENSION = f"Install the Claude in Chrome extension ({EXTENSION_URL}), sign it in, then click Connect"
+FIX_CONNECT = "Sign in to the Claude in Chrome extension, then click Connect in Mac's menu"
 
 Runner = Callable[[list[str]], tuple[int, str]]  # argv -> (returncode, stdout)
 
@@ -183,8 +182,8 @@ def check_chrome(
         out["fix"] = FIX_BROWSER
     elif not out["extension_installed"]:
         out["fix"] = FIX_EXTENSION
-    elif not out["native_host"] or out["enabled_by_default"] is not True or connected == "not_connected":
-        out["fix"] = FIX_ENABLE
+    elif not out["native_host"] or connected == "not_connected":
+        out["fix"] = FIX_CONNECT  # the Connect button's deep check registers the native host
     return out
 
 
@@ -192,7 +191,7 @@ def is_ready(claude: dict[str, Any], chrome: dict[str, Any]) -> bool:
     return bool(
         claude["installed"] and claude["min_ok"] and claude["signed_in"] == "yes" and claude["auth_method"] != "api_key"
         and chrome["browser_running"] and chrome["extension_installed"] and chrome["native_host"]
-        and chrome["enabled_by_default"] is True and chrome["connected"] not in ("not_connected", "unavailable_api_key")
+        and chrome["connected"] not in ("not_connected", "unavailable_api_key")  # enabled_by_default is info only
     )
 
 

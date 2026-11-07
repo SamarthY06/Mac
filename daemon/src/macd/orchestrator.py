@@ -56,7 +56,7 @@ from macd.tasks import TaskSet, supervise
 
 log = logging.getLogger(__name__)
 
-PHONE_SESSION_DETAIL = "Phone session — local mic paused"  # shown by the app instead of "Listening…"
+PHONE_SESSION_DETAIL = "Phone session: local mic paused"  # shown by the app instead of "Listening…"
 THINKING_AFTER_IDLE_S = 1.0  # SPEAKING → THINKING only after this much silence (no HUD flicker)
 WAKE_BLIP_DELAY_S = 0.25  # the wake blip plays only if the user paused after "Hey Mac"
 LONG_TURN_DONE_EARCON_S = 30.0
@@ -345,6 +345,7 @@ class Orchestrator:
                 t.first_audio = True
                 self.metrics.observe_since("transcript_to_first_audio", t.transcript_t)
 
+        text = P.dedash(text)
         if self.speech.say(turn.id, text, kind, output=turn.output, priority=priority, on_play=on_play):  # type: ignore[arg-type]
             turn.last_speech = time.monotonic()
             if kind in ("answer", "say", "confirm"):
@@ -353,7 +354,7 @@ class Orchestrator:
 
     def _say_system(self, text: str, output: str | None = None, *, priority: bool = False) -> None:
         out = output or (self.turn.output if self.turn else self.speech.default_output)
-        self.speech.say(SYSTEM_TURN, text, "say", output=out, priority=priority)
+        self.speech.say(SYSTEM_TURN, P.dedash(text), "say", output=out, priority=priority)
 
     def _on_speech_start(self, text: str, kind: str) -> None:
         for lst in self._listeners.values():

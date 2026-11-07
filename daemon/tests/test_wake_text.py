@@ -58,3 +58,13 @@ def test_configured_phrases_drive_verification():
     assert wp.mentions("Jarvis is here")
     with pytest.raises(ValueError):
         WakePhrases([])
+
+
+def test_similar_names_only_with_knob_and_strong_prefix():
+    strict, loose = WakePhrases(["hey mac"]), WakePhrases(["hey mac"], accept_similar_names=True)
+    for t in ("Hey Mark, what time?", "Hey Mic.", "hey mech", "Haymark.", "He marked.", "He mark what time is"):
+        assert not strict.verify(t) and loose.verify(t), t
+    assert loose.remove("Haymark, what time is it?") == "What time is it?"
+    assert not loose.verify("hey make a note") and not loose.verify("Hey Matt, are you coming?")
+    assert loose.remove("Hey Mark, what time?") == "What time?"
+    assert not loose.verify("a mark on the wall") and not loose.verify("the market is open")  # weak prefix / not the word

@@ -92,3 +92,8 @@ def test_no_empty_strings():
 
 def test_snake_case_preserved():
     assert speakable("Set my_var_name to 3.") == "Set my_var_name to 3."
+
+
+def test_dashes_become_comma_pauses():
+    assert speakable("Paris — the capital – is big - really.") == "Paris, the capital, is big, really."
+    assert speakable("Use well-known APIs.") == "Use well-known APIs."  # hyphenated words untouched

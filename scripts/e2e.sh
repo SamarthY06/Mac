@@ -18,7 +18,7 @@ MAC_HOME="$H" python3 "$ROOT/scripts/fake_daemon.py" --timeout 30 >"$H/fake.out"
 FAKE=$!
 sleep 0.5
 # Exec the bundle's binary directly (bundle identity/Info.plist still apply) so we know its PID.
-MAC_HOME="$H" MAC_LOG_DIR="$H/logs" MAC_SUPERVISE=0 MAC_NO_ONBOARDING=1 MAC_NO_HUD=1 \
+MAC_HOME="$H" MAC_LOG_DIR="$H/logs" MAC_SUPERVISE=0 MAC_NO_ONBOARDING=1 MAC_NO_HUD=1 MAC_AEC_IDLE_S=3 \
   "$APP/Contents/MacOS/Mac" >"$H/app.out" 2>&1 &
 APP_PID=$!
 rc=0; wait "$FAKE" || rc=$?
@@ -41,7 +41,7 @@ chmod +x "$D/.venv/bin/python"
 MAC_HOME="$H" MAC_LOG_DIR="$H/logs2" MAC_DAEMON_DIR="$D" MAC_NO_ONBOARDING=1 MAC_NO_HUD=1 \
   "$APP/Contents/MacOS/Mac" >"$H/app2.out" 2>&1 &
 APP_PID=$!
-sleep 3
+for i in $(seq 1 40); do pgrep -f mac-e2e-claude >/dev/null && break; sleep 0.25; done
 if ! pgrep -f mac-e2e-claude >/dev/null; then echo "  FAIL quit_no_orphans: stub grandchild never appeared"; exit 1; fi
 t0=$(date +%s); kill -TERM "$APP_PID"; while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.2; done; dt=$(( $(date +%s) - t0 ))
 sleep 0.5

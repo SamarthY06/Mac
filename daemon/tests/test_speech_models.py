@@ -112,8 +112,11 @@ async def test_wake_then_utterance_one_breath(stack):
      "Hey Mark, can you order pizza?", "Hey Matt, are you coming?", "Hi Mike, how are you?"],
 )
 async def test_negatives_no_wake(stack, text):
-    """Runs even without Parakeet: then KWS hits are accepted unverified, i.e. stricter."""
-    events, lis, _ = await run_listener(stack, padded(tts16(stack, text)))
+    """Runs even without Parakeet: then KWS hits are accepted unverified, i.e. stricter.
+    Person names are rejected with accept_similar_names off (the strict N6 policy)."""
+    cfg = Config()
+    cfg.wake.accept_similar_names = False
+    events, lis, _ = await run_listener(stack, padded(tts16(stack, text)), cfg=cfg)
     ks = kinds(events)
     assert ListenerEventKind.WAKE not in ks, (text, ks, dict(lis.metrics.counters))
     assert ListenerEventKind.UTTERANCE not in ks
@@ -133,6 +136,25 @@ async def test_wake_latency_realtime(stack):
     assert hit_to_wake - verify < 160, (hit_to_wake, verify)
     if verify < 120:
         assert hit_to_wake < 250
+
+
+@needs_stt
+@pytest.mark.parametrize("voice", ["hf_alpha", "hm_psi", "hf_beta"])
+async def test_accented_wake(stack, voice):
+    """Hindi-accented English (Kokoro hf/hm voices, lang en-us) must wake with the defaults:
+    Parakeet hears "Hey Mark" for these, so stage 2 relies on accept_similar_names."""
+    k = stack.tts.kokoro
+    saved = k.voice
+    k.voice = voice
+    try:
+        speech = tts16(stack, "Hey Mac, what time is it?")
+    finally:
+        k.voice = saved
+    events, lis, _ = await run_listener(stack, padded(speech))
+    ks = kinds(events)
+    assert ListenerEventKind.WAKE in ks, (voice, ks, dict(lis.metrics.counters))
+    utt = next(e.utterance for e in events if e.kind is ListenerEventKind.UTTERANCE)
+    assert utt.woke and "time" in utt.text.lower(), utt.text
 
 
 @needs_stt

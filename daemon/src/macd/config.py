@@ -30,9 +30,10 @@ KEYCHAIN_SERVICE = "mac-agent"
 @dataclass
 class WakeConfig:
     phrases: list[str] = field(default_factory=lambda: ["hey mac", "ok mac"])
-    kws_threshold: float = 0.25  # sherpa-onnx keywords_threshold (lower = more sensitive)
-    kws_score: float = 1.5  # sherpa-onnx keywords_score (boost)
+    kws_threshold: float = 0.1  # sherpa-onnx keywords_threshold (lower = more sensitive; 0.25 missed accented speech)
+    kws_score: float = 1.5  # sherpa-onnx keywords_score (boost; higher values LOWER recall on this model)
     verify: bool = True  # stage-2 STT verification of wake hits
+    accept_similar_names: bool = True  # stage 2 also accepts "hey mark/make/mic..." (what STT hears for accented "mac")
 
 
 @dataclass

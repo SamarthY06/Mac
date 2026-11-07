@@ -145,9 +145,9 @@ def connect_checks(cfg: config.Config) -> list[Check]:
               connect.FIX_BROWSER if not ch["browser_running"] else ""),
         Check("ok" if ch["extension_installed"] else "fail", "Claude in Chrome extension",
               "installed" if ch["extension_installed"] else "not found", "" if ch["extension_installed"] else connect.FIX_EXTENSION),
-        Check("ok" if ch["native_host"] and ch["enabled_by_default"] else "fail", "Claude in Chrome enabled",
+        Check("ok" if ch["native_host"] else "fail", "Claude in Chrome connected",
               f"native host {'ok' if ch['native_host'] else 'missing'}, enabled by default {ch['enabled_by_default']}",
-              "" if ch["native_host"] and ch["enabled_by_default"] else connect.FIX_ENABLE),
+              "" if ch["native_host"] else connect.FIX_CONNECT),
     ]
     return out
 

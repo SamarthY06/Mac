@@ -21,7 +21,7 @@ class ClassifiedError:
 
 
 MESSAGES = {
-    BrainErrorKind.AUTH: "I'm not signed in to Claude. Open Terminal, run claude, and sign in — then ask me again.",
+    BrainErrorKind.AUTH: "I'm not signed in to Claude. Open Terminal, run claude, and sign in, then ask me again.",
     BrainErrorKind.RATE_LIMIT: "I've hit the Claude usage limit. Please try again later.",
     BrainErrorKind.NETWORK: "I can't reach Claude right now. Please check the internet connection.",
     BrainErrorKind.CLI_MISSING: "I can't find Claude Code on this Mac. Please install it, then try again.",

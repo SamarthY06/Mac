@@ -240,3 +240,56 @@ async def test_stop_word_while_speaking():
     # playback ended -> no more stop-word captures (window closed by set_speaking(False))
     kinds, _, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT("stop"), before=lambda l: (l.set_speaking(True, "x"), l.set_speaking(False)))
     assert kinds == []
+
+
+class EventSink:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, type_, **fields):
+        self.events.append((type_, fields))
+        return True
+
+
+async def test_wake_instrumentation_events_and_counters():
+    sink = EventSink()
+    src = FileInput(audio((1.0, 1.6), (1.7, 2.6)), trailing_silence_s=0.5)
+    lis = ListenerImpl(src, FakeWake(int(1.6 * SAMPLE_RATE)), FakeVAD(), FakeSTT(), Config(), eventlog=sink)
+    kinds = []
+
+    async def collect():
+        async for ev in lis.events():
+            kinds.append(ev.kind)
+
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
+    types = [t for t, _ in sink.events]
+    assert types[:2] == ["kws_hit", "wake_verify"]
+    assert sink.events[0][1]["phrase"] == "hey mac" and sink.events[1][1] == {
+        "source": "file", "accepted": True, "transcript": "hey mac what time is it", "reason": "phrase_found"}
+    c = lis.metrics.counters
+    assert c["kws_hits"] == 1 and c["wakes"] == 1 and c.get("false_wakes", 0) == 0
+    assert lis.metrics.latency("kws_hit_to_wake")["n"] == 1
+    # rejected + suppressed hits are logged with reasons
+    sink = EventSink()
+    src = FileInput(audio((1.0, 1.6), (1.7, 2.6)), trailing_silence_s=0.5)
+    lis = ListenerImpl(src, FakeWake(int(1.6 * SAMPLE_RATE)), FakeVAD(), FakeSTT("big mac"), Config(), eventlog=sink)
+    lis.set_speaking(True, "I'm Mac")
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
+    assert [t for t, _ in sink.events] == ["kws_hit", "wake_suppressed"] and sink.events[1][1]["reason"] == "self_trigger"
+    assert lis.metrics.counters["wakes_suppressed"] == 1
+
+
+async def test_wake_right_after_mac_stops_speaking_and_during_followup():
+    """The tail guard only blocks VAD captures; a wake word 0.5 s after playback ends is caught,
+    and a wake hit inside an open FOLLOWUP window still takes the woke path."""
+    def before(l):
+        l.set_speaking(True, "Here is the answer")
+        l.set_speaking(False)  # playback just ended at t=0: guard active for tail_guard_ms
+        l.open_window(6.0, WindowReason.FOLLOWUP)
+
+    kinds, events, lis = await run(audio((0.5, 1.1), (1.2, 2.1)), wake_at=1.1, before=before)
+    # the follow-up window's VAD capture starts on "hey mac" itself (SPEECH_START), then the KWS
+    # hit takes over: exactly one utterance, woke, not attributed to the window
+    assert [k for k in kinds if k is not K.SPEECH_START] == [K.WAKE, K.UTTERANCE]
+    assert events[-1].utterance.woke and events[-1].utterance.window is None
+    assert lis._window_end is None  # the wake closed the follow-up window

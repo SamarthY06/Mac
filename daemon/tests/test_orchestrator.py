@@ -335,6 +335,75 @@ def test_confirmation_line(summary: str, target: str, line: str) -> None:
     assert P.confirmation_line(summary, target) == line
 
 
+@pytest.mark.parametrize(
+    ("t", "out"),
+    [("a — b", "a, b"), ("a – b", "a, b"), ("a - b", "a, b"), ("well-known", "well-known"), ("x—y", "x, y"),
+     ("This is taking a while — I'll keep going.", "This is taking a while, I'll keep going."), ("plain", "plain")],
+)
+def test_dedash(t: str, out: str) -> None:
+    assert P.dedash(t) == out
+
+
+def test_no_dashes_in_spoken_phrases() -> None:
+    assert all("—" not in p and "–" not in p for p in P.PREWARM_PHRASES)
+    assert "—" not in P.confirmation_line("Send it — to Bob", "") and "—" not in P.confirmation_line("x", "Slack: Send")
+
+
+async def test_spoken_text_has_no_dashes(rig: Rig) -> None:
+    rig.scripts["summarize"] = [text("First point — second point.\n"), pause()]
+    rig.mic.say("summarize", woke=True)
+    await wait_until(lambda: any("second point" in s for s in rig.spoken))
+    assert all("—" not in s for s in rig.spoken)
+    rig.orch.say("Phone session — local mic paused")
+    await wait_until(lambda: "Phone session, local mic paused" in rig.spoken)
+
+
+def test_listener_metrics_plumbing() -> None:
+    """A's listener feeds the daemon Metrics object it is given (status then shows kws_hits etc.)."""
+    from macd.eventlog import Metrics
+    from macd.speech.factory import SpeechStack, make_listener
+
+    class Src:
+        name = "local"
+        requires_wake_word = True
+
+        async def start(self) -> None:
+            return
+
+        async def close(self) -> None:
+            return
+
+        def frames(self):
+            return iter(())
+
+    class Wake:
+        def accept(self, frame, idx):
+            return None
+
+        def reset(self) -> None:
+            return
+
+    class Vad:
+        def accept(self, frame):
+            return 0.0
+
+        def reset(self) -> None:
+            return
+
+    class Stt:
+        async def transcribe(self, pcm):
+            return ""
+
+    m = Metrics()
+    stack = SpeechStack(make_wake=Wake, make_vad=Vad, stt=Stt(), tts=None)  # type: ignore[arg-type]
+    lst = make_listener(Src(), stack, make_cfg(), metrics=m)  # type: ignore[arg-type]
+    assert lst.metrics is m
+    m.incr("kws_hits")
+    m.observe("listener_kws", 1.5)
+    snap = m.snapshot()
+    assert snap["counters"]["kws_hits"] == 1 and snap["latency_ms"]["listener_kws"]["n"] == 1
+
+
 def test_visible_strips_invisible_chars() -> None:
     assert P.visible("\u200eSend\u200f  now\ufeff") == "Send now"
 

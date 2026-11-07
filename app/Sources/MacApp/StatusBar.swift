@@ -76,7 +76,7 @@ final class StatusBar: NSObject, NSMenuDelegate {
         let animated = !off && !model.muted && model.state.isActive && !UX.reduceMotion
         b.alphaValue = off ? 0.45 : 1
         b.setAccessibilityLabel("Mac: \(model.statusLine)")
-        b.toolTip = "Mac — \(model.statusLine)"
+        b.toolTip = "Mac: \(model.statusLine)"
         if let s = shown, s.glyph == glyph, s.animated == animated { return }
         shown = (glyph, animated)
         bounceReset?.cancel()

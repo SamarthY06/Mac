@@ -31,11 +31,18 @@ _PREFIX_ALIASES: dict[str, set[str]] = {
 }
 # TODO(later): weak prefixes still accept the exact name anywhere in a sentence ("I bought a Mac" verifies);
 # consider requiring the phrase at/near the start of the verification transcript.
-_WEAK_PREFIXES = {"a", "he", "eh"}  # only accept the exact name after these
+_WEAK_PREFIXES = {"a", "eh"}  # only accept the exact name after these ("he" counts as strong: STT often hears "Hey" as "He")
 _NAME_ALIASES: dict[str, set[str]] = {
     "mac": {"mac", "mack", "mak", "mach", "mag", "mc", "macs", "mac's", "max"},
 }
 _NAME_WEAK = {"max"}  # accepted only after a strong prefix ("a max of five" is not a wake)
+# What STT hears for an accented "mac" (Indian English: "Hey Mark", "Hey Make"...). Accepted
+# after a STRONG prefix only, and only when the KWS already fired (stage 2 runs after a hit),
+# when WakeConfig.accept_similar_names is on. Costs: "Hey Mark, order pizza" said to a person
+# named Mark can wake Mac if the KWS also fires on it.
+_NAME_SIMILAR: dict[str, set[str]] = {"mac": {"mark", "mic", "mech", "mec", "mak", "mack", "mag", "mach"}}
+# ("make"/"matt"/"mike" deliberately excluded: never heard for an accented "mac" in the Kokoro
+# hf/hm corpus, and "Hey, make a note" is a real KWS false alarm.)
 # STT sometimes fuses the name with the next word ("Hey Macstop!", "Mac.Stop"); these are real
 # compounds that must not be read as "mac" + remainder.
 _NAME_COMPOUNDS = {"macbook", "macbooks", "macos", "macintosh", "machine", "machines", "macaroni", "macro", "macros", "macdonald", "macdonalds"}
@@ -73,13 +80,20 @@ def _fuzzy(word: str, target: str) -> bool:
 class WakePhrases:
     """Stage-2 matcher for the configured wake phrases (fuzzy, name-safe)."""
 
-    def __init__(self, phrases: list[str] | tuple[str, ...] = DEFAULT_PHRASES) -> None:
+    def __init__(self, phrases: list[str] | tuple[str, ...] = DEFAULT_PHRASES, accept_similar_names: bool = False) -> None:
+        self.accept_similar_names = accept_similar_names
         self.phrases = [w for w in (_words(p) for p in phrases) if w]
         if not self.phrases:
             raise ValueError("no wake phrases configured")
         self.names = {p[-1] for p in self.phrases}
         aliases = {a for n in self.names for a in _NAME_ALIASES.get(n, {n})}
         self._mention = re.compile(r"\b(?:" + "|".join(re.escape(a) for a in sorted(aliases)) + r")\b")
+
+    def _glued_names(self, name: str) -> set[str]:
+        names = {name} | _NAME_ALIASES.get(name, set())
+        if self.accept_similar_names:
+            names |= _NAME_SIMILAR.get(name, set())
+        return names
 
     def _match_prefix(self, word: str, target: str) -> bool:
         return word in _PREFIX_ALIASES.get(target, {target}) or _fuzzy(word, target)
@@ -93,6 +107,10 @@ class WakePhrases:
             return len(word) if strong_prefix and word in _NAME_ALIASES.get(target, set()) else 0
         if word in _NAME_ALIASES.get(target, {target}) or _fuzzy(word, target):
             return len(word)
+        if self.accept_similar_names and strong_prefix:
+            for sim in _NAME_SIMILAR.get(target, set()):
+                if word == sim or (word.startswith(sim) and word[len(sim):] in ("s", "ed")):  # "marked", "marks"
+                    return len(word)
         head = re.split(r"[.']", word, 1)[0]
         if head != word and head in _NAME_ALIASES.get(target, {target}):
             return len(head)  # "mac.stop"
@@ -108,8 +126,10 @@ class WakePhrases:
                 *prefix, name = phrase
                 if not prefix:
                     continue  # a bare name is never a wake word in stage 2
-                if len(prefix) == 1 and w in {p + name for p in _PREFIX_ALIASES.get(prefix[0], {prefix[0]})}:
-                    return s, e  # glued: "heymac"
+                if len(prefix) == 1:
+                    glued = {p + n for p in _PREFIX_ALIASES.get(prefix[0], {prefix[0]}) for n in self._glued_names(name)}
+                    if w in glued:
+                        return s, e  # glued: "heymac", "haymark"
                 if i + len(phrase) > len(toks):
                     continue
                 if not all(self._match_prefix(toks[i + k][0], prefix[k]) for k in range(len(prefix))):
@@ -184,7 +204,7 @@ def _pick(dir_: Path, stem: str) -> str:
 class KeywordSpotterModel:
     """Shared KeywordSpotter (thread-safe in sherpa); create one stream per detector."""
 
-    def __init__(self, kws_dir: Path, phrases: list[str], score: float, threshold: float, num_threads: int = 1) -> None:
+    def __init__(self, kws_dir: Path, phrases: list[str], score: float, threshold: float, num_threads: int = 1, max_active_paths: int = 8) -> None:
         import sherpa_onnx
 
         self._tmp = tempfile.TemporaryDirectory(prefix="macd-kws-")
@@ -199,7 +219,7 @@ class KeywordSpotterModel:
             num_threads=num_threads,
             keywords_score=score,
             keywords_threshold=threshold,
-            max_active_paths=4,
+            max_active_paths=max_active_paths,  # 8 (not 4): +12 % recall on accented speech, stage 2 absorbs the extra FAs
             num_trailing_blanks=1,
             provider="cpu",
         )

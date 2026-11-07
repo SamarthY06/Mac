@@ -186,14 +186,13 @@ class ControlSide:
                 claude = {"installed": mode != "missing", "version": "" if mode == "missing" else "2.1.3",
                           "min_ok": mode != "missing", "signed_in": "yes" if signed else ("unknown" if mode == "missing" else "no"),
                           "auth_method": "api_key" if mode == "api_key" else ("claude.ai" if signed else ""),
-                          "fix": {"signed_out": "Open Terminal and run: claude — then sign in.",
+                          "fix": {"signed_out": "Run claude in Terminal and sign in.",
                                   "missing": "Install Claude Code from claude.com/claude-code."}.get(mode, "")}
                 chrome_ok = mode == "connected"
                 chrome = {"browser_running": mode != "chrome_off", "extension_installed": True, "native_host": chrome_ok,
                           "enabled_by_default": chrome_ok, "connected": chrome_ok,
                           "connected_state": "connected" if chrome_ok else ("unavailable_api_key" if mode == "api_key" else "not_connected"),
-                          "fix": "" if chrome_ok else ("Open Chrome, then check again." if mode == "chrome_off"
-                                                       else "Chrome must be open and the extension signed in to the same claude.ai account.")}
+                          "fix": "Open Chrome, then check again." if mode == "chrome_off" else ""}
                 reply["data"] = {"claude": claude, "chrome": chrome, "ready": signed and chrome_ok}
                 if deep:
                     threading.Timer(1.2, self.send, args=(reply,)).start()   # the real check asks Claude (up to ~90 s)
@@ -416,9 +415,14 @@ def main() -> int:
     with audio.cv:
         n_hello = len(audio.hellos)
     control.send({"event": "state", "state": "idle"})
-    # idle → voice processing off: a fresh HELLO with aec=false and a real device
+    # idle → AEC stays on for MAC_AEC_IDLE_S (3 s in e2e; 60 s in real life), THEN a single
+    # rebuild without voice processing: a fresh HELLO with aec=false and a real device.
+    time.sleep(1.0)
+    with audio.cv:
+        early = len(audio.hellos) > n_hello
+    check("aec_kept_right_after_idle", not early, "no rebuild in the first second of idle")
     got = audio.wait(lambda: len(audio.hellos) > n_hello and audio.hellos[-1].get("aec") is False
-                     and audio.hellos[-1].get("input_device") not in (None, "none"), 6)
+                     and audio.hellos[-1].get("input_device") not in (None, "none"), 15)
     check("aec_off_when_idle", got, audio.hellos[-1] if audio.hellos else None)
     time.sleep(1.0)
     with audio.cv:
@@ -427,6 +431,22 @@ def main() -> int:
     with audio.cv:
         alive = len(audio.mic_times) > before + 30
     check("still_streaming_after_tests", alive, f"{len(audio.mic_times) - before} mic frames in 1 s after AEC-off rebuild")
+
+    # --- rapid state churn: 20× idle→listening→thinking→speaking→idle in 6 s. The engine
+    # must keep streaming and must never log a failed start (checked via the app's HELLOs:
+    # input_device must never become "none").
+    with audio.cv:
+        n_hello = len(audio.hellos); n0 = len(audio.mic_times)
+    for i in range(20):
+        for st in ("listening", "thinking", "speaking", "idle"):
+            control.send({"event": "state", "state": st}); time.sleep(0.075)
+    time.sleep(3.0)
+    with audio.cv:
+        new_hellos = audio.hellos[n_hello:]; n1 = len(audio.mic_times)
+    dead = [h for h in new_hellos if h.get("input_device") in (None, "none")]
+    rate = (n1 - n0) / 9.0
+    check("rapid_toggle_no_failed_start", not dead and rate > 30,
+          f"{len(new_hellos)} HELLOs during churn, none with input none; {rate:.1f} frames/s over the churn window")
 
     # --- off switch: state=off must release the engine (no MIC frames), state=idle resumes
     with audio.cv:

@@ -147,6 +147,25 @@ async def test_slow_client_dropped(server: tuple[ControlServer, FakeHandler, Pat
     w.close()
 
 
+async def test_client_gone_mid_write_is_quiet(server: tuple[ControlServer, FakeHandler, Path], caplog: pytest.LogCaptureFixture) -> None:
+    """A subscribed client that closes while events are being written must be dropped without an ERROR."""
+    srv, _h, sock = server
+    r, w = await connect(sock)
+    await rpc(r, w, {"id": 1, "cmd": "subscribe"})
+    w.transport.abort()  # go away abruptly (RST), without reading
+    w.close()
+    with caplog.at_level("DEBUG"):
+        for i in range(50):
+            srv.publish({"event": "activity", "i": i, "blob": "z" * 20_000})
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.1)
+    assert not [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert srv.client_count == 0
+    r2, w2 = await connect(sock)  # server still fine
+    assert (await rpc(r2, w2, {"id": 1, "cmd": "status"}))["ok"]
+    w2.close()
+
+
 async def test_foreign_uid_refused(monkeypatch: pytest.MonkeyPatch, server: tuple[ControlServer, FakeHandler, Path]) -> None:
     srv, h, sock = server
     monkeypatch.setattr(control, "peer_uid", lambda s: os.getuid() + 1)

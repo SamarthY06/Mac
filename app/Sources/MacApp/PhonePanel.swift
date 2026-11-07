@@ -44,7 +44,8 @@ final class PhonePanel {
                                                              enable: { [weak self] in self?.state.content = .loading; self?.onEnable?() },
                                                              retry: { [weak self] in self?.state.content = .loading; self?.onRetry?() },
                                                              close: { [weak w] in w?.close() }))
-            hc.sizingOptions = [.preferredContentSize]
+            hc.sizingOptions = []  // crash fix: with .fullSizeContentView, content-driven sizing loops (safe area ↔ frame) until AppKit throws
+            w.setContentSize(NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height)))
             w.contentViewController = hc
             w.center()
             window = w
@@ -118,7 +119,7 @@ struct PhoneView: View {
                         .padding(8).background(Color.white, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .accessibilityLabel("QR code for the phone link")
                 }
-                Text("Scan with your phone — the link works for 15 minutes.")
+                Text("Scan with your phone. The link works for 15 minutes.")
                     .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                 let pin = model.remote.pin.isEmpty ? state.pin : model.remote.pin

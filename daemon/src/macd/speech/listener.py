@@ -114,11 +114,13 @@ class ListenerImpl:
         cfg: Config,
         aec: bool | Callable[[], bool] = False,
         metrics: Metrics | None = None,
+        eventlog: Any = None,
     ) -> None:
         self.source = source
         self.source_name = source.name
         self.speaking = False
         self.metrics = metrics or Metrics()
+        self.eventlog = eventlog  # anything with .emit(type, **fields); None = no event log
         self.frame_ms_max = 0.0  # loop time per frame (KWS executor wait excluded)
         self.kws_ms_max = 0.0
         self._wake = wake
@@ -126,7 +128,7 @@ class ListenerImpl:
         self._stt = stt
         self._cfg = cfg
         self._aec = aec
-        self._phrases = WakePhrases(cfg.wake.phrases)
+        self._phrases = WakePhrases(cfg.wake.phrases, accept_similar_names=cfg.wake.accept_similar_names)
         self._requires_wake = source.requires_wake_word and wake is not None
         self._ring = RingBuffer(_samples(PREROLL_S))
         self._pos = 0  # absolute index of the next sample
@@ -267,14 +269,21 @@ class ListenerImpl:
             if hit is not None and not self._muted:
                 self._on_hit(hit)
 
+    def _emit_log(self, type_: str, **fields: Any) -> None:
+        if self.eventlog is not None:
+            self.eventlog.emit(type_, source=self.source_name, **fields)
+
     def _on_hit(self, hit: WakeHit) -> None:
         self.metrics.incr("kws_hits")
+        self._emit_log("kws_hit", phrase=hit.phrase, at_s=round(hit.sample_index / SAMPLE_RATE, 2), speaking=self.speaking)
         if self.speaking and not self.aec and self._phrases.mentions(self._current_text):
             self.metrics.incr("wakes_suppressed")
+            self._emit_log("wake_suppressed", reason="self_trigger", spoken=self._current_text[:80])
             log.info("wake hit suppressed (self-trigger: speaking %r)", self._current_text[:40])
             return
         cur = self._capture
         if cur is not None and cur.woke and not cur.rejected:
+            self._emit_log("wake_suppressed", reason="already_capturing")
             return  # already capturing after a wake word
         start = max(self._ring.oldest, hit.sample_index - _samples(WAKE_LOOKBACK_S))
         # The KWS hit can land after a short command fused with the wake phrase ("Hey Mac, stop"),
@@ -296,6 +305,7 @@ class ListenerImpl:
             cap.verify_at = hit.sample_index + _samples(VERIFY_TAIL_S)
         else:
             cap.verified = True
+            self._emit_log("wake_verify", accepted=True, transcript=None, reason="verify_disabled")
             self._enqueue(self._emit_wake(cap))
         self._capture = cap
 
@@ -413,6 +423,7 @@ class ListenerImpl:
         if c.wall_hit:
             self.metrics.observe_since("kws_hit_to_wake", c.wall_hit)
         self._window_end = None  # a verified wake supersedes any open window
+        self.metrics.incr("wakes")
         self._queue.put_nowait(ListenerEvent(ListenerEventKind.WAKE, self.source_name, wake=c.hit))
         if c.speech_start_pending:
             c.speech_start_pending = False
@@ -435,10 +446,12 @@ class ListenerImpl:
         text = await self._transcribe(audio, "wake_verify_stt")
         if text is None or self._phrases.verify(text):
             c.verified = True  # no STT -> lighter path: trust the KWS hit
+            self._emit_log("wake_verify", accepted=True, transcript=text, reason="no_stt" if text is None else "phrase_found")
             await self._emit_wake(c)
         else:
             c.rejected = True
             self.metrics.incr("false_wakes")
+            self._emit_log("wake_verify", accepted=False, transcript=text, reason="phrase_not_found")
             log.info("false wake rejected by stage-2 (heard %r)", text)
             self._queue.put_nowait(ListenerEvent(ListenerEventKind.FALSE_WAKE, self.source_name, wake=c.hit))
 

@@ -115,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         setupNotifications()
         model.guided = GuidedActions(control: control, model: model)
+        model.guided?.onNotify = { [weak self] t, b in self?.notify(title: t, body: b, path: nil) }
         // Test hook: MAC_DEBUG_GUIDED=installClaude|signIn|installExtension|connectChrome runs
         // that guided action 2 s after launch (with MAC_GUIDED_NO_OPEN=1 it only writes the script).
         if let a = Paths.env["MAC_DEBUG_GUIDED"] {
@@ -318,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !visible, !warnedHiddenItem else { return }
         warnedHiddenItem = true
         notify(title: "Mac is running",
-               body: "Its menu bar icon is hidden by the notch or a full menu bar. Opening the Mac window…",
+               body: "Its menu bar icon is hidden by the notch or a full menu bar. Opening the Mac window.",
                path: nil)
         showMainWindow()
     }
@@ -426,6 +427,25 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
 // Ignore SIGPIPE globally (sockets also use SO_NOSIGPIPE; the child's pipes don't).
 signal(SIGPIPE, SIG_IGN)
+
+// Safety net: an uncaught ObjC exception (AppKit layout, KVO …) would abort the app and
+// take the daemon down with it (stdin EOF). Log the reason + backtrace to app.log, then
+// relaunch ourselves (LaunchServices starts a fresh instance; the old one aborts) so the
+// user sees at most a blink. `MAC_NO_RELAUNCH=1` disables the relaunch (tests).
+NSSetUncaughtExceptionHandler { ex in
+    let reason = "\(ex.name.rawValue): \(ex.reason ?? "?")"
+    Log.error("UNCAUGHT EXCEPTION \(reason)\n" + ex.callStackSymbols.prefix(25).joined(separator: "\n"), "crash")
+    Log.flush()
+    if ProcessInfo.processInfo.environment["MAC_NO_RELAUNCH"] != "1",
+       Bundle.main.bundleIdentifier != nil, !ProcessInfo.processInfo.arguments.contains("--relaunched") {
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.createsNewApplicationInstance = true
+        cfg.arguments = ["--relaunched"]
+        let sem = DispatchSemaphore(value: 0)
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: cfg) { _, _ in sem.signal() }
+        _ = sem.wait(timeout: .now() + 3)
+    }
+}
 
 // `Mac --unregister-login-item`: used by install.sh --uninstall (SMAppService registrations
 // can only be removed by the app itself).

@@ -99,7 +99,7 @@ async def test_explicit_wake_phrases_win_over_derived() -> None:
 
 @pytest.mark.parametrize(
     ("changes", "bad_key", "msg"),
-    [({"name": ""}, "name", "1–32"), ({"name": "x" * 40}, "name", "1–32"), ({"tts.speed": 5}, "tts.speed", "between"),
+    [({"name": ""}, "name", "1 to 32"), ({"name": "x" * 40}, "name", "1 to 32"), ({"tts.speed": 5}, "tts.speed", "between"),
      ({"listen.silence_ms": 50}, "listen.silence_ms", "between"), ({"tts.engine": "robot"}, "tts.engine", "kokoro"),
      ({"wake.phrases": []}, "wake.phrases", "at least one"), ({"wake.phrases": "hey this is way too long"}, "wake.phrases", "two to four"),
      ({"wake.phrases": ["jarvis"]}, "wake.phrases", "two to four"),

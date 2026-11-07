@@ -97,6 +97,8 @@ class Daemon:
         self.stop = asyncio.Event()
         self.eventlog = EventLog(config.EVENT_LOG)
         self.metrics = Metrics()
+        for name in ("kws_hits", "wakes", "false_wakes", "wakes_suppressed", "stop_words", "turns"):
+            self.metrics.counters[name] = 0  # visible in `macctl status` before the first event
         self.stack: Any = None
         self.voice_reason = ""
         self.inputs: list[AudioInput] = []
@@ -180,7 +182,7 @@ class Daemon:
 
         output = self.output
         return make_listener(inp, self.stack, self.cfg, aec=lambda: bool(output is not None and output.aec),
-                             metrics=self.metrics)
+                             metrics=self.metrics, eventlog=self.eventlog)
 
     def _spawn(self, coro: Any, name: str) -> None:
         t = asyncio.create_task(coro, name=name)

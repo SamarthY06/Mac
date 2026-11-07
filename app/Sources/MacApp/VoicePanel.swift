@@ -32,7 +32,8 @@ final class VoicePanel {
             w.level = .floating
             w.setAccessibilityLabel("Give Mac a voice")
             let hc = NSHostingController(rootView: VoiceView(state: state, model: model, close: { [weak w] in w?.close() }))
-            hc.sizingOptions = [.preferredContentSize]
+            hc.sizingOptions = []  // crash fix: with .fullSizeContentView, content-driven sizing loops (safe area ↔ frame) until AppKit throws
+            w.setContentSize(NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height)))
             w.contentViewController = hc
             w.center()
             window = w
@@ -174,7 +175,7 @@ final class VoiceState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         let seconds = Self.maxSeconds - remaining
         guard ok, seconds >= 2 else {
             try? FileManager.default.removeItem(at: url)
-            phase = .failed(ok ? "That was too short — record at least a few seconds." : "Recording didn’t finish. Try again.")
+            phase = .failed(ok ? "That was too short. Record at least a few seconds." : "Recording didn’t finish. Try again.")
             return
         }
         sample = url
@@ -232,9 +233,9 @@ final class VoiceState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             if ok {
                 self.model.setVoiceEngine(data["voice_engine"] ?? data["engine"] ?? "clone",
                                           sample: data["clone_sample"] ?? sample.path)
-                self.phase = .done("Done — say “Hey Mac” to hear it.")
+                self.phase = .done("Done. Say “Hey Mac” to hear it.")
             } else {
-                self.phase = .failed(err ?? "Couldn’t clone that voice.")
+                self.phase = .failed(UX.noDash(err ?? "Couldn’t clone that voice."))
             }
         }
         if !sent { phase = .failed("Mac isn’t connected yet. Try again in a moment.") }

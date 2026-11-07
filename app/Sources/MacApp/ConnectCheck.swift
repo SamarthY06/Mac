@@ -28,10 +28,14 @@ struct ConnectCheck: Equatable {
     var checking = false      // a deep check is in flight
     var checkedAt: Date?
 
-    /// Chrome is usable for browser tasks (what the "Connect Chrome…" poll waits for).
-    var chromeReady: Bool {
-        chrome.nativeHost == true && chrome.extensionInstalled == true && chrome.enabledByDefault != false
-    }
+    /// Equality that ignores `checkedAt`/`checking` (what the UI should react to).
+    func sameFacts(as o: ConnectCheck) -> Bool { claude == o.claude && chrome == o.chrome && ready == o.ready }
+
+    /// Chrome is usable for browser tasks: extension + native host (we pass --chrome ourselves,
+    /// so "Enabled by default" is informational only).
+    var chromeReady: Bool { chrome.nativeHost == true && chrome.extensionInstalled == true }
+    /// Fully connected (deep check succeeded).
+    var chromeConnected: Bool { chromeReady && chrome.connected == true }
 
     /// `status.connect` right after daemon boot: `{"pending": true, claude: null, chrome: null}`.
     static func isPending(_ d: [String: Any]) -> Bool { (d["pending"] as? Bool) == true }
@@ -76,6 +80,8 @@ final class GuidedActions {
     private let model: AppModel
     private var chromePoll: Timer?
     private var chromePollStarted: Date?
+    private var lastShallowReply: Date?
+    private var shallowInFlight = false
 
     init(control: ControlClient, model: AppModel) {
         self.control = control
@@ -87,9 +93,17 @@ final class GuidedActions {
     /// Static part (cheap): run on connect and from the status poll. `deep` is what the
     /// "Check connection" button does (daemon talks to the CLI / extension).
     func check(deep: Bool, completion: (@MainActor (ConnectCheck?) -> Void)? = nil) {
+        // Shallow checks are coalesced: a caller (view onAppear, poll, …) within 1 s of the
+        // last reply, or while one is in flight, gets the cached facts without a socket trip.
+        if !deep {
+            if shallowInFlight { completion?(model.connect); return }
+            if let t = lastShallowReply, Date().timeIntervalSince(t) < 1 { completion?(model.connect); return }
+            shallowInFlight = true
+        }
         if deep { model.connect.checking = true }
         let sent = control.send("connect_check", ["deep": deep]) { [weak self] ok, data, err in
             guard let self else { return }
+            if !deep { self.shallowInFlight = false; self.lastShallowReply = Date() }
             self.model.connect.checking = false
             guard ok else {
                 Log.warn("connect_check failed: \(err ?? "?")", "connect")
@@ -97,46 +111,77 @@ final class GuidedActions {
             }
             var c = ConnectCheck.parse(data)
             c.checking = false
-            self.model.connect = c
+            // Publish only when the facts changed (a new checkedAt alone must not re-render
+            // every observer, which is how a view-driven call could loop at socket speed).
+            if !c.sameFacts(as: self.model.connect) { self.model.connect = c } else { self.model.connect.checkedAt = c.checkedAt }
             Log.info("connect_check deep=\(deep): claude signed_in=\(c.claude.signedIn.map(String.init) ?? "?") chrome ready=\(c.chromeReady) ready=\(c.ready.map(String.init) ?? "?")", "connect")
             completion?(c)
         }
-        if !sent { model.connect.checking = false; completion?(nil) }
+        if !sent { shallowInFlight = false; model.connect.checking = false; completion?(nil) }
     }
 
-    /// "Check connection" button.
-    func checkConnection() { check(deep: true) }
+    /// "Connect" / "Check connection": deep check (the daemon runs our headless `claude --chrome`,
+    /// which registers the native host), then poll every 2 s until native host + extension +
+    /// connected, for up to 2 minutes. No Terminal involved.
+    func checkConnection() {
+        check(deep: true) { [weak self] c in
+            guard let self else { return }
+            if let c, c.chromeConnected { return }
+            self.startChromePolling(deepWhenReady: true)
+        }
+    }
 
     // MARK: guided fixes
 
-    /// "Install Claude Code…": Terminal runs the official installer, then `claude` to sign in.
+    /// "Install Claude Code": runs the official installer in the background (no Terminal),
+    /// logs its output, notifies when done, then re-checks. Sign-in still needs a Terminal.
+    private var installer: Process?
     func installClaude() {
-        runInTerminal(name: "install-claude-code", title: "Install Claude Code", lines: [
-            "echo 'Installing Claude Code (official installer)…'",
-            Self.claudeInstallCmd,
-            "export PATH=\"$HOME/.local/bin:$PATH\"",
-            "echo; echo 'Now sign in. A browser window will open; when you are back here, type /exit.'",
-            "claude || echo 'claude was not found on PATH — open a new Terminal window and run: claude'",
-        ])
+        guard installer == nil else { return }
+        model.connect.checking = true
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-lc", Self.claudeInstallCmd]
+        let out = Pipe(); p.standardOutput = out; p.standardError = out
+        p.terminationHandler = { [weak self] proc in
+            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.installer = nil
+                    self.model.connect.checking = false
+                    let ok = proc.terminationStatus == 0
+                    Log.info("Claude Code installer exit \(proc.terminationStatus): \(text.suffix(400))", "connect")
+                    self.onNotify?(ok ? "Claude Code installed" : "Claude Code install failed",
+                                   ok ? "Next: sign in to Claude." : "See the log (Open Logs in the menu).")
+                    self.check(deep: false)
+                }
+            }
+        }
+        do { try p.run(); installer = p; Log.info("running the Claude Code installer in the background", "connect") }
+        catch { model.connect.checking = false; Log.error("installer failed to start: \(error)", "connect") }
     }
 
-    /// "Sign in…": Terminal runs `claude`.
+    /// Posts a notification (wired by AppDelegate).
+    var onNotify: ((String, String) -> Void)?
+
+    /// "Sign in": the only step that needs a Terminal (interactive browser login).
     func signIn() {
         runInTerminal(name: "sign-in-claude", title: "Sign in to Claude", lines: [
-            "echo 'Signing in to Claude Code. Follow the prompts; when you are signed in, type /exit.'",
+            "echo 'Signing in to Claude. A browser window opens; when you are signed in, type /exit here.'",
             "export PATH=\"$HOME/.local/bin:$PATH\"",
-            "claude",
+            "claude /login",
         ])
     }
 
-    /// "Install extension…": Web Store page, in Chrome explicitly when Chrome isn't the default.
+    /// "Get the extension": Web Store page in Chrome (explicitly, if Chrome isn't the default
+    /// browser), then poll until the extension shows up.
     func installExtension() {
         let url = Self.extensionURL
         let defaultBrowser = NSWorkspace.shared.urlForApplication(toOpen: url)
         let chrome = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.Chrome")
         if let chrome, let d = defaultBrowser, Bundle(url: d)?.bundleIdentifier != "com.google.Chrome" {
-            let cfg = NSWorkspace.OpenConfiguration()
-            NSWorkspace.shared.open([url], withApplicationAt: chrome, configuration: cfg) { _, err in
+            NSWorkspace.shared.open([url], withApplicationAt: chrome, configuration: NSWorkspace.OpenConfiguration()) { _, err in
                 if let err { Log.warn("open in Chrome failed: \(err)", "connect") }
             }
             Log.info("opened Web Store in Chrome explicitly (default browser is \(d.lastPathComponent))", "connect")
@@ -144,34 +189,31 @@ final class GuidedActions {
             NSWorkspace.shared.open(url)
             Log.info("opened Web Store in the default browser (chrome installed: \(chrome != nil))", "connect")
         }
-        startChromePolling()
+        startChromePolling(deepWhenReady: false)
     }
 
-    /// "Connect Chrome…": Terminal runs `claude --chrome` with instructions; the app polls
-    /// until the native host + extension are in place, then re-checks deeply.
-    func connectChrome() {
-        runInTerminal(name: "connect-chrome", title: "Connect Claude to Chrome", lines: [
-            "echo '1. Press Enter at the dialog that appears.'",
-            "echo '2. Type /chrome and choose \"Enabled by default\".'",
-            "echo '3. Type /exit to come back.'; echo",
-            "export PATH=\"$HOME/.local/bin:$PATH\"",
-            "claude --chrome",
-        ])
-        startChromePolling()
-    }
+    /// Kept for API compatibility: same as the no-Terminal "Connect".
+    func connectChrome() { checkConnection() }
 
-    private func startChromePolling() {
+    /// Poll `connect_check {deep:false}` every 2 s (max 2 min). After "Get the extension" we
+    /// stop once the extension is installed; after "Connect" we stop once connected, and run
+    /// one more deep check as soon as extension + native host are there.
+    private func startChromePolling(deepWhenReady: Bool) {
         chromePoll?.invalidate()
         chromePollStarted = Date()
+        var deepDone = false
         chromePoll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
             MainActor.assumeIsolated {
                 guard let self else { t.invalidate(); return }
-                if Date().timeIntervalSince(self.chromePollStarted ?? Date()) > 300 { t.invalidate(); self.chromePoll = nil; return }
+                if Date().timeIntervalSince(self.chromePollStarted ?? Date()) > 120 { t.invalidate(); self.chromePoll = nil; return }
                 self.check(deep: false) { c in
-                    guard let c, c.chromeReady else { return }
-                    t.invalidate(); self.chromePoll = nil
-                    Log.info("Chrome extension + native host detected; deep re-check", "connect")
-                    self.check(deep: true)
+                    guard let c else { return }
+                    let done = deepWhenReady ? c.chromeConnected : (c.chrome.extensionInstalled == true)
+                    if done { t.invalidate(); self.chromePoll = nil; Log.info("Chrome: \(deepWhenReady ? "connected" : "extension installed")", "connect"); return }
+                    if deepWhenReady, c.chromeReady, !deepDone, !self.model.connect.checking {
+                        deepDone = true
+                        self.check(deep: true)
+                    }
                 }
             }
         }
@@ -187,9 +229,9 @@ final class GuidedActions {
             .appendingPathComponent("Library/Application Support/Mac", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("\(name).command")
-        var script = "#!/bin/bash\n# Generated by Mac.app — \(title)\nprintf '\\033]0;%s\\007' \"\(title)\"\nclear\n"
+        var script = "#!/bin/bash\n# Generated by Mac.app: \(title)\nprintf '\\033]0;%s\\007' \"\(title)\"\nclear\n"
         script += lines.joined(separator: "\n") + "\n"
-        script += "echo; echo 'Done — you can close this window and go back to Mac.'\n"
+        script += "echo; echo 'Done. You can close this window and go back to Mac.'\n"
         do {
             try script.write(to: file, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)

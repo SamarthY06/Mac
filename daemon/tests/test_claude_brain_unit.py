@@ -1210,3 +1210,16 @@ async def test_locked_context_note_on_and_off(make_brain) -> None:
     assert q[0] == "a"
     assert q[1].startswith(cb.LOCKED_NOTE) and q[1].endswith("b") and "Never try to unlock" in q[1]
     assert q[2] == "c"
+
+
+def test_no_dashes_in_spoken_strings(tmp_path: Path) -> None:
+    from macd.brain import errors, mac_tools, prompts
+
+    cfg = config.Config()
+    cfg.tts.lang = "hi"
+    persona = prompts.persona_prompt(cfg, browser_available=False, memory_path=tmp_path / "m.md")
+    assert "em dashes" in persona
+    for text in [persona, *errors.MESSAGES.values(), errors.CONNECTION_LOST, mac_tools.APPROVED,
+                 mac_tools.DECLINED, mac_tools.ALREADY_PENDING, mac_tools.NOTHING_TO_CONFIRM,
+                 cb.LOCKED_NOTE, cb.CHROME_DOWN_NOTE, cb.HANDOFF_PROMPT]:
+        assert "\u2014" not in text and "\u2013" not in text, text

@@ -33,7 +33,7 @@ final class AudioEngine: @unchecked Sendable {
     private var wantRunning = false
     private var poweredOff = false  // "Turn Off": engine released until turned on
     /// Voice processing (AEC/NS) costs ~18 % of a core by itself (Apple's BNNS model runs
-    /// in-process), so it is only enabled while a turn is in progress — see
+    /// in-process), so it is only enabled while a turn is in progress: see
     /// `setVoiceProcessingWanted`. Idle = plain input ≈ 0.5 %.
     private var vpWanted = false
     private var vpActive = false
@@ -211,27 +211,51 @@ final class AudioEngine: @unchecked Sendable {
         micAccum.removeAll(keepingCapacity: true)
     }
 
+    private var startAttempts = 0
+    private(set) var failedStarts = 0
+
+    /// Build a fresh engine. A rebuild right after a VPIO teardown can fail with -10875
+    /// (IsFormatSampleRateAndChannelCountValid: the output HW format is briefly invalid
+    /// while CoreAudio reconfigures) or -10868. Strategy (never leave the mic dead):
+    ///   1. retry with a FRESH engine every 250 ms, up to 8× (≈2 s);
+    ///   2. then fall back to the previous configuration (VP toggled back) with the same retries;
+    ///   3. only then wait 5 s and start over. Deferred PLAY/END survive all of this.
     private func buildAndStart(reason: String) {
         flushAll(reason: "engine rebuild")
         teardown()
-        let pinned = preferBuiltInMic ? pinBuiltInMicIfOnBluetooth() : nil
+        startAttempts = 0
+        attemptStart(reason: reason, voiceProcessing: preferVoiceProcessing && vpWanted, fallbackTried: false)
+    }
+
+    private func attemptStart(reason: String, voiceProcessing wantVP: Bool, fallbackTried: Bool) {
+        guard wantRunning, engine == nil else { return }
+        let pinned = preferBuiltInMic && startAttempts == 0 ? pinBuiltInMicIfOnBluetooth() : nil
         let defaultName = CoreAudioDevices.defaultInput().map(CoreAudioDevices.name) ?? "none"
-        let tryVP = preferVoiceProcessing && vpWanted && vpFailedForDevice != defaultName
+        let tryVP = wantVP && vpFailedForDevice != defaultName
         do {
-            try startEngine(voiceProcessing: tryVP, reason: reason, note: pinned)
+            try startEngine(voiceProcessing: tryVP, reason: reason + (startAttempts > 0 ? " (attempt \(startAttempts + 1))" : ""), note: pinned)
+            startAttempts = 0
             replayDeferred()
         } catch {
-            Log.warn("engine start failed (vp=\(tryVP)): \(error)", "audio")
             teardown()
-            if tryVP {
-                // Remember per input device so we don't retry VP in a loop. CoreAudio
-                // needs a moment after a failed VPIO init before a plain engine starts.
-                vpFailedForDevice = defaultName
-            }
-            setHello(Hello(input_device: "none", aec: false), error: "Audio engine failed: \(error.localizedDescription)")
-            if !tryVP { dropDeferred(reason: "engine failed") }  // VP retry follows in 1 s; keep audio for it
-            queue.asyncAfter(deadline: .now() + (tryVP ? 1 : 5)) { [self] in
-                if wantRunning && engine == nil { buildAndStart(reason: tryVP ? "no-AEC fallback" : "retry") }
+            startAttempts += 1
+            failedStarts += 1
+            Log.warn("engine start failed (vp=\(tryVP), attempt \(startAttempts)): \(error)", "audio")
+            if startAttempts < 8 {
+                queue.asyncAfter(deadline: .now() + 0.25) { [self] in attemptStart(reason: reason, voiceProcessing: wantVP, fallbackTried: fallbackTried) }
+            } else if !fallbackTried {
+                // Give up on this configuration: go back to the one that worked.
+                if tryVP { vpFailedForDevice = defaultName }
+                Log.warn("falling back to the previous configuration (vp=\(!wantVP))", "audio")
+                startAttempts = 0
+                queue.asyncAfter(deadline: .now() + 0.25) { [self] in attemptStart(reason: reason + " fallback", voiceProcessing: !wantVP, fallbackTried: true) }
+            } else {
+                setHello(Hello(input_device: "none", aec: false), error: "Audio engine failed: \(error.localizedDescription)")
+                dropDeferred(reason: "engine failed")
+                startAttempts = 0
+                queue.asyncAfter(deadline: .now() + 5) { [self] in
+                    if wantRunning && engine == nil { buildAndStart(reason: "retry") }
+                }
             }
         }
     }
@@ -566,7 +590,7 @@ final class AudioEngine: @unchecked Sendable {
 
     /// FLUSH(id): the daemon's SpeechQueue plays one stream at a time, so flushing one
     /// stream == stopping playback; any other open stream is reported DRAINED too
-    /// (simplicity #32 — the protocol is unchanged, only the bookkeeping is smaller).
+    /// (simplicity #32: the protocol is unchanged, only the bookkeeping is smaller).
     private func handleFlush(stream sid: UInt32) {
         if sid != 0 && !closedStreams.contains(sid) && streams[sid] == nil { finish(sid) }
         flushAll(reason: sid == 0 ? "FLUSH(0)" : "FLUSH(\(sid))")
@@ -606,7 +630,7 @@ extension AudioEngine: AudioLinkDelegate {
             Log.info("daemon HELLO: \(String(decoding: json, as: UTF8.self))", "link")
             let v = ((try? JSONSerialization.jsonObject(with: json)) as? [String: Any])?["version"] as? Int
             if v != Hello.protocolVersion {
-                Log.warn("audio protocol version mismatch: app \(Hello.protocolVersion), daemon \(v.map(String.init) ?? "missing") — update both sides", "link")
+                Log.warn("audio protocol version mismatch: app \(Hello.protocolVersion), daemon \(v.map(String.init) ?? "missing"): update both sides", "link")
             }
         case .mic, .drained: Log.warn("unexpected \(m.frameType) from daemon", "link")
         case .unknown(let t, _): Log.warn("unknown frame type \(t)", "link")

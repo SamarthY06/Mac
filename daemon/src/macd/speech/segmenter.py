@@ -62,6 +62,7 @@ _EMOJI = re.compile(
     "]+"
 )
 _STRAY = re.compile(r"(?<!\w)[*_#`]+|[*_#`]+(?!\w)")
+_DASH = re.compile(r"\s*[—–]\s*|\s+-\s+")  # em/en dashes and spaced hyphens are spoken as a comma pause
 _WS = re.compile(r"\s+")
 _SPACE_PUNCT = re.compile(r"\s+([.,!?;:])(?=\s|$)")
 _EXPAND = [(re.compile(r"\be\.g\.(?=\s|,|$)", re.IGNORECASE), "for example"), (re.compile(r"\bi\.e\.(?=\s|,|$)", re.IGNORECASE), "that is")]
@@ -101,6 +102,7 @@ def clean_inline(text: str) -> str:
     t = _STRAY.sub("", t)
     for rx, rep in _EXPAND:
         t = rx.sub(rep, t)
+    t = _DASH.sub(", ", t)
     t = _WS.sub(" ", t).strip()
     return _SPACE_PUNCT.sub(r"\1", t)
 

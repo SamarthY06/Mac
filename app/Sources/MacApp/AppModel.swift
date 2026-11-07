@@ -53,7 +53,7 @@ struct RemoteSession: Equatable {
 
     /// Banner text (HUD + menu).
     var banner: String {
-        if !present { return "Phone link ready — waiting for your phone" }
+        if !present { return "Phone link ready, waiting for your phone" }
         if !verified, !pin.isEmpty { return "Phone connected · PIN \(pin)" }
         return "Phone connected"
     }
@@ -80,7 +80,7 @@ final class AppModel: ObservableObject {
     @Published var userFromPhone = false   // the current user line came from the phone (N7 mirror)
     @Published var lastTranscript = ""
     @Published var lastReply = ""
-    @Published var inputDevice = "—"
+    @Published var inputDevice = "none yet"
     @Published var aec = false
     @Published var audioWarning: String?
     @Published var daemonStatus = ""
@@ -91,13 +91,13 @@ final class AppModel: ObservableObject {
     @Published var voiceUnavailable: String? // reason when speech models are missing/failed, else nil
     @Published var inputSwitchedNote: String?  // one-time line when the mic was switched (N5/UX#11)
     @Published var voiceReason = ""            // `voice_reason` from every state event, shown whenever non-empty
-                                               // (e.g. "Phone session — local mic paused" while a phone is present)
+                                               // (e.g. "Phone session: local mic paused" while a phone is present)
     @Published var onboardingVisible = false   // AppDelegate polls status faster while true
     @Published var voiceEngine = ""            // "kokoro" or "clone:<sample>" (from status.voice_engine)
     @Published var statusItemHidden = false    // menu bar icon hidden by the notch / overflow (AppDelegate sets)
     @Published var connect = ConnectCheck()    // Claude Code + Chrome connection state (ConnectCheck.swift)
     @Published var screenLocked = false        // set by AppDelegate from com.apple.screenIsLocked/Unlocked
-    static let screenLockedLine = "Screen locked — voice, Chrome and Mail/Calendar still work; clicking in apps resumes when you unlock"
+    static let screenLockedLine = "Screen locked: voice, Chrome and Mail/Calendar still work. Clicking in apps resumes when you unlock."
     var guided: GuidedActions?                 // "Install…/Sign in…/Connect Chrome…" buttons (set by AppDelegate)
 
     var onStateChange: ((AgentState) -> Void)?
@@ -171,15 +171,15 @@ final class AppModel: ObservableObject {
     /// While a phone is present the daemon sends `voice_reason` on every state event (B2);
     /// fallback copy if it is empty.
     var phoneSessionLine: String {
-        voiceReason.isEmpty ? "Phone session — local mic paused" : voiceReason
+        voiceReason.isEmpty ? "Phone session: local mic paused" : voiceReason
     }
 
     /// One-line status for the menu header and HUD caption.
     var statusLine: String {
         if off { return AgentState.off.label }
-        if muted { return "Muted — Mac can’t hear you" }
+        if muted { return "Muted. Mac can’t hear you" }
         if let why = voiceUnavailable {
-            return why.isEmpty ? "Can’t hear or speak — speech models missing" : "Voice unavailable — \(why)"
+            return why.isEmpty ? "Can’t hear or speak: speech models missing" : "Voice unavailable: \(why)"
         }
         if remote.active, !state.inTurn { return phoneSessionLine }
         if !voiceReason.isEmpty { return voiceReason }
@@ -196,8 +196,8 @@ final class AppModel: ObservableObject {
         }
         if remote.active { return state.inTurn ? phoneSessionLine : "Choose End Phone Session to resume." }
         if voiceUnavailable != nil { return "Re-run install.sh (it downloads the speech models)." }
-        if brainAuth == "signed_out" { return "Not signed in to Claude — choose Sign in to Claude…" }
-        if brainAuth == "missing" { return "Claude Code isn’t installed — choose Install Claude Code…" }
+        if brainAuth == "signed_out" { return "Not signed in to Claude. Choose Sign in to Claude…" }
+        if brainAuth == "missing" { return "Claude Code isn’t installed. Choose Install Claude Code…" }
         if screenLocked { return Self.screenLockedLine }
         if let w = audioWarning, !w.isEmpty { return w }
         if state == .error, !errorText.isEmpty { return errorText }
@@ -275,8 +275,8 @@ final class AppModel: ObservableObject {
             if let m = e["muted"] as? Bool { setMuted(m) }
             if let v = e["voice"] as? Bool {
                 let why = (e["voice_reason"] as? String) ?? ""
-                voiceUnavailable = v ? nil : (why.isEmpty ? "speech models missing" : why)
-                voiceReason = v ? why : ""   // a real voice problem takes precedence (shown above)
+                voiceUnavailable = v ? nil : (why.isEmpty ? "speech models missing" : UX.noDash(why))
+                voiceReason = v ? UX.noDash(why) : ""   // a real voice problem takes precedence (shown above)
             }
             setState(AgentState(rawValue: ((e["state"] as? String) ?? "").lowercased()) ?? .unknown)
         case "transcript":
@@ -308,7 +308,7 @@ final class AppModel: ObservableObject {
             applyRemote(e)
         case "error":
             errorKind = e["kind"] as? String ?? ""
-            errorText = e["message"] as? String ?? "Unknown error"
+            errorText = UX.noDash(e["message"] as? String ?? "Unknown error")
         default:
             break  // metrics etc.
         }
@@ -332,6 +332,14 @@ final class AppModel: ObservableObject {
 enum UX {
     /// System “Reduce Motion” (Accessibility › Display). Continuous effects become static glyphs.
     @MainActor static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    /// House style: no dashes in UI copy. Daemon strings pass through here before display.
+    static func noDash(_ s: String) -> String {
+        // Dashes as escapes so a text-level "remove all dashes" pass can't blank these patterns.
+        let em = "\u{2014}", en = "\u{2013}"
+        return s.replacingOccurrences(of: " \(em) ", with: ", ").replacingOccurrences(of: em, with: ", ")
+                .replacingOccurrences(of: " \(en) ", with: ", ")
+    }
 
     static func truncate(_ s: String, _ n: Int) -> String {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")

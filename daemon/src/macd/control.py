@@ -286,8 +286,8 @@ class ControlServer:
                 writer.close()
                 return
             if len(self._clients) >= self.max_clients:
-                writer.write(b'{"id":null,"ok":false,"error":"too many clients"}\n')
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(ConnectionError, OSError):
+                    writer.write(b'{"id":null,"ok":false,"error":"too many clients"}\n')
                     await asyncio.wait_for(writer.drain(), 1.0)
                 writer.close()
                 return
@@ -325,9 +325,10 @@ class ControlServer:
                     break
                 c.writer.write(line)
                 await c.writer.drain()
-        except (ConnectionError, OSError):
-            pass
+        except (ConnectionError, OSError) as e:  # client went away mid-write: drop it quietly
+            log.debug("control client %d disconnected while writing: %s", c.cid, e)
         finally:
+            c.closed = True
             with contextlib.suppress(Exception):
                 c.writer.close()
 

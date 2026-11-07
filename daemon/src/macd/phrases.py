@@ -19,7 +19,7 @@ DENIED = "Okay, I won't."
 CONFIRM_TIMEOUT = "No answer, so I won't."
 GOING_OFF = "Okay, going to sleep. Click the menu bar icon to wake me."
 STILL_WORKING = "Still working on it."
-HEARTBEATS = ("Still on it.", "This is taking a while — I'll keep going.")
+HEARTBEATS = ("Still on it.", "This is taking a while. I'll keep going.")
 PHONE_CONNECTED = "Phone connected."
 PHONE_PREEMPTED = "Someone joined from the phone."
 PIN_PROMPT = "Please say the four-digit code shown on the Mac."
@@ -54,6 +54,14 @@ _DELETE_RE = re.compile(r"\b(delete|remove|erase|discard|clear|unsubscribe)\b")
 _PAY_RE = re.compile(r"\b(pay|buy|order|purchase|checkout|transfer|book|subscribe)\b")
 MAX_SUMMARY_WORDS = 25
 _TRAILING_PUNCT_RE = re.compile(r"[.?!]+(['\"”’)\]]*)$")  # drop the final period, even inside closing quotes
+
+
+_DASH_RE = re.compile(r"\s*[—–]\s*|\s+-\s+")
+
+
+def dedash(text: str) -> str:
+    """No em/en dashes are ever spoken: "a — b" / "a – b" / "a - b" → "a, b"."""
+    return _DASH_RE.sub(", ", text).replace(",, ", ", ")
 
 
 def visible(text: str) -> str:
@@ -114,7 +122,7 @@ def confirmation_line(summary: str, target: str = "") -> str:
     core, phrase = humanize_target(target)
     if phrase and core and core not in s.lower():
         s = f"{s} {phrase}"
-    return f"{s}. {confirm_question(summary)}"
+    return dedash(f"{s}. {confirm_question(summary)}")
 
 
 def elapsed_phrase(seconds: float) -> str:

@@ -67,7 +67,7 @@ class SpeechStack:
         """Rebuild the KWS for ``phrases`` and swap it into every live listener; persists."""
         clean = validate_wake_phrases(phrases)
         model = self.make_kws_model(clean)  # ValueError if a phrase has no KWS tokens
-        wp = WakePhrases(clean)
+        wp = WakePhrases(clean, accept_similar_names=self.cfg.wake.accept_similar_names)
         self.cfg.wake.phrases = clean
         if model is not None:
             self.make_wake = lambda: self.make_detector(model)
@@ -229,11 +229,14 @@ def build_speech(cfg: Config, metrics: Metrics | None = None) -> SpeechStack:
 
 
 def make_listener(
-    source: AudioInput, stack: SpeechStack, cfg: Config, aec: bool | Callable[[], bool] = False, metrics: Metrics | None = None
+    source: AudioInput, stack: SpeechStack, cfg: Config, aec: bool | Callable[[], bool] = False,
+    metrics: Metrics | None = None, eventlog: Any = None,
 ) -> ListenerImpl:
     """One Listener per AudioInput; sources that don't need a wake word get no KWS.
-    Pass the daemon's ``Metrics`` so `status` shows listener_frame/kws/stt latencies."""
+    Pass the daemon's ``Metrics`` (kws_hits/wakes/false_wakes/wakes_suppressed counters and
+    kws_hit_to_wake/listener_* latencies in `status`) and ``EventLog`` (kws_hit / wake_verify /
+    wake_suppressed events)."""
     wake = stack.make_wake() if source.requires_wake_word else None
-    lis = ListenerImpl(source, wake, stack.make_vad(), stack.stt, cfg, aec=aec, metrics=metrics)
+    lis = ListenerImpl(source, wake, stack.make_vad(), stack.stt, cfg, aec=aec, metrics=metrics, eventlog=eventlog)
     stack.listeners.add(lis)  # so set_wake_phrases can swap detectors live
     return lis

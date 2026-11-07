@@ -310,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("remote-end", help="end the current phone session")
     v = sub.add_parser("voice", help="choose Mac's voice (default Kokoro, or a clone of a short recording)")
     vsub = v.add_subparsers(dest="voice_cmd", required=True)
-    vs = vsub.add_parser("set", help="clone the voice in a wav/m4a recording (10–30 s of clean speech)")
+    vs = vsub.add_parser("set", help="clone the voice in a wav/m4a recording (10 to 30 s of clean speech)")
     vs.add_argument("path")
     vsub.add_parser("reset", help="back to the default voice")
     vsub.add_parser("status", help="show the active voice engine")

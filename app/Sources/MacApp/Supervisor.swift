@@ -10,7 +10,7 @@ import Foundation
 /// - stdin is a pipe that is never written: if Mac.app dies (even SIGKILL), the daemon
 ///   sees EOF on stdin and can exit (env `MAC_PARENT_PIPE=stdin`).
 /// - Exit code 3 = "macd is already running" (a dev `uv run macd` holds the lock): treated
-///   as "external daemon present" — 60 s backoff, no crash counting (N10).
+///   as "external daemon present": 60 s backoff, no crash counting (N10).
 /// - Quit: SIGTERM, then SIGKILL after 10 s (macd's own shutdown can take ~5 s) (N15).
 /// - Disabled with env `MAC_SUPERVISE=0` (tests, or when running macd by hand).
 @MainActor
@@ -54,14 +54,14 @@ final class Supervisor {
         restartWork = nil
         guard !stopping else { return }
         guard let dir = daemonDir else {
-            status = .notConfigured("daemonDir not set — run install.sh")
+            status = .notConfigured("daemonDir not set: run install.sh")
             Log.error("daemonDir not configured (defaults write io.github.macagent.Mac daemonDir <path>)", "supervisor")
             scheduleRestart()
             return
         }
         let python = URL(fileURLWithPath: dir).appendingPathComponent(".venv/bin/python")
         guard FileManager.default.isExecutableFile(atPath: python.path) else {
-            status = .notConfigured("\(python.path) missing — run install.sh")
+            status = .notConfigured("\(python.path) missing: run install.sh")
             Log.error("python not found at \(python.path)", "supervisor")
             scheduleRestart()
             return
@@ -213,7 +213,7 @@ extension Supervisor.Status {
         case .notConfigured(let why): return "Daemon not installed: \(why)"
         case .starting: return "Starting daemon…"
         case .running: return "Daemon running"
-        case .backoff(let s): return String(format: "Daemon crashed — restarting in %.0f s", s)
+        case .backoff(let s): return String(format: "Daemon crashed: restarting in %.0f s", s)
         case .external: return "Using a macd started outside the app (e.g. uv run macd)"
         }
     }

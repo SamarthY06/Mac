@@ -46,7 +46,7 @@ def validate(key: str, value: Any) -> None:
     """Range / shape checks beyond `config.set_key`'s type coercion. Raises ValueError."""
     if key == "name":
         if not value.strip() or len(value) > MAX_NAME_LEN or not value.replace(" ", "").replace("-", "").isalnum():
-            raise ValueError("name must be 1–32 letters, digits, spaces or dashes")
+            raise ValueError("name must be 1 to 32 letters, digits, spaces or dashes")
     elif key == "wake.phrases":
         if not value:
             raise ValueError("at least one wake phrase is required")

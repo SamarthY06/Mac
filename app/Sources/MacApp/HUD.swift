@@ -265,7 +265,7 @@ struct HUDView: View {
         .accessibilityValue(accessibilityText)
     }
 
-    /// "Phone connected · PIN 1234" — the caller must say the PIN first (N7).
+    /// "Phone connected · PIN 1234": the caller must say the PIN first (N7).
     private var banner: some View {
         HStack(spacing: 6) {
             Image(systemName: model.remote.present ? "iphone.radiowaves.left.and.right" : "iphone")

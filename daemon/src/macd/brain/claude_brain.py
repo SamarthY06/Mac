@@ -71,7 +71,7 @@ CHROME_HINT = ("Chrome isn't running, the Claude in Chrome extension isn't insta
                "signed in to a different claude.ai account/org than Claude Code.")
 HANDOFF_TIMEOUT_S = 60.0
 HANDOFF_PROMPT = (
-    "[Session handoff — internal, not spoken.] This session is about to end. Save what your next "
+    "[Session handoff: internal, not spoken.] This session is about to end. Save what your next "
     "session must know: call mcp__mac__remember with kind \"context\" for the 3 to 8 most useful "
     "durable facts, open tasks and decisions from this conversation (one short line each, newest "
     "first; the user may ask \"what were we doing?\" after a restart), and with other kinds for "
@@ -90,7 +90,7 @@ LOCKED_NOTE = (
     "[System note: the Mac's screen is LOCKED. Voice, Chrome (Claude in Chrome), shell, files and "
     "AppleScript automation of apps (Mail, Calendar, Notes, Messages 'send') all work. Accessibility "
     "clicks and typing (mcp__mac__ui_click/ui_type/ui_key) and screenshots will NOT reach apps behind "
-    "the lock screen — don't attempt them; prefer Chrome/AppleScript routes, or tell the user to unlock "
+    "the lock screen, don't attempt them; prefer Chrome/AppleScript routes, or tell the user to unlock "
     "for that step. Never try to unlock the screen.]\n"
 )
 CHROME_DOWN_NOTE = ("[System note: the Claude in Chrome browser extension is not connected. "
@@ -872,7 +872,7 @@ class ClaudeBrain:
         self._resume_next = None
         self._session_id = None
         await self._save_session(None)
-        log.info("brain: reset — next ask starts a fresh session")
+        log.info("brain: reset, next ask starts a fresh session")
         await self._next_pending()
 
     # ------------------------------------------------------------------ timers
