@@ -35,7 +35,7 @@ and free** on Apple Silicon.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/Mac.git && cd Mac
+git clone https://github.com/SamarthY06/Mac.git && cd Mac
 ./install.sh
 ```
 
