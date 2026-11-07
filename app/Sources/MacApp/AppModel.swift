@@ -19,7 +19,7 @@ enum AgentState: String {
         case .followup: return "Go on, I’m listening"
         case .error: return "Something went wrong"
         case .off: return "Mac is off"
-        case .unknown: return "Connecting to Mac…"
+        case .unknown: return "Mac is starting…"
         }
     }
 
@@ -59,6 +59,9 @@ struct RemoteSession: Equatable {
     }
 }
 
+enum ClaudeStage: Int { case install, signIn, connected }
+enum ChromeStage: Int { case install, connect, connected }
+
 /// UI state, fed by control.sock events. Main-actor only.
 /// Protocol schema: daemon/src/macd/control.py docstring + orchestrator.publish calls.
 @MainActor
@@ -92,11 +95,40 @@ final class AppModel: ObservableObject {
     @Published var onboardingVisible = false   // AppDelegate polls status faster while true
     @Published var voiceEngine = ""            // "kokoro" or "clone:<sample>" (from status.voice_engine)
     @Published var statusItemHidden = false    // menu bar icon hidden by the notch / overflow (AppDelegate sets)
+    @Published var connect = ConnectCheck()    // Claude Code + Chrome connection state (ConnectCheck.swift)
+    @Published var screenLocked = false        // set by AppDelegate from com.apple.screenIsLocked/Unlocked
+    static let screenLockedLine = "Screen locked — voice, Chrome and Mail/Calendar still work; clicking in apps resumes when you unlock"
+    var guided: GuidedActions?                 // "Install…/Sign in…/Connect Chrome…" buttons (set by AppDelegate)
 
     var onStateChange: ((AgentState) -> Void)?
     /// While an "off" command is queued for a disconnected daemon, state events must not flip
     /// `off` back (AppDelegate sets this).
     var holdOff = false
+
+    /// Claude stage from `connect` (ConnectCheck.swift), with `status.brain` as the fallback.
+    var claudeStage: ClaudeStage? {
+        let c = connect.claude
+        if c.installed == false { return .install }
+        if c.signedIn == true { return .connected }
+        if c.signedIn == false || c.installed == true { return .signIn }
+        switch brainAuth {
+        case "ok", "api_key": return .connected
+        case "signed_out": return .signIn
+        case "missing": return .install
+        default: return nil
+        }
+    }
+
+    var claudeUsesApiKey: Bool { connect.claude.authMethod == "api_key" || (connect.claude.authMethod.isEmpty && brainAuth == "api_key") }
+
+    var chromeStage: ChromeStage? {
+        let ch = connect.chrome
+        if ch.extensionInstalled == false { return .install }
+        if ch.connected == true { return .connected }
+        if ch.connected == false || ch.extensionInstalled == true { return .connect }
+        if let p = chromePaired { return p ? .connected : .connect }
+        return nil
+    }
 
     /// B2's shape: `status.voice_engine` is "kokoro" | "clone" and `status.clone_sample` is the
     /// sample's full path (or null); command replies also carry `voice_engine: {engine, sample}`.
@@ -158,11 +190,15 @@ final class AppModel: ObservableObject {
     var statusDetail: String? {
         if off { return "Choose Turn On to start listening again." }
         if muted { return "Choose Mute again to resume." }
-        if !connected { return daemonStatus.isEmpty ? nil : daemonStatus }
+        if !connected {
+            // Supervisor labels say "daemon"; people see "Mac's engine".
+            return daemonStatus.isEmpty ? "Mac is starting…" : daemonStatus.replacingOccurrences(of: "daemon", with: "engine", options: .caseInsensitive)
+        }
         if remote.active { return state.inTurn ? phoneSessionLine : "Choose End Phone Session to resume." }
         if voiceUnavailable != nil { return "Re-run install.sh (it downloads the speech models)." }
         if brainAuth == "signed_out" { return "Not signed in to Claude — choose Sign in to Claude…" }
         if brainAuth == "missing" { return "Claude Code isn’t installed — choose Install Claude Code…" }
+        if screenLocked { return Self.screenLockedLine }
         if let w = audioWarning, !w.isEmpty { return w }
         if state == .error, !errorText.isEmpty { return errorText }
         return nil
@@ -174,7 +210,7 @@ final class AppModel: ObservableObject {
         switch errorKind {
         case "auth":
             return brainAuth == "api_key"
-                ? "Add your API key, then choose Troubleshoot ▸ Restart Daemon:"
+                ? "Add your API key, then choose Troubleshoot ▸ Restart Engine:"
                 : "Open Terminal and sign in, then ask again:"
         case "rate_limit":
             if Self.resetTime(in: errorText) != nil {
@@ -182,7 +218,7 @@ final class AppModel: ObservableObject {
             }
             return "Wait a while, or switch to an API key in the settings file."
         case "network": return "Check your internet connection and try again."
-        case "cli_missing": return "Install Claude Code (claude.com/claude-code), then Troubleshoot ▸ Restart Daemon."
+        case "cli_missing": return "Install Claude Code (claude.com/claude-code), then Troubleshoot ▸ Restart Engine."
         case "timeout": return "Try a smaller request."
         default: return "Try again. If it keeps happening, choose Open Logs."
         }
@@ -312,22 +348,6 @@ enum UX {
         } catch {
             Log.error("launch at login: \(error)", "ui")
             return "Couldn’t change Launch at Login: \(error.localizedDescription) You can also add Mac under System Settings › General › Login Items."
-        }
-    }
-
-    /// Opens Terminal running `command` without needing Automation permission: Terminal runs
-    /// `.command` files directly.
-    static func openTerminal(running command: String, name: String) {
-        let url = Paths.home.appendingPathComponent("\(name).command")
-        let script = "#!/bin/zsh\nclear\necho \"Mac: running \\`\(command)\\`\"\n\(command)\n"
-        do {
-            try FileManager.default.createDirectory(at: Paths.home, withIntermediateDirectories: true)
-            try script.write(to: url, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-            NSWorkspace.shared.open(url)
-        } catch {
-            Log.error("open terminal: \(error)", "ui")
-            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
         }
     }
 }

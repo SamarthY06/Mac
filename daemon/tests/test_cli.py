@@ -64,6 +64,12 @@ class FakeOrch:
             return {"voices": [{"id": "af_heart", "name": "Heart", "lang": "en-us", "gender": "f"}]}
         if cmd == "voice_preview":
             return {"queued": True}
+        if cmd == "connect_check":
+            return {"claude": {"installed": True, "version": "2.1.319", "min_ok": True, "signed_in": "yes",
+                               "auth_method": "claude_ai", "fix": ""},
+                    "chrome": {"browser_running": False, "browsers": [], "extension_installed": True, "native_host": True,
+                               "enabled_by_default": True, "connected": "unknown", "fix": "Chrome isn't running"},
+                    "ready": False}
         if cmd == "remote_link":
             return {"url": "https://meet.livekit.io/custom?x=1#token=t", "expires_in_s": 900, "pin": "1234",
                     "configured": True}
@@ -147,10 +153,15 @@ async def test_simple_commands(daemon: tuple[FakeOrch, Path], capsys: pytest.Cap
     assert code == 1 and "name = 'Jarvis'" in out and "tts.speed = '1.2'" in out and "bad: setting not allowed" in err
     assert orch.calls[-1][1] == {"changes": {"name": "Jarvis", "tts.speed": "1.2", "bad": "1"}}
     assert (await run_cli([*s, "settings", "set", "novalue"], capsys))[0] == 1
+    code, out, _ = await run_cli([*s, "connect", "--deep"], capsys)
+    assert code == 1 and "Claude Code: 2.1.319" in out and "fix: Chrome isn't running" in out and "not ready" in out
+    assert orch.calls[-1] == ("connect_check", {"deep": True})
+    code, out, _ = await run_cli([*s, "--json", "connect"], capsys)
+    assert code == 1 and json.loads(out)["ready"] is False
     cmds = [c for c, _ in orch.calls]
     assert cmds[:12] == ["mute", "say", "confirm", "stop", "listen", "off", "on", "remote_link", "remote_end", "voice_clone",
                          "voice_reset", "status"]
-    assert cmds[12:] == ["voice_preview", "voices_list", "settings_get", "settings_set"]
+    assert cmds[12:] == ["voice_preview", "voices_list", "settings_get", "settings_set", "connect_check", "connect_check"]
     assert orch.calls[9][1] == {"path": sample} and orch.calls[2][1] == {"approved": True}
 
 

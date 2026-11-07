@@ -96,9 +96,10 @@ final class AudioEngine: @unchecked Sendable {
         queue.async { [self] in startStats() }
     }
 
-    /// Start the audio hardware.
+    /// Start the audio hardware (no-op while powered off: `setPowered(true)` starts it).
     func start() {
         queue.async { [self] in
+            guard !poweredOff else { Log.info("start skipped: powered off", "audio"); return }
             wantRunning = true
             buildAndStart(reason: "start")
         }

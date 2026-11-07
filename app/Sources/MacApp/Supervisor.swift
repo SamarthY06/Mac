@@ -160,13 +160,34 @@ final class Supervisor {
         }
     }
 
-    /// Blocking: used from applicationWillTerminate.
+    /// All live descendants of `pid` (children, grandchildren …), e.g. the `claude` CLI.
+    nonisolated static func descendants(of pid: Int32) -> [Int32] {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axo", "pid=,ppid="]
+        let out = Pipe(); ps.standardOutput = out
+        guard (try? ps.run()) != nil else { return [] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        ps.waitUntilExit()
+        var children: [Int32: [Int32]] = [:]
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            let f = line.split(separator: " ", omittingEmptySubsequences: true)
+            if f.count == 2, let c = Int32(f[0]), let pp = Int32(f[1]) { children[pp, default: []].append(c) }
+        }
+        var out2: [Int32] = [], queue = [pid]
+        while let p = queue.popLast() { for c in children[p] ?? [] { out2.append(c); queue.append(c) } }
+        return out2
+    }
+
+    /// Blocking: used from applicationWillTerminate. SIGTERM, then SIGKILL after `timeout`;
+    /// any descendants still alive afterwards (orphaned `claude` CLI, shells) are killed too.
     func stopSync(timeout: TimeInterval = 10) {
         stopping = true
         restartWork?.cancel(); restartWork = nil
         guard let p = process, p.isRunning else { return }
         let pid = p.processIdentifier
-        Log.info("stopping macd pid=\(pid) (SIGTERM)", "supervisor")
+        let kids = Self.descendants(of: pid)
+        Log.info("stopping macd pid=\(pid) (SIGTERM; \(kids.count) descendants)", "supervisor")
         kill(pid, SIGTERM)
         let deadline = Date().addingTimeInterval(timeout)
         while p.isRunning && Date() < deadline { usleep(50_000) }
@@ -175,6 +196,10 @@ final class Supervisor {
             kill(pid, SIGKILL)
             p.waitUntilExit()
         }
+        usleep(200_000)
+        let orphans = kids.filter { kill($0, 0) == 0 }
+        for o in orphans { kill(o, SIGKILL) }
+        if !orphans.isEmpty { Log.warn("killed \(orphans.count) orphaned daemon descendants: \(orphans)", "supervisor") }
         Log.info("macd stopped", "supervisor")
         process = nil
     }

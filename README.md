@@ -47,6 +47,23 @@ Chrome is paired. Then say *"Hey Mac, what can you do?"*
 
 Flags: `--yes` (non-interactive) · `--no-models` · `--no-open` · `--app-only` · `--uninstall`.
 
+## Connect Claude and Chrome
+
+Mac uses **your** Claude and **your** Chrome. The Meet Mac window walks you through both and
+shows live status; here is what happens underneath.
+
+1. **Claude** — install [Claude Code](https://code.claude.com/docs/en/quickstart) and sign in
+   (`claude`, then `/login`). Mac runs your `claude` with your claude.ai plan.
+   An API key works too (`macctl secret set ANTHROPIC_API_KEY`, `auth = "api_key"`), but
+   **Claude in Chrome only works with a claude.ai sign-in**, per Anthropic's docs.
+2. **Chrome** — install the
+   [Claude in Chrome extension](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
+   (v1.0.36+), sign it in to the same claude.ai account, then run `claude --chrome` once in a
+   terminal: press Enter at the dialog, type `/chrome` and choose **Enabled by default**.
+   That writes Claude's native-messaging host file and pairs the extension. Mac's
+   *Check connection* button verifies all of it (Chrome running · extension · native host ·
+   enabled · connected). Works with Chrome, Edge, Brave and Arc.
+
 ## Using it
 
 | Say | Mac does |
@@ -134,6 +151,18 @@ uv run macd --audio sounddevice   # headless daemon (permissions attribute to yo
 ```
 
 Reviews that shaped the code (architecture, code quality, simplicity, UX) are in `docs/reviews/`.
+
+## Screen off, screen locked
+
+Mac keeps listening with the display off or the screen locked (it runs in your user session, not
+on the lock screen). *Settings → General → Stay awake while listening* keeps the Mac from
+sleeping while plugged in. While locked: voice, Chrome, shell, files and AppleScript automation
+(Mail, Calendar, Notes, Messages) all work; clicking/typing inside apps and screenshots wait
+until you unlock — Mac knows the difference and never tries to unlock. A closed MacBook lid still
+sleeps the Mac unless an external display is attached.
+
+Ask "what's on my screen?" or "what's this error?" and Mac looks at your screen (Screen
+Recording permission).
 
 ## Memory
 

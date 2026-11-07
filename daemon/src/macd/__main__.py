@@ -28,6 +28,7 @@ from macd.brain.claude_brain import ClaudeBrain, default_cli_path
 from macd.brain.fake_brain import FakeBrain
 from macd.brain.gate import ConfirmationGate
 from macd.brain.mac_tools import notify_argv
+from macd.connect import ConnectChecker
 from macd.contracts import AudioInput, AudioOutput, Brain
 from macd.control import ControlServer, Hooks, handle_command
 from macd.eventlog import EventLog, Metrics
@@ -109,6 +110,7 @@ class Daemon:
         self.brain: Brain | None = None
         self.control: ControlServer | None = None
         self.settings: Settings | None = None
+        self.connect: ConnectChecker | None = None
         self._bg: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------ setup
@@ -275,6 +277,7 @@ class Daemon:
                 "connected": bool(self.link.connected.is_set()) if self.link is not None else None,
             },
             "brain": dict(self.brain_status, kind=type(self.brain).__name__ if self.brain else None),
+            "connect": self.connect.snapshot() if self.connect is not None else None,
             "voice_engine": self.stack.voice_engine if self.stack is not None else None,
             "clone_sample": self.stack.clone_sample if self.stack is not None else None,
         }
@@ -344,8 +347,10 @@ class Daemon:
             self.settings = Settings(self.cfg, stack=self.stack, brain=self.brain, speak=self.orch.say,
                                      play=lambda pcm, sr: speech.play_pcm(0, pcm, sr, "say"),
                                      prewarm=self._prewarm_fillers)
+            self.connect = ConnectChecker(self.cfg, brain=self.brain,
+                                          brain_chrome=lambda: str(self.brain_status.get("chrome", "unknown")))
             hooks = Hooks(remote_link=self._remote_link, remote_end=self._remote_end, remote_enable=self._remote_enable,
-                          settings=self.settings,
+                          settings=self.settings, connect_check=self.connect.command,
                           audio_reinit=self._audio_reinit, voice_clone=self._voice_clone,
                           voice_reset=self._voice_reset,
                           power=self._power, status=self._status)

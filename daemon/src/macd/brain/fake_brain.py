@@ -89,8 +89,14 @@ class FakeBrain:
         self.warms = 0
         self.sleeps = 0
         self.handoffs = 0
+        self.connect_checks = 0
+        self.check_result: dict[str, Any] = {
+            "auth": "ok", "auth_detail": "", "chrome": "connected", "chrome_detail": "",
+            "cli_version": "fake", "session_ok": True}
         self.alive = False
         self.name = "Mac"
+        self.locked = False
+        self.context: dict[str, Any] = {"locked": False}
         self.lang = "en-us"
         self.closed = False
 
@@ -143,9 +149,17 @@ class FakeBrain:
         self.sleeps += 1
         self.alive = False
 
+    async def connect_check(self) -> dict[str, Any]:
+        self.connect_checks += 1
+        return dict(self.check_result)
+
     async def handoff(self) -> bool:
         self.handoffs += 1
         return True
+
+    async def set_context(self, locked: bool) -> None:
+        self.locked = locked
+        self.context["locked"] = locked
 
     async def set_name(self, name: str) -> None:
         self.name = name

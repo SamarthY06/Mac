@@ -138,12 +138,12 @@ final class StatusBar: NSObject, NSMenuDelegate {
         header(menu, model.statusLine)
         if let d = model.statusDetail { info(menu, d) }
         if model.brainAuth == "signed_out" {
-            action(menu, "Sign in to Claude…", symbol: "person.crop.circle.badge.exclamationmark") {
-                UX.openTerminal(running: "claude", name: "sign-in-to-claude")
+            action(menu, "Sign in to Claude…", symbol: "person.crop.circle.badge.exclamationmark") { [weak self] in
+                self?.model.guided?.signIn()
             }
         } else if model.brainAuth == "missing" {
-            action(menu, "Install Claude Code…", symbol: "arrow.down.circle") {
-                NSWorkspace.shared.open(URL(string: "https://claude.com/claude-code")!)
+            action(menu, "Install Claude Code…", symbol: "arrow.down.circle") { [weak self] in
+                self?.model.guided?.installClaude()
             }
         }
         if model.remote.active {
@@ -197,7 +197,7 @@ final class StatusBar: NSObject, NSMenuDelegate {
         let sub = NSMenu(title: "Troubleshoot")
         sub.autoenablesItems = false
         action(sub, "Restart Audio", symbol: "speaker.wave.2", actions.restartAudio)
-        action(sub, "Restart Daemon", symbol: "arrow.clockwise", actions.restartDaemon)
+        action(sub, "Restart Engine", symbol: "arrow.clockwise", actions.restartDaemon)
         info(sub, "Mic: \(model.inputDevice) · \(model.aec ? "echo cancellation on" : "no echo cancellation")")
         fix.submenu = sub
         menu.addItem(fix)

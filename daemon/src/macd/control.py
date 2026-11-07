@@ -7,7 +7,8 @@ Protocol: one JSON object per line, max 64 KB per line.
   client → daemon: {"id": <any>, "cmd": "<name>", ...args}
       status | ask{text} | confirm{approved} | listen | stop | mute{value} | say{text} | reset | off | on |
       remote_link | remote_end | remote_enable | audio_reinit | voice_clone{path} | voice_reset |
-      settings_get | settings_set{changes} | voices_list | voice_preview{voice, text?} | power{event: will_sleep|did_wake} | subscribe
+      power{event: will_sleep|did_wake|screen_locked|screen_unlocked} |
+      settings_get | settings_set{changes} | voices_list | voice_preview{voice, text?} | connect_check{deep?} | power{event: will_sleep|did_wake} | subscribe
   daemon → client: {"id": <same>, "ok": true, "data": {...}} | {"id", "ok": false, "error": "..."}
   events (after `subscribe`): {"event": "state"|"transcript"|"activity"|"error"|"remote"|"notify", ...}
 Each client has a bounded outgoing queue; a client that can't keep up is disconnected.
@@ -51,6 +52,7 @@ class Hooks:
     voice_clone: Callable[[str], Awaitable[dict[str, Any]]] | None = None
     voice_reset: Callable[[], Awaitable[dict[str, Any]]] | None = None
     settings: Any | None = None  # macd.settings.Settings
+    connect_check: Callable[[bool], Awaitable[dict[str, Any]]] | None = None
 
 
 def _text_arg(args: dict[str, Any], cmd: str) -> str:
@@ -115,8 +117,8 @@ async def handle_command(orch: Orchestrator, hooks: Hooks, cmd: str, args: dict[
         return {}
     if cmd == "power":
         event = args.get("event")
-        if event not in ("will_sleep", "did_wake"):
-            raise ValueError("power needs event will_sleep|did_wake")
+        if event not in ("will_sleep", "did_wake", "screen_locked", "screen_unlocked"):
+            raise ValueError("power needs event will_sleep|did_wake|screen_locked|screen_unlocked")
         await orch.power(event)
         if hooks.power is not None:
             await hooks.power(event)
@@ -134,6 +136,10 @@ async def handle_command(orch: Orchestrator, hooks: Hooks, cmd: str, args: dict[
         if hooks.remote_end is not None:
             await hooks.remote_end()
         return {}
+    if cmd == "connect_check":
+        if hooks.connect_check is None:
+            raise ValueError("connect check is not available")
+        return await hooks.connect_check(bool(args.get("deep", False)))
     if cmd in ("settings_get", "settings_set", "voices_list", "voice_preview"):
         if hooks.settings is None:
             raise ValueError("settings are not available")

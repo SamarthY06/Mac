@@ -222,16 +222,19 @@ fi
 # First-minute collision: don't launch (and prompt for permissions) while the models are
 # still missing — the app would show "voice unavailable" right away.
 if [[ $OPEN == 1 && ( $MODELS_OK == 1 || $MODELS == 0 || $APP_ONLY == 1 ) ]]; then
-  open "$APP_DEST"
-  ok "Mac is running — look for the waveform icon in the menu bar"
+  open "$APP_DEST" --args --show
+  ok "Mac is running — look for the waveform icon in the menu bar; the Meet Mac window is open"
 elif [[ $OPEN == 1 ]]; then
   warn "not opening Mac.app because the speech models are missing; run 'macctl models', then: open ~/Applications/Mac.app"
 fi
 
 echo
-echo "${B}Next steps${O}"
-echo "  1. In the Permissions window, allow, in order: Microphone, Accessibility, Automation,"
-echo "     Screen Recording, and (optional) Notifications. Menu bar icon → Permissions… reopens it."
-echo "  2. Say ${B}“Hey Mac, what can you do?”${O}  — or press ${B}⌥Space${O} to talk."
-echo "  3. Settings: ~/.mac-agent/config.toml   Logs: ~/Library/Logs/Mac/   CLI: macctl status"
-echo "  Optional: menu bar icon → Launch at login."
+echo "${B}Next steps${O} (the Meet Mac window walks you through them, in this order)"
+echo "  1. Permissions — allow Microphone, Accessibility, Automation, Screen Recording (Notifications optional)."
+echo "  2. Claude — the window shows whether Claude Code is installed and signed in; use its"
+echo "     “Install Claude Code…” / “Sign in…” buttons if not (they open Terminal for you)."
+echo "  3. Chrome (optional, for browser tasks) — “Install extension…” then “Connect Chrome…”:"
+echo "     press Enter at the dialog, type /chrome, choose “Enabled by default”, then /exit."
+echo "  4. Try it — say ${B}“Hey Mac, what can you do?”${O}  — or press ${B}⌥Space${O} to talk."
+echo "  Settings: ~/.mac-agent/config.toml   Logs: ~/Library/Logs/Mac/   CLI: macctl status"
+echo "  Menu bar icon → Permissions… reopens the Meet Mac window; so does double-clicking Mac.app."

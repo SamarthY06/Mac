@@ -64,6 +64,11 @@ log = logging.getLogger(__name__)
 SAY_TOOL = "mcp__mac__say"
 _SILENT_TOOLS = {SAY_TOOL, CONFIRM_TOOL}
 HANDOFF_TURN = -1  # turn id of the silent session-handoff query (never emitted)
+PROBE_TURN = -2  # turn id of the silent connect_check probe query (never emitted)
+PROBE_PROMPT = "Reply with exactly the word OK and nothing else. Do not use any tools."
+CONNECT_CHECK_TIMEOUT_S = 25.0
+CHROME_HINT = ("Chrome isn't running, the Claude in Chrome extension isn't installed, or Chrome is "
+               "signed in to a different claude.ai account/org than Claude Code.")
 HANDOFF_TIMEOUT_S = 60.0
 HANDOFF_PROMPT = (
     "[Session handoff — internal, not spoken.] This session is about to end. Save what your next "
@@ -81,6 +86,13 @@ _MEMORY_WORDS = re.compile(r"\b(remember|note that|make a note|save (this|that)|
                            r"don'?t forget|keep in mind)\b", re.IGNORECASE)
 _CHROME_SERVER = "claude-in-chrome"
 _CHROME = "mcp__claude-in-chrome__"
+LOCKED_NOTE = (
+    "[System note: the Mac's screen is LOCKED. Voice, Chrome (Claude in Chrome), shell, files and "
+    "AppleScript automation of apps (Mail, Calendar, Notes, Messages 'send') all work. Accessibility "
+    "clicks and typing (mcp__mac__ui_click/ui_type/ui_key) and screenshots will NOT reach apps behind "
+    "the lock screen — don't attempt them; prefer Chrome/AppleScript routes, or tell the user to unlock "
+    "for that step. Never try to unlock the screen.]\n"
+)
 CHROME_DOWN_NOTE = ("[System note: the Claude in Chrome browser extension is not connected. "
                     "Don't use mcp__claude-in-chrome tools.]\n")
 
@@ -118,6 +130,7 @@ class _Turn:
     assistant_error: str | None = None
     queries: int = 1
     handoff: bool = False  # silent, memory-tools-only query (session handoff)
+    probe: bool = False  # silent, tool-less connect_check query
     after: Callable[[], Any] | None = None  # deferred action once a handoff turn ends
     future: asyncio.Future[bool] | None = None
 
@@ -212,6 +225,9 @@ class ClaudeBrain:
         self._session_started = self._wall()  # wall time the current session was created
         self._handed_off = False  # a handoff ran for the current session
         self._turns_this_session = 0  # nothing to hand off when 0
+        self._init_info: dict[str, Any] = {}  # last init message: mcp server statuses, CLI version
+        self.last_check: dict[str, Any] | None = None
+        self.locked = False  # set_context(): screen locked → every ask carries LOCKED_NOTE
         self._orphans: list[tuple[Any, asyncio.Task[None] | None]] = []  # F2: clients of a dead owner
         self.chrome_connected: bool | None = None
 
@@ -219,6 +235,7 @@ class ClaudeBrain:
             "ask": self._on_ask, "steer": self._on_steer, "interrupt": self._on_interrupt,
             "reset": self._on_reset, "warm": self._on_warm, "sleep": self._on_sleep,
             "msg": self._on_msg, "reader_done": self._on_reader_done, "handoff": self._on_handoff,
+            "connect_check": self._on_connect_check,
         }
         self.hook = PreToolHook(
             gate, self._current_turn, self.is_cancelled, self._memory_check,
@@ -317,6 +334,85 @@ class ClaudeBrain:
         except TimeoutError:
             return False
 
+    async def connect_check(self) -> dict[str, Any]:
+        """Connect (if needed), read the CLI's init message and run one silent tool-less probe
+        query; report auth / Chrome / version for the app's Permissions screen (≤ 25 s)."""
+        if self.cfg.brain.auth == "claude_cli" and default_cli_path(self.cfg) is None:
+            return self._check_result(errors.ClassifiedError(
+                BrainErrorKind.CLI_MISSING, errors.MESSAGES[BrainErrorKind.CLI_MISSING], "claude not found"))
+        if self._task is None:
+            return self._check_result(errors.ClassifiedError(BrainErrorKind.INTERNAL, "brain not started"))
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._put(_Cmd("connect_check", payload=fut))
+        try:
+            return await asyncio.wait_for(fut, CONNECT_CHECK_TIMEOUT_S)
+        except TimeoutError:
+            return self._check_result(errors.ClassifiedError(
+                BrainErrorKind.TIMEOUT, "Claude did not answer within 25 seconds.", "connect_check timeout"))
+
+    def _check_result(self, err: errors.ClassifiedError | None, session_ok: bool | None = None) -> dict[str, Any]:
+        auth, auth_detail = "ok", ""
+        if err is not None:
+            auth_detail = err.message
+            if err.kind is BrainErrorKind.AUTH:
+                auth = "not_signed_in"
+            elif err.kind is BrainErrorKind.CLI_MISSING:
+                auth = "cli_missing"
+            elif err.kind is BrainErrorKind.RATE_LIMIT:
+                auth = "ok"  # signed in, just throttled
+            else:
+                auth = "error"
+        if auth == "ok" and self.cfg.brain.auth == "api_key":
+            auth = "api_key"
+        servers = self._init_info.get("servers") or []
+        status = next((x.get("status") for x in servers
+                       if isinstance(x, dict) and x.get("name") == _CHROME_SERVER), None)
+        if self.cfg.brain.auth == "api_key":
+            chrome, chrome_detail = "unavailable_api_key", (
+                "Claude in Chrome needs a claude.ai sign-in (Pro/Max/Team/Enterprise); it stays off "
+                "with an API key.")
+        elif not self.cfg.brain.chrome:
+            chrome, chrome_detail = "unknown", "Chrome integration is disabled in config (brain.chrome)."
+        elif status == "connected":
+            chrome, chrome_detail = "connected", "Claude in Chrome extension connected."
+        elif status is None and not self._init_info:
+            chrome, chrome_detail = "unknown", "Claude Code has not reported its tools yet."
+        else:
+            chrome, chrome_detail = "not_connected", f"Status: {status or 'not listed'}. {CHROME_HINT}"
+        result = {
+            "auth": auth, "auth_detail": auth_detail, "chrome": chrome, "chrome_detail": chrome_detail,
+            "cli_version": str(self._init_info.get("version") or ""),
+            "session_ok": bool(session_ok) if session_ok is not None else err is None,
+        }
+        self.last_check = result
+        return result
+
+    async def _on_connect_check(self, cmd: _Cmd) -> None:
+        fut: asyncio.Future[dict[str, Any]] = cmd.payload
+        if self._active is not None:  # busy: answer from what we know rather than interrupt the user
+            fut.set_result(self.last_check or self._check_result(
+                errors.ClassifiedError(BrainErrorKind.INTERNAL, "Mac is busy with a request; try again.")))
+            return
+        err = await self._ensure_connected()
+        if err is not None:
+            fut.set_result(self._check_result(err))
+            return
+        self._active = _Turn(PROBE_TURN, self._clock() + CONNECT_CHECK_TIMEOUT_S - 3, probe=True, future=fut)  # type: ignore[arg-type]
+        try:
+            await self._client.query(PROBE_PROMPT)
+        except Exception as e:  # noqa: BLE001
+            await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
+
+    def _end_probe(self, a: _Turn, err: errors.ClassifiedError | None) -> None:
+        if a.future is not None and not a.future.done():
+            a.future.set_result(self._check_result(err, session_ok=err is None))
+
+    async def set_context(self, locked: bool) -> None:
+        """Screen lock state from the app; while locked every ask carries LOCKED_NOTE."""
+        if locked != self.locked:
+            log.info("brain: screen %s", "locked" if locked else "unlocked")
+        self.locked = bool(locked)
+
     async def set_name(self, name: str) -> None:
         """Rename the persona for the next connect; a live session is parked (id kept)."""
         self.cfg.name = name.strip() or "Mac"
@@ -370,6 +466,8 @@ class ClaudeBrain:
             a = self._active
             if a is not None and a.handoff:
                 await self._end_handoff(a, ok=False)
+            elif a is not None and a.probe:
+                self._end_probe(a, errors.ClassifiedError(BrainErrorKind.INTERNAL, "Brain closed."))
             elif a is not None and not a.timed_out:
                 self._emit(BrainEventKind.DONE, a.turn_id, data={"interrupted": True})
             self._active = None
@@ -421,6 +519,8 @@ class ClaudeBrain:
 
     def _restrict(self, tool: str) -> str | None:
         a = self._active
+        if a is not None and a.probe:
+            return "Connection check: no tools; just reply OK."
         if a is not None and a.handoff and tool not in MEMORY_TOOLS:
             return "Session handoff: only mcp__mac__remember / forget / rewrite_memory may be called."
         return None
@@ -701,6 +801,8 @@ class ClaudeBrain:
         prompt = cmd.text
         if self.cfg.brain.chrome and self.chrome_connected is False and not self._chrome_recheck_due():
             prompt = CHROME_DOWN_NOTE + prompt
+        if self.locked:
+            prompt = LOCKED_NOTE + prompt
         try:
             await self._client.query(prompt)
         except Exception as e:  # noqa: BLE001
@@ -798,6 +900,8 @@ class ClaudeBrain:
             await self._park_session()
             if a.handoff:
                 await self._end_handoff(a, ok=False)
+            elif a.probe:
+                self._end_probe(a, errors.ClassifiedError(BrainErrorKind.TIMEOUT, "Claude did not answer."))
             await self._next_pending()
         elif not a.draining and now >= a.deadline:
             log.warning("brain: turn %d exceeded max_turn_s", a.turn_id)
@@ -814,6 +918,8 @@ class ClaudeBrain:
         self._active = None
         if a is not None and a.handoff:
             await self._end_handoff(a, ok=False)
+        elif a is not None and a.probe:
+            self._end_probe(a, err)
         elif a is not None:
             self._cancelled.discard(a.turn_id)
             if a.interrupted and not a.timed_out:
@@ -888,6 +994,7 @@ class ClaudeBrain:
         if data.get("session_id"):
             self._session_id = str(data["session_id"])
         self._init_at = self._clock()
+        self._init_info = {"servers": servers, "version": data.get("claude_code_version", "")}
         connected: bool | None
         if not self.cfg.brain.chrome:
             connected = None
@@ -988,6 +1095,17 @@ class ClaudeBrain:
         self._cancelled.discard(a.turn_id)
         if a.handoff:
             await self._end_handoff(a, ok=not a.draining)
+            await self._next_pending()
+            return
+        if a.probe:
+            err = errors.classify_result(msg, self.stderr_tail(10))
+            if err is None and a.assistant_error:
+                err = errors.classify_assistant_error(a.assistant_error, msg.result or "")
+            if err is None and a.draining:
+                err = errors.ClassifiedError(BrainErrorKind.INTERNAL, "The check was interrupted.")
+            self._end_probe(a, err)
+            if err is not None and err.kind is not BrainErrorKind.RATE_LIMIT:
+                self._record_failure(err)
             await self._next_pending()
             return
         data = {"session_id": msg.session_id, "cost_usd": msg.total_cost_usd,

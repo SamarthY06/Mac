@@ -45,9 +45,10 @@ def delta(text: str) -> StreamEvent:
                               "delta": {"type": "text_delta", "text": text}})
 
 
-def init(chrome: str = "connected") -> SystemMessage:
-    return SystemMessage(subtype="init", data={"session_id": "sess-1", "mcp_servers": [
-        {"name": "claude-in-chrome", "status": chrome}, {"name": "mac", "status": "connected"}]})
+def init(chrome: str = "connected", version: str = "2.1.319") -> SystemMessage:
+    return SystemMessage(subtype="init", data={"session_id": "sess-1", "claude_code_version": version,
+                                              "mcp_servers": [{"name": "claude-in-chrome", "status": chrome},
+                                                              {"name": "mac", "status": "connected"}]})
 
 
 Responder = Callable[["MockClient", str], Any]
@@ -1103,3 +1104,109 @@ async def test_ask_during_handoff_interrupts_it(make_brain) -> None:
     assert await task is False
     await brain.close()
     assert [e.kind for e in evs] == [K.TEXT, K.DONE] and evs[0].turn_id == 2
+
+
+CHECK_KEYS = {"auth", "auth_detail", "chrome", "chrome_detail", "cli_version", "session_ok"}
+
+
+async def test_connect_check_connected(make_brain) -> None:
+    seen: list[str] = []
+
+    async def r(c: MockClient, p: str) -> None:
+        seen.append(p)
+        denied = await brain.hook({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                   "tool_input": {"command": "ls"}}, "t", {})
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"  # probe: no tools
+        c.push(init(), delta("OK"), result())
+
+    brain = make_brain(r)
+    await brain.start()
+    res = await brain.connect_check()
+    assert set(res) == CHECK_KEYS
+    assert res["auth"] == "ok" and res["chrome"] == "connected" and res["session_ok"] is True
+    assert res["cli_version"] == "2.1.319" and res["auth_detail"] == ""
+    assert seen == [cb.PROBE_PROMPT] and brain._out.empty()  # nothing spoken
+    assert brain.alive  # warmed as a side effect
+    await brain.close()
+
+
+async def test_connect_check_chrome_not_connected(make_brain) -> None:
+    def r(c: MockClient, p: str) -> None:
+        c.push(init(chrome="failed"), delta("OK"), result())
+
+    brain = make_brain(r)
+    await brain.start()
+    res = await brain.connect_check()
+    await brain.close()
+    assert res["auth"] == "ok" and res["chrome"] == "not_connected"
+    assert "extension" in res["chrome_detail"] and "failed" in res["chrome_detail"]
+
+
+async def test_connect_check_api_key_mode(make_brain, monkeypatch) -> None:
+    monkeypatch.setattr(config, "get_secret", lambda name: "sk-test-key")
+    brain = make_brain(simple("OK"), brain_cfg={"auth": "api_key"})
+    await brain.start()
+    res = await brain.connect_check()
+    await brain.close()
+    assert res["auth"] == "api_key" and res["chrome"] == "unavailable_api_key" and res["session_ok"]
+    assert "claude.ai" in res["chrome_detail"]
+    assert MockClient.instances[0].options.env["ANTHROPIC_API_KEY"] == "sk-test-key"
+
+
+async def test_connect_check_not_signed_in(make_brain) -> None:
+    def r(c: MockClient, p: str) -> None:
+        c.push(init(), result(is_error=True, result="Invalid API key · Please run /login"))
+
+    brain = make_brain(r)
+    await brain.start()
+    res = await brain.connect_check()
+    await brain.close()
+    assert res["auth"] == "not_signed_in" and res["session_ok"] is False
+    assert "sign in" in res["auth_detail"]
+
+
+async def test_connect_check_cli_missing(make_brain, monkeypatch) -> None:
+    monkeypatch.setattr(cb, "default_cli_path", lambda cfg: None)
+    brain = make_brain(simple("OK"))
+    await brain.start()
+    res = await brain.connect_check()
+    await brain.close()
+    assert res["auth"] == "cli_missing" and res["session_ok"] is False
+    assert MockClient.instances == []  # never tried to connect
+
+
+async def test_connect_check_while_busy_does_not_interrupt(make_brain) -> None:
+    hold = asyncio.Event()
+
+    async def r(c: MockClient, p: str) -> None:
+        await hold.wait()
+        c.push(result())
+
+    brain = make_brain(r)
+    await brain.start()
+    await brain.ask(1, "x")
+    await settle(brain)
+    res = await brain.connect_check()
+    assert res["auth"] == "error" and "busy" in res["auth_detail"]
+    hold.set()
+    evs = await collect(brain)
+    await brain.close()
+    assert evs[-1].kind == K.DONE and MockClient.instances[0].queries == ["x"]
+
+
+async def test_locked_context_note_on_and_off(make_brain) -> None:
+    brain = make_brain(simple("hi"))
+    await brain.start()
+    await brain.ask(1, "a")
+    await collect(brain)
+    await brain.set_context(locked=True)
+    await brain.ask(2, "b")
+    await collect(brain)
+    await brain.set_context(locked=False)
+    await brain.ask(3, "c")
+    await collect(brain)
+    await brain.close()
+    q = MockClient.instances[0].queries
+    assert q[0] == "a"
+    assert q[1].startswith(cb.LOCKED_NOTE) and q[1].endswith("b") and "Never try to unlock" in q[1]
+    assert q[2] == "c"

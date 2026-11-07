@@ -252,3 +252,18 @@ async def test_proactive_memory_from_plain_statement(tmp_path: Path) -> None:
         assert allowed
     finally:
         await brain.close()
+
+
+async def test_screen_vision_takes_one_screenshot(tmp_path: Path) -> None:
+    brain = make(tmp_path)
+    await brain.start()
+    turns = Turns(brain)
+    try:
+        await brain.ask(1, "What's on my screen right now? One sentence.")
+        end = await turns.finished(1)
+        assert end.kind == K.DONE, end
+        shots = [e for e in turns.of(1) if e.kind == K.TOOL_START and e.tool_name == "mcp__mac__screenshot"]
+        assert len(shots) == 1, [e.tool_name for e in turns.of(1) if e.kind == K.TOOL_START]
+        assert turns.text(1).strip()
+    finally:
+        await brain.close()

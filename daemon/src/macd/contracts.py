@@ -206,6 +206,17 @@ class Brain(Protocol):
         """Change the assistant's name for the next session (keeps context)."""
         ...
 
+    async def connect_check(self) -> dict[str, Any]:
+        """Verify the user's Claude + Chrome setup (bounded ~25 s; may start the CLI). Returns
+        {"auth": ok|not_signed_in|api_key|cli_missing|error, "auth_detail", "chrome":
+        connected|not_connected|unavailable_api_key|unknown, "chrome_detail", "cli_version",
+        "session_ok"}. Answers from the last known result while a turn is running."""
+        ...
+
+    async def set_context(self, locked: bool) -> None:
+        """Tell the brain about the Mac's state (screen locked → tools that need the UI won't work)."""
+        ...
+
     async def set_language(self, lang: str) -> None:
         """Change the language Mac answers in (Kokoro lang code, e.g. "hi", "fr-fr")."""
         ...

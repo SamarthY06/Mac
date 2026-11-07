@@ -756,6 +756,37 @@ async def test_wake_blip_only_after_a_pause(rig: Rig) -> None:
     await wait_until(lambda: any(s.startswith("<earcon") for s in rig.out.spoken), timeout=1)
 
 
+async def test_screen_lock_events(rig: Rig) -> None:
+    ctx: list[dict] = []
+
+    async def set_context(**kw: object) -> None:
+        ctx.append(dict(kw))
+
+    rig.brain.set_context = set_context  # type: ignore[attr-defined]
+    await rig.orch.power("screen_locked")
+    assert rig.orch.locked is True and rig.orch.status()["locked"] is True and ctx == [{"locked": True}]
+    st = [e for e in rig.events if e["event"] == "state"][-1]
+    assert st["locked"] is True and st["reason"] == "lock" and not rig.mic.muted
+    await rig.orch.power("screen_locked")  # repeat (app re-sends on connect): brain told again, no new event
+    assert ctx == [{"locked": True}, {"locked": True}] and [e for e in rig.events if e["event"] == "state"][-1] is st
+    tid = await start_turn(rig, "what time is it")  # listening and turns continue while locked
+    assert rig.orch.turn is not None and rig.orch.turn.id == tid
+    await rig.orch.power("screen_unlocked")
+    assert rig.orch.locked is False and ctx[-1] == {"locked": False}
+    assert [e for e in rig.events if e["event"] == "state"][-1]["locked"] is False
+
+
+async def test_screen_lock_without_brain_support(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(type(rig.brain), "set_context")
+    await rig.orch.power("screen_locked")
+    assert rig.orch.locked is True
+
+
+async def test_screen_lock_reaches_real_fake_brain(rig: Rig) -> None:
+    await rig.orch.power("screen_locked")
+    assert rig.orch.locked is True  # B1's FakeBrain.set_context(locked=...) accepted the call
+
+
 async def test_mute_and_power(rig: Rig) -> None:
     rig.orch.set_muted(True)
     assert rig.mic.muted and rig.events[-1]["event"] == "state" and rig.events[-1]["muted"] is True

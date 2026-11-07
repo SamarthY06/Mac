@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -7,6 +8,12 @@ import UniformTypeIdentifiers
 enum AppPrefs {
     static let changed = Notification.Name("io.github.macagent.Mac.prefsChanged")
     static let avatarDir = Paths.home.appendingPathComponent("avatar")
+
+    /// "auto" (only when plugged in, default) | "always" | "never" — Power.swift reads it.
+    static var stayAwake: String {
+        get { UserDefaults.standard.string(forKey: "stayAwake") ?? "auto" }
+        set { UserDefaults.standard.set(newValue, forKey: "stayAwake"); NotificationCenter.default.post(name: changed, object: nil) }
+    }
 
     /// "top" (default) or "bottom".
     static var hudPosition: String {
@@ -73,16 +80,26 @@ final class SettingsStore: ObservableObject {
     private var pending: [String: DispatchWorkItem] = [:]
     private var flashWork: DispatchWorkItem?
     weak var model: AppModel?   // gets the live engine (tts.engine + clone_sample)
+    private var cancellables: Set<AnyCancellable> = []
 
     init(control: ControlClient) { self.control = control }
+
+    /// Reload whenever the connection comes (back) up — a load that raced a reconnect must not stick.
+    func observe(_ model: AppModel) {
+        self.model = model
+        model.$connected.removeDuplicates().dropFirst().receive(on: RunLoop.main).sink { [weak self] up in
+            MainActor.assumeIsolated { if up { self?.load() } }
+        }.store(in: &cancellables)
+    }
 
     func load() {
         loadError = nil
         let sent = control.send("settings_get") { [weak self] ok, data, err in
             guard let self else { return }
-            if ok { self.apply(data); self.loaded = true } else { self.loadError = err ?? "Couldn’t read settings." }
+            if ok { self.apply(data); self.loaded = true; self.loadError = nil }
+            else if self.model?.connected == true { self.loadError = Self.friendly(err) }
         }
-        if !sent { loadError = "Mac isn’t connected yet. Settings will load when it is." }
+        _ = sent   // not connected yet: the hero shows "Mac is starting…" and observe() reloads
         control.send("voices_list") { [weak self] ok, data, _ in
             guard ok, let self else { return }
             let raw = (data["voices"] as? [[String: Any]]) ?? (data["list"] as? [[String: Any]]) ?? []
@@ -146,10 +163,10 @@ final class SettingsStore: ObservableObject {
                 for (k, v) in errs { self.errors[k] = v }
                 if errs.isEmpty { self.flashSaved() }
             } else {
-                for k in changes.keys { self.errors[k] = err ?? "Couldn’t save." }
+                for k in changes.keys { self.errors[k] = Self.friendly(err) }
             }
         }
-        if !sent { for k in changes.keys { errors[k] = "Mac isn’t connected yet." } }
+        if !sent { for k in changes.keys { errors[k] = "Mac is still starting — try again in a moment." } }
     }
 
     /// Debounced write (text fields, sliders).
@@ -167,6 +184,16 @@ final class SettingsStore: ObservableObject {
             if !ok { self?.errors["tts.voice"] = err ?? "Couldn’t play a preview." }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { MainActor.assumeIsolated { self?.previewing = nil } }
         }
+    }
+
+    /// Never show transport-level strings ("daemon", "disconnected") to people.
+    static func friendly(_ err: String?) -> String {
+        guard let e = err, !e.isEmpty else { return "Couldn’t save." }
+        let low = e.lowercased()
+        if low.contains("daemon") || low.contains("disconnected") || low.contains("not running") {
+            return "Mac is still starting — try again in a moment."
+        }
+        return e
     }
 
     private func flashSaved() {
@@ -192,13 +219,14 @@ final class SettingsStore: ObservableObject {
 // MARK: - Window
 
 enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
-    case general, voice, appearance, permissions, phone, advanced
+    case general, voice, appearance, connections, permissions, phone, advanced
     var id: String { rawValue }
     var title: String {
         switch self {
         case .general: return "General"
         case .voice: return "Voice"
         case .appearance: return "Appearance"
+        case .connections: return "Connections"
         case .permissions: return "Permissions"
         case .phone: return "Phone"
         case .advanced: return "Advanced"
@@ -207,16 +235,18 @@ enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
     var symbol: String {
         switch self {
         case .general: return "gearshape"
-        case .voice: return "waveform"
+        case .voice: return "waveform.circle"
         case .appearance: return "person.crop.circle"
+        case .connections: return "link.circle"
         case .permissions: return "lock.shield"
-        case .phone: return "iphone"
-        case .advanced: return "slider.horizontal.3"
+        case .phone: return "iphone.circle"
+        case .advanced: return "gearshape.2"
         }
     }
+    var filledSymbol: String { symbol + ".fill" }
 }
 
-/// Settings: sidebar + detail, ~640×520 (HIG Settings-window style).
+/// Settings: 200 pt sidebar + content column with a compact hero, ~680×560 (docs/DESIGN.md "Settings").
 @MainActor
 final class SettingsWindow {
     struct Deps {
@@ -238,7 +268,7 @@ final class SettingsWindow {
     init(deps: Deps) {
         self.deps = deps
         self.store = SettingsStore(control: deps.control)
-        self.store.model = deps.model
+        self.store.observe(deps.model)
     }
 
     var isVisible: Bool { window?.isVisible ?? false }
@@ -247,27 +277,27 @@ final class SettingsWindow {
         if let section { nav.section = section }
         store.load()
         deps.perms.refresh()
+        deps.model.guided?.check(deep: false)
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 520),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 560),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
             w.title = "Mac Settings"
             w.titlebarAppearsTransparent = true
             w.toolbarStyle = .unified
             w.isReleasedWhenClosed = false
-            w.minSize = NSSize(width: 600, height: 460)
+            w.minSize = NSSize(width: 640, height: 480)
             w.setAccessibilityLabel("Mac Settings")
             let root = SettingsView(store: store, nav: nav, model: deps.model, perms: deps.perms, phone: deps.phone,
                                     openVoicePanel: deps.openVoicePanel, resetConversation: deps.resetConversation,
                                     voiceReset: deps.voiceReset)
             w.contentViewController = NSHostingController(rootView: root)
-            w.setContentSize(NSSize(width: 640, height: 520))
+            w.setContentSize(NSSize(width: 680, height: 560))
             w.center()
             window = w
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
-        // Permission grants happen in System Settings; poll while open (and let the daemon poll faster).
         deps.model.onboardingVisible = true
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
@@ -286,6 +316,86 @@ final class SettingsNav: ObservableObject {
     @Published var section: SettingsSection = .general
 }
 
+// MARK: - Shared card language (also used by Meet Mac)
+
+/// Accent (or green when done) circle with an SF Symbol — the row glyph everywhere.
+struct IconBadge: View {
+    var symbol: String
+    var tint: Color = .accentColor
+    var size: CGFloat = 26
+    var body: some View {
+        ZStack {
+            Circle().fill(tint.opacity(0.13)).frame(width: size, height: size)
+            Image(systemName: symbol).font(.system(size: size * 0.46, weight: .semibold)).foregroundStyle(tint)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Rounded, softly tinted container; rows go inside, separated by `RowDivider`.
+struct Card<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        VStack(spacing: 0) { content() }
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.045)))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.06)))
+    }
+}
+
+struct RowDivider: View {
+    var body: some View { Divider().padding(.leading, 50) }
+}
+
+/// icon · title / subtitle · trailing control. 13 pt body, 11 pt secondary.
+struct CardRow<Trailing: View>: View {
+    var symbol: String
+    var tint: Color = .accentColor
+    var title: String
+    var subtitle: String? = nil
+    var error: String? = nil
+    @ViewBuilder var trailing: () -> Trailing
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                IconBadge(symbol: symbol, tint: tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 13))
+                    if let subtitle, !subtitle.isEmpty {
+                        Text(subtitle).font(.system(size: 11)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 12)
+                trailing()
+            }
+            if let error, !error.isEmpty {
+                Label(error, systemImage: "exclamationmark.circle.fill")
+                    .font(.system(size: 11)).foregroundStyle(.orange)
+                    .padding(.leading, 38)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+    }
+}
+
+struct SectionTitle: View {
+    var text: String
+    var body: some View {
+        Text(text).font(.system(size: 13, weight: .semibold)).padding(.leading, 2)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+struct Footnote: View {
+    var text: String
+    var body: some View {
+        Text(text).font(.system(size: 11)).foregroundStyle(.secondary).padding(.leading, 2)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 // MARK: - Views
 
 struct SettingsView: View {
@@ -300,14 +410,29 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(SettingsSection.allCases, selection: $nav.section) { s in
-                Label(s.title, systemImage: s.symbol).tag(s)
+            List(selection: $nav.section) {
+                ForEach(SettingsSection.allCases) { s in
+                    Label {
+                        Text(s.title)
+                    } icon: {
+                        Image(systemName: nav.section == s ? s.filledSymbol : s.symbol)
+                    }
+                    .tag(s)
+                }
             }
-            .navigationSplitViewColumnWidth(min: 160, ideal: 170, max: 200)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 200, max: 240)
             .listStyle(.sidebar)
         } detail: {
-            ZStack(alignment: .topTrailing) {
-                detail
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    SettingsHero(store: store, model: model)
+                    detail
+                }
+                .padding(.horizontal, 24).padding(.top, 8).padding(.bottom, 24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+            .overlay(alignment: .topTrailing) {
                 if store.savedFlash {
                     Label("Saved", systemImage: "checkmark.circle.fill")
                         .font(.footnote.weight(.medium)).foregroundStyle(.green)
@@ -321,7 +446,7 @@ struct SettingsView: View {
             .animation(.easeInOut(duration: 0.18), value: store.savedFlash)
             .navigationTitle(nav.section.title)
         }
-        .frame(minWidth: 600, minHeight: 460)
+        .frame(minWidth: 640, minHeight: 480)
     }
 
     @ViewBuilder private var detail: some View {
@@ -329,40 +454,60 @@ struct SettingsView: View {
         case .general: GeneralSettings(store: store)
         case .voice: VoiceSettings(store: store, model: model, openVoicePanel: openVoicePanel, voiceReset: voiceReset)
         case .appearance: AppearanceSettings()
+        case .connections:
+            Card { ConnectRows(model: model) }
+            Footnote(text: "Everything stays on this Mac except your conversation with Claude.")
         case .permissions:
-            Form {
-                Section {
-                    PermissionsChecklist(perms: perms, model: model, asCard: false)
-                } header: {
-                    Text("Mac asks for each permission with a one-line why. Grants take effect right away.")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
+            Card { PermissionsChecklist(perms: perms, model: model, asCard: false, includeConnect: false) }
+            Footnote(text: "Mac asks for each permission with a one-line why. Grants take effect right away.")
         case .phone: PhoneSettings(store: store, model: model, phone: phone)
         case .advanced: AdvancedSettings(store: store, resetConversation: resetConversation)
         }
     }
 }
 
-/// Inline error under a control.
-private struct FieldError: View {
-    var text: String?
-    var body: some View {
-        if let text, !text.isEmpty {
-            Label(text, systemImage: "exclamationmark.circle.fill")
-                .font(.footnote).foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-}
-
-private struct ConnectionNote: View {
+/// Compact identity header: portrait / app mark, Mac's name, live status with the state glyph.
+struct SettingsHero: View {
     @ObservedObject var store: SettingsStore
+    @ObservedObject var model: AppModel
+
+    private var tint: Color {
+        if model.off { return .secondary }
+        if model.state == .error { return .orange }
+        return .accentColor
+    }
+
     var body: some View {
-        if let e = store.loadError {
-            Label(e, systemImage: "bolt.slash").font(.callout).foregroundStyle(.secondary)
+        HStack(spacing: 14) {
+            if let portrait = AppPrefs.avatarImage() {
+                Image(nsImage: portrait).resizable().interpolation(.high).scaledToFill()
+                    .frame(width: 48, height: 48).clipShape(Circle())
+                    .overlay(Circle().strokeBorder(Color.primary.opacity(0.1)))
+                    .accessibilityHidden(true)
+            } else {
+                Image(nsImage: NSApp.applicationIconImage).resizable().interpolation(.high)
+                    .frame(width: 48, height: 48)
+                    .accessibilityHidden(true)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(store.name.isEmpty ? "Mac" : store.name).font(.system(size: 17, weight: .semibold))
+                HStack(spacing: 6) {
+                    Image(systemName: model.glyph).font(.system(size: 11, weight: .semibold)).foregroundStyle(tint)
+                        .accessibilityHidden(true)
+                    Text(model.statusLine).font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if !model.connected {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Mac is starting…").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+            }
         }
+        .padding(.bottom, 2)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -372,66 +517,82 @@ struct GeneralSettings: View {
     @ObservedObject var store: SettingsStore
     @State private var launchAtLogin = UX.launchAtLogin
     @State private var loginError: String?
+    @State private var stayAwake = AppPrefs.stayAwake
 
     var body: some View {
-        Form {
-            ConnectionNote(store: store)
-            Section {
-                TextField("Name", text: $store.name, prompt: Text("Mac"))
-                    .onChange(of: store.name) { _, v in
-                        let n = v.trimmingCharacters(in: .whitespaces)
-                        store.setDebounced("name", n)
-                    }
+        SectionTitle(text: "Name")
+        Card {
+            CardRow(symbol: "person.wave.2", title: "Name", subtitle: store.wakeHint,
+                    error: store.errors["name"] ?? store.errors["wake.phrases"]) {
+                TextField("Mac", text: $store.name)
+                    .textFieldStyle(.roundedBorder).frame(width: 170)
+                    .onChange(of: store.name) { _, v in store.setDebounced("name", v.trimmingCharacters(in: .whitespaces)) }
+                    .accessibilityLabel("Name")
                     .accessibilityHint("Changes the wake word to Hey, followed by this name")
-                Text(store.wakeHint).font(.callout).foregroundStyle(.secondary)
-                FieldError(text: store.errors["name"] ?? store.errors["wake.phrases"])
-                TextField("Your name", text: $store.userName, prompt: Text("Optional"))
-                    .onChange(of: store.userName) { _, v in store.setDebounced("user_name", v) }
-                FieldError(text: store.errors["user_name"])
-            } header: {
-                Text("Names")
-            } footer: {
-                Text("Mac uses your name when it talks to you.").font(.footnote).foregroundStyle(.secondary)
             }
+            RowDivider()
+            CardRow(symbol: "person", title: "Your name", subtitle: "Mac uses it when it talks to you. Optional.",
+                    error: store.errors["user_name"]) {
+                TextField("", text: $store.userName)
+                    .textFieldStyle(.roundedBorder).frame(width: 170)
+                    .onChange(of: store.userName) { _, v in store.setDebounced("user_name", v) }
+                    .accessibilityLabel("Your name")
+            }
+        }
 
-            Section("Language") {
-                Picker("Mac speaks", selection: Binding(
-                    get: { store.ttsLang },
-                    set: { store.ttsLang = $0; store.set(["tts.lang": $0]) })
-                ) {
+        SectionTitle(text: "Language")
+        Card {
+            CardRow(symbol: "globe", title: "Mac speaks", error: store.errors["tts.lang"]) {
+                Picker("", selection: Binding(get: { store.ttsLang }, set: { store.ttsLang = $0; store.set(["tts.lang": $0]) })) {
                     if store.languages.isEmpty { Text(store.ttsLang.isEmpty ? "English" : store.ttsLang).tag(store.ttsLang) }
                     ForEach(store.languages, id: \.code) { l in Text(l.name).tag(l.code) }
                 }
-                FieldError(text: store.errors["tts.lang"])
-                LabeledContent("You speak") {
-                    Text("\(Self.spoken(store.sttLanguages)) — more languages soon").foregroundStyle(.secondary)
-                }
+                .labelsHidden().frame(width: 180)
+                .accessibilityLabel("Language Mac speaks")
             }
+            RowDivider()
+            CardRow(symbol: "ear", title: "You speak") {
+                Text("\(Self.spoken(store.sttLanguages)) — more languages soon").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+        }
 
-            Section("Behavior") {
-                Toggle("Launch at login", isOn: $launchAtLogin)
+        SectionTitle(text: "Behavior")
+        Card {
+            CardRow(symbol: "sunrise", title: "Launch at login", error: loginError) {
+                Toggle("", isOn: $launchAtLogin).labelsHidden().toggleStyle(.switch)
                     .onChange(of: launchAtLogin) { _, on in
                         loginError = UX.setLaunchAtLogin(on)
                         if loginError != nil { launchAtLogin = UX.launchAtLogin }
                     }
-                FieldError(text: loginError)
+                    .accessibilityLabel("Launch at login")
+            }
+            RowDivider()
+            CardRow(symbol: "moon.zzz", title: "Idle shutdown", subtitle: "Claude goes to sleep after this long without a request.",
+                    error: store.errors["brain.idle_shutdown_min"]) {
                 Stepper(value: Binding(get: { store.idleMinutes }, set: { store.idleMinutes = $0; store.set(["brain.idle_shutdown_min": $0]) }),
-                        in: 1...240, step: 1) {
-                    LabeledContent("Idle shutdown", value: "\(store.idleMinutes) min")
-                }
-                .accessibilityLabel("Idle shutdown, \(store.idleMinutes) minutes")
-                FieldError(text: store.errors["brain.idle_shutdown_min"])
+                        in: 1...240) { Text("\(store.idleMinutes) min").font(.system(size: 12)).monospacedDigit() }
+                    .accessibilityLabel("Idle shutdown, \(store.idleMinutes) minutes")
+            }
+            RowDivider()
+            CardRow(symbol: "ellipsis.bubble", title: "Follow-up window", subtitle: "Keep talking without the wake word for this long after Mac answers.",
+                    error: store.errors["listen.followup_s"]) {
                 Stepper(value: Binding(get: { store.followupSeconds }, set: { store.followupSeconds = $0; store.set(["listen.followup_s": $0]) }),
-                        in: 2...30, step: 1) {
-                    LabeledContent("Follow-up window", value: "\(Int(store.followupSeconds)) s")
+                        in: 2...30, step: 1) { Text("\(Int(store.followupSeconds)) s").font(.system(size: 12)).monospacedDigit() }
+                    .accessibilityLabel("Follow-up window, \(Int(store.followupSeconds)) seconds")
+            }
+            RowDivider()
+            CardRow(symbol: "bolt", title: "Stay awake while listening",
+                    subtitle: "Keeps the Mac from sleeping while Mac is listening (the display can still turn off). A closed MacBook lid still sleeps the Mac unless an external display and power are attached.") {
+                Picker("", selection: $stayAwake) {
+                    Text("Automatic — when plugged in").tag("auto")
+                    Text("Always").tag("always")
+                    Text("Never").tag("never")
                 }
-                .accessibilityLabel("Follow-up window, \(Int(store.followupSeconds)) seconds")
-                Text("After Mac answers, you can keep talking without the wake word for this long.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                FieldError(text: store.errors["listen.followup_s"])
+                .labelsHidden().frame(width: 200)
+                .onChange(of: stayAwake) { _, v in AppPrefs.stayAwake = v }
+                .accessibilityLabel("Stay awake while listening")
             }
         }
-        .formStyle(.grouped)
     }
 
     static func spoken(_ codes: [String]) -> String {
@@ -460,61 +621,67 @@ struct VoiceSettings: View {
     }
 
     var body: some View {
-        Form {
-            ConnectionNote(store: store)
-            Section {
-                LabeledContent("Now speaking with", value: model.voiceEngineLabel)
-                HStack {
-                    Button("Record or Choose…", action: openVoicePanel)
-                    Button("Use Default Voice", action: voiceReset).disabled(!model.voiceEngine.hasPrefix("clone"))
+        SectionTitle(text: "Your voice")
+        Card {
+            CardRow(symbol: "waveform.and.mic", title: "Now speaking with", subtitle: model.voiceEngineLabel) {
+                HStack(spacing: 8) {
+                    Button("Record…", action: openVoicePanel).accessibilityLabel("Record or choose a voice sample")
+                    Button("Use Default", action: voiceReset).disabled(!model.voiceEngine.hasPrefix("clone"))
                 }
-            } header: {
-                Text("Your cloned voice")
-            } footer: {
-                Text("A 15-second sample is enough. The sample never leaves this Mac.")
-                    .font(.footnote).foregroundStyle(.secondary)
             }
-
-            Section("Speed") {
-                HStack {
+            RowDivider()
+            CardRow(symbol: "gauge.with.needle", title: "Speed", error: store.errors["tts.speed"]) {
+                HStack(spacing: 8) {
                     Slider(value: Binding(get: { store.ttsSpeed }, set: { store.ttsSpeed = $0; store.setDebounced("tts.speed", ($0 * 100).rounded() / 100, delay: 0.4) }),
                            in: 0.8...1.3, step: 0.05) { Text("Speed") }
+                        .labelsHidden().frame(width: 160)
                         .accessibilityValue(String(format: "%.2f times", store.ttsSpeed))
-                    Text(String(format: "%.2f×", store.ttsSpeed)).monospacedDigit().frame(width: 48, alignment: .trailing)
-                }
-                FieldError(text: store.errors["tts.speed"])
-            }
-
-            if groups.isEmpty {
-                Section("Built-in voices") {
-                    Text(store.loaded ? "No voices reported by Mac." : "Loading voices…").foregroundStyle(.secondary)
+                    Text(String(format: "%.2f×", store.ttsSpeed)).font(.system(size: 12)).monospacedDigit().frame(width: 42, alignment: .trailing)
                 }
             }
-            ForEach(groups, id: \.language) { g in
-                Section(g.language) {
-                    ForEach(g.voices) { v in voiceRow(v) }
-                }
-            }
-            FieldError(text: store.errors["tts.voice"])
         }
-        .formStyle(.grouped)
+        Footnote(text: "A 15-second sample is enough to clone a voice. The sample never leaves this Mac.")
+
+        if groups.isEmpty {
+            SectionTitle(text: "Built-in voices")
+            Card {
+                Text(store.loaded ? "No voices reported by Mac." : "Loading voices…")
+                    .font(.system(size: 12)).foregroundStyle(.secondary).padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        ForEach(groups, id: \.language) { g in
+            SectionTitle(text: g.language)
+            Card {
+                ForEach(Array(g.voices.enumerated()), id: \.element.id) { i, v in
+                    if i > 0 { Divider().padding(.leading, 40) }
+                    voiceRow(v)
+                }
+            }
+        }
+        if let e = store.errors["tts.voice"] {
+            Label(e, systemImage: "exclamationmark.circle.fill").font(.system(size: 11)).foregroundStyle(.orange)
+        }
     }
 
     private func voiceRow(_ v: Voice) -> some View {
         let selected = store.ttsVoice == v.id
         return HStack(spacing: 10) {
             Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(selected ? Color.accentColor : .secondary)
+                .font(.system(size: 15))
+                .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.6))
+                .frame(width: 18)
                 .accessibilityHidden(true)
-            Text(v.name)
+            Text(v.name).font(.system(size: 13))
             if !v.gender.isEmpty {
-                Text(v.gender.capitalized).font(.caption)
+                Text(v.gender).font(.system(size: 10, weight: .medium))
                     .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    .foregroundStyle(.secondary)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
                     .accessibilityHidden(true)
             }
             if !v.available {
-                Text("Not downloaded").font(.caption).foregroundStyle(.secondary)
+                Text("Not downloaded").font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
             Button {
@@ -527,6 +694,7 @@ struct VoiceSettings: View {
             .disabled(!v.available)
             .accessibilityLabel("Preview \(v.name)")
         }
+        .padding(.horizontal, 12).padding(.vertical, 8)
         .contentShape(Rectangle())
         .onTapGesture {
             guard v.available else { return }
@@ -548,63 +716,68 @@ struct AppearanceSettings: View {
     @State private var error: String?
 
     var body: some View {
-        Form {
-            Section {
-                HStack(alignment: .center, spacing: 18) {
-                    ZStack {
-                        Circle().fill(Color.primary.opacity(0.06)).frame(width: 96, height: 96)
-                        Circle().strokeBorder(targeted ? Color.accentColor : Color.primary.opacity(0.12),
-                                              style: StrokeStyle(lineWidth: 2, dash: portrait == nil ? [5, 4] : []))
-                            .frame(width: 96, height: 96)
-                        if let portrait {
-                            Image(nsImage: portrait).resizable().scaledToFill()
-                                .frame(width: 92, height: 92).clipShape(Circle())
-                        } else {
-                            Image(systemName: "person.crop.circle.badge.plus")
-                                .font(.system(size: 30, weight: .light)).foregroundStyle(.secondary)
-                        }
-                    }
-                    .onDrop(of: [.fileURL], isTargeted: $targeted) { providers in
-                        guard let p = providers.first else { return false }
-                        p.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
-                            guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                            DispatchQueue.main.async { MainActor.assumeIsolated { use(url) } }
-                        }
-                        return true
-                    }
-                    .accessibilityLabel(portrait == nil ? "No picture. Drop a photo here or choose one." : "Mac’s picture")
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Picture").font(.body.weight(.medium))
-                        Text("Used for Mac’s avatar — animated avatar coming soon.")
-                            .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        HStack {
-                            Button("Choose Photo…", action: choose)
-                            if portrait != nil { Button("Remove", action: { use(nil) }) }
-                        }
-                        FieldError(text: error)
+        SectionTitle(text: "Portrait")
+        Card {
+            HStack(alignment: .center, spacing: 16) {
+                ZStack {
+                    Circle().fill(Color.primary.opacity(0.06)).frame(width: 72, height: 72)
+                    Circle().strokeBorder(targeted ? Color.accentColor : Color.primary.opacity(0.12),
+                                          style: StrokeStyle(lineWidth: 2, dash: portrait == nil ? [5, 4] : []))
+                        .frame(width: 72, height: 72)
+                    if let portrait {
+                        Image(nsImage: portrait).resizable().scaledToFill()
+                            .frame(width: 68, height: 68).clipShape(Circle())
+                    } else {
+                        Image(systemName: "person.crop.circle.badge.plus")
+                            .font(.system(size: 24, weight: .light)).foregroundStyle(.secondary)
                     }
                 }
-                .padding(.vertical, 4)
+                .onDrop(of: [.fileURL], isTargeted: $targeted) { providers in
+                    guard let p = providers.first else { return false }
+                    p.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                        guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                        DispatchQueue.main.async { MainActor.assumeIsolated { use(url) } }
+                    }
+                    return true
+                }
+                .accessibilityLabel(portrait == nil ? "No portrait. Drop a photo here or choose one." : "Mac’s portrait")
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Mac’s portrait").font(.system(size: 13))
+                    Text("Shown in the HUD, in Meet Mac and here. Drop a photo or choose one.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("Choose Photo…", action: choose)
+                        if portrait != nil { Button("Remove", action: { use(nil) }) }
+                    }
+                    if let error {
+                        Label(error, systemImage: "exclamationmark.circle.fill").font(.system(size: 11)).foregroundStyle(.orange)
+                    }
+                }
+                Spacer(minLength: 0)
             }
-            Section("HUD") {
-                Picker("Position", selection: $hudPosition) {
-                    Text("Top of the screen").tag("top")
-                    Text("Bottom of the screen").tag("bottom")
+            .padding(14)
+        }
+
+        SectionTitle(text: "HUD")
+        Card {
+            CardRow(symbol: "rectangle.topthird.inset.filled", title: "Position",
+                    subtitle: "The HUD shows what you said and what Mac is doing, on the screen your pointer is on.") {
+                Picker("", selection: $hudPosition) {
+                    Text("Top").tag("top")
+                    Text("Bottom").tag("bottom")
                 }
-                .pickerStyle(.radioGroup)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 150)
                 .onChange(of: hudPosition) { _, v in AppPrefs.hudPosition = v }
-                Text("The HUD shows what you said and what Mac is doing, on the screen your pointer is on.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                .accessibilityLabel("HUD position")
             }
         }
-        .formStyle(.grouped)
     }
 
     private func choose() {
         let p = NSOpenPanel()
         p.allowedContentTypes = [.image]
         p.allowsMultipleSelection = false
-        p.message = "Choose a photo for Mac’s avatar."
+        p.message = "Choose a photo for Mac’s portrait."
         guard p.runModal() == .OK, let url = p.url else { return }
         use(url)
     }
@@ -629,27 +802,26 @@ struct PhoneSettings: View {
     let phone: PhonePanel
 
     var body: some View {
-        Form {
-            ConnectionNote(store: store)
-            Section {
-                Toggle("Allow talking to Mac from a phone", isOn: Binding(
-                    get: { store.remoteEnabled },
-                    set: { store.remoteEnabled = $0; store.set(["remote.enabled": $0]) }))
-                FieldError(text: store.errors["remote.enabled"])
-                if model.remote.active {
-                    LabeledContent("Session", value: model.remote.banner)
-                }
-            } footer: {
-                Text("Each link is private, works for 15 minutes, and asks the caller for a spoken PIN first.")
-                    .font(.footnote).foregroundStyle(.secondary)
+        SectionTitle(text: "Phone")
+        Card {
+            CardRow(symbol: "iphone.radiowaves.left.and.right", title: "Allow talking to Mac from a phone",
+                    subtitle: "Each link is private, works for 15 minutes, and asks the caller for a spoken PIN first.",
+                    error: store.errors["remote.enabled"]) {
+                Toggle("", isOn: Binding(get: { store.remoteEnabled }, set: { store.remoteEnabled = $0; store.set(["remote.enabled": $0]) }))
+                    .labelsHidden().toggleStyle(.switch)
+                    .accessibilityLabel("Allow talking to Mac from a phone")
             }
-            Section {
-                PhoneView(state: phone.state, model: model, embedded: true,
-                          enable: { phone.enable() }, retry: { phone.refresh() }, close: {})
-                    .frame(maxWidth: .infinity)
+            if model.remote.active {
+                RowDivider()
+                CardRow(symbol: "phone.connection", title: "Session", subtitle: model.remote.banner) { EmptyView() }
             }
         }
-        .formStyle(.grouped)
+        Card {
+            PhoneView(state: phone.state, model: model, embedded: true,
+                      enable: { phone.enable() }, retry: { phone.refresh() }, close: {})
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .frame(maxWidth: .infinity)
+        }
         .onAppear { phone.refresh() }   // the daemon answers "disabled" when off → Turn On state
         .onChange(of: store.remoteEnabled) { _, on in if on { phone.refresh() } }
     }
@@ -662,46 +834,51 @@ struct AdvancedSettings: View {
     var resetConversation: () -> Void
 
     var body: some View {
-        Form {
-            ConnectionNote(store: store)
-            Section("Claude") {
-                Toggle("Use Chrome for websites", isOn: Binding(
-                    get: { store.chrome }, set: { store.chrome = $0; store.set(["brain.chrome": $0]) }))
-                FieldError(text: store.errors["brain.chrome"])
-                Toggle("Load my Claude MCP servers and skills", isOn: Binding(
-                    get: { store.loadUserSources },
-                    set: { store.loadUserSources = $0; store.set(["brain.setting_sources": $0 ? ["user"] : []]) }))
-                Text("Everything you set up for Claude Code (~/.claude) becomes available to Mac, including tools that can act on your behalf.")
-                    .font(.footnote).foregroundStyle(.secondary)
-                FieldError(text: store.errors["brain.setting_sources"])
+        SectionTitle(text: "Claude")
+        Card {
+            CardRow(symbol: "globe", title: "Use Chrome for websites", error: store.errors["brain.chrome"]) {
+                Toggle("", isOn: Binding(get: { store.chrome }, set: { store.chrome = $0; store.set(["brain.chrome": $0]) }))
+                    .labelsHidden().toggleStyle(.switch).accessibilityLabel("Use Chrome for websites")
             }
-            Section("Files") {
-                LabeledContent("Results folder") {
-                    HStack {
-                        Text(store.resultsDir.isEmpty ? "~/Documents/Mac" : store.resultsDir)
-                            .lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
-                        Button("Choose…", action: chooseFolder)
-                    }
-                }
-                FieldError(text: store.errors["results_dir"])
-                HStack {
-                    Button("Open Config File") {
+            RowDivider()
+            CardRow(symbol: "puzzlepiece.extension", title: "Load my Claude MCP servers and skills",
+                    subtitle: "Everything you set up for Claude Code (~/.claude) becomes available to Mac, including tools that can act on your behalf.",
+                    error: store.errors["brain.setting_sources"]) {
+                Toggle("", isOn: Binding(get: { store.loadUserSources },
+                                         set: { store.loadUserSources = $0; store.set(["brain.setting_sources": $0 ? ["user"] : []]) }))
+                    .labelsHidden().toggleStyle(.switch).accessibilityLabel("Load my Claude MCP servers and skills")
+            }
+        }
+
+        SectionTitle(text: "Files")
+        Card {
+            CardRow(symbol: "folder", title: "Results folder",
+                    subtitle: store.resultsDir.isEmpty ? "~/Documents/Mac" : store.resultsDir,
+                    error: store.errors["results_dir"]) {
+                Button("Choose…", action: chooseFolder)
+            }
+            RowDivider()
+            CardRow(symbol: "doc.text", title: "Config file and logs", subtitle: "For the curious, or when something’s off.") {
+                HStack(spacing: 8) {
+                    Button("Config File") {
                         if FileManager.default.fileExists(atPath: Paths.configFile.path) {
                             NSWorkspace.shared.open(Paths.configFile)
                         } else {
                             NSWorkspace.shared.open(Paths.home)
                         }
                     }
-                    Button("Open Logs") { NSWorkspace.shared.open(Paths.logDir) }
+                    Button("Logs") { NSWorkspace.shared.open(Paths.logDir) }
                 }
             }
-            Section("Conversation") {
-                Button("Reset Conversation", action: resetConversation)
-                Text("Mac forgets the current conversation and starts fresh. Memory notes are kept.")
-                    .font(.footnote).foregroundStyle(.secondary)
+        }
+
+        SectionTitle(text: "Conversation")
+        Card {
+            CardRow(symbol: "arrow.counterclockwise", title: "Reset conversation",
+                    subtitle: "Mac forgets the current conversation and starts fresh. Memory notes are kept.") {
+                Button("Reset", action: resetConversation)
             }
         }
-        .formStyle(.grouped)
     }
 
     private func chooseFolder() {

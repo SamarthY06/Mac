@@ -299,6 +299,10 @@ struct HUDView: View {
         default:
             if model.userText.isEmpty || model.state == .followup {
                 Text(model.statusLine).font(.callout).foregroundStyle(.secondary)
+                if model.screenLocked {
+                    Label(AppModel.screenLockedLine, systemImage: "lock.fill")
+                        .font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                }
             } else if model.userFromPhone {
                 Label(model.userText, systemImage: "iphone").font(.callout).foregroundStyle(.secondary).lineLimit(3)
             } else {

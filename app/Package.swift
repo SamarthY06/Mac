@@ -21,6 +21,7 @@ let package = Package(
                 .linkedFramework("ServiceManagement"),
                 .linkedFramework("UserNotifications"),
                 .linkedFramework("ApplicationServices"),
+                .linkedFramework("IOKit"),
             ]
         ),
         .testTarget(name: "MacProtocolTests", dependencies: ["MacProtocol"]),

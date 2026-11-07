@@ -123,6 +123,9 @@ async def test_reset_and_records() -> None:
     await brain.sleep()
     assert not brain.alive and brain.sleeps == 1
     assert await brain.handoff() is True and brain.handoffs == 1
+    assert (await brain.connect_check())["auth"] == "ok" and brain.connect_checks == 1
+    await brain.set_context(locked=True)
+    assert brain.locked
     await brain.set_name("Jarvis")
     await brain.set_language("hi")
     assert brain.name == "Jarvis" and brain.lang == "hi"

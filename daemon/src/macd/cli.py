@@ -180,6 +180,29 @@ def cmd_ask(client: ControlClient, text: str, wait: bool, timeout: float) -> int
     return 2
 
 
+def fmt_connect(d: dict[str, Any]) -> str:
+    cl, ch = d.get("claude") or {}, d.get("chrome") or {}
+    mark = lambda ok: "✓" if ok else "✗"
+    lines = [
+        f" {mark(cl.get('installed'))} Claude Code: {cl.get('version') or 'not installed'}"
+        + ("" if cl.get("min_ok") or not cl.get("installed") else " (too old)"),
+        f" {mark(cl.get('signed_in') == 'yes')} Signed in: {cl.get('signed_in')} ({cl.get('auth_method')})",
+    ]
+    if cl.get("fix"):
+        lines.append(f"     fix: {cl['fix']}")
+    lines += [
+        f" {mark(ch.get('browser_running'))} Browser running: {', '.join(ch.get('browsers') or []) or 'no'}",
+        f" {mark(ch.get('extension_installed'))} Claude in Chrome extension installed",
+        f" {mark(ch.get('native_host'))} Native host registered",
+        f" {mark(ch.get('enabled_by_default'))} Enabled by default (/chrome): {ch.get('enabled_by_default')}",
+        f" {'✓' if ch.get('connected') == 'connected' else '-'} Connected: {ch.get('connected')}",
+    ]
+    if ch.get("fix"):
+        lines.append(f"     fix: {ch['fix']}")
+    lines.append(f" {'✓ READY' if d.get('ready') else '✗ not ready'}")
+    return "\n".join(lines)
+
+
 def cmd_logs(n: int, follow: bool, raw: bool) -> int:
     path = config.EVENT_LOG
     if not path.exists():
@@ -295,6 +318,8 @@ def build_parser() -> argparse.ArgumentParser:
     vp.add_argument("voice")
     vp.add_argument("--text", default=None)
     sub.add_parser("voices", help="list the available Kokoro voices")
+    cc = sub.add_parser("connect", help="check that Claude Code and Claude in Chrome are set up")
+    cc.add_argument("--deep", action="store_true", help="also start Claude and ask it whether Chrome is connected")
     st = sub.add_parser("settings", help="read or change settings (saved to config.toml, applied live)")
     stsub = st.add_subparsers(dest="settings_cmd", required=True)
     stsub.add_parser("get", help="print all settings")
@@ -401,6 +426,13 @@ def _run(args: argparse.Namespace) -> int:
                 st = c.request("status")
                 print(f"voice: {st.get('voice_engine')}" + (f" ({st['clone_sample']})" if st.get("clone_sample") else ""))
             return 0
+        if args.cmd == "connect":
+            data = c.request("connect_check", deep=args.deep)
+            if args.json:
+                _print_json(data)
+            else:
+                print(fmt_connect(data))
+            return 1 if not data.get("ready") else 0
         if args.cmd == "voices":
             for v in c.request("voices_list").get("voices", []):
                 print(f"{v.get('id', '?'):<12} {v.get('name', '')}  {v.get('lang', '')} {v.get('gender', '')}".rstrip())

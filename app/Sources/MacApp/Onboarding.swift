@@ -107,7 +107,7 @@ final class Permissions: ObservableObject {
     }
 }
 
-/// "Meet Mac": one window — hero, permission checklist (live), try-it, launch at login.
+/// "Meet Mac": one window — hero, connect rows + permission checklist (live), try-it, launch at login.
 @MainActor
 final class OnboardingWindow {
     private var window: NSWindow?
@@ -127,6 +127,7 @@ final class OnboardingWindow {
     func show() {
         perms.refresh()
         model.onboardingVisible = true
+        model.guided?.check(deep: false)
         if window == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 600),
                              styleMask: [.titled, .closable, .fullSizeContentView],
@@ -137,7 +138,8 @@ final class OnboardingWindow {
             w.isMovableByWindowBackground = true
             w.isReleasedWhenClosed = false
             w.setAccessibilityLabel("Meet Mac")
-            let hc = NSHostingController(rootView: OnboardingView(perms: perms, model: model, close: { [weak w, weak self] in w?.close(); self?.onDone?() }))
+            let hc = NSHostingController(rootView: OnboardingView(perms: perms, model: model,
+                                                                  close: { [weak w, weak self] in w?.close(); self?.onDone?() }))
             hc.sizingOptions = [.preferredContentSize]
             w.contentViewController = hc
             w.center()
@@ -227,18 +229,15 @@ struct OnboardingView: View {
     private var allSet: Bool { perms.allGranted && (model.brainAuth == "ok" || model.brainAuth == "api_key") }
 
     private var checklist: some View {
-        GroupBox {
-            PermissionsChecklist(perms: perms, model: model, asCard: true)
-        } label: {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Text(allSet ? "All set" : "Mac needs a few things")
-                    .font(.headline)
+                SectionTitle(text: allSet ? "All set" : "Mac needs a few things")
                 if allSet {
                     Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
                         .symbolEffect(.bounce, value: allSet)
                 }
             }
-            .padding(.bottom, 2)
+            Card { PermissionsChecklist(perms: perms, model: model, asCard: true, includeConnect: true) }
         }
     }
 
@@ -284,11 +283,22 @@ struct OnboardingView: View {
                     .toggleStyle(.checkbox)
                     .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
                 Spacer()
+                if model.claudeStage != .connected {
+                    Button("Later", action: close).accessibilityHint("Finish setup later from Settings")
+                }
                 Button("Done", action: close).keyboardShortcut(.defaultAction)
+                    .disabled(model.claudeStage != .connected)
+                    .accessibilityHint(model.claudeStage == .connected ? "" : "Sign in to Claude first")
             }
             if let loginError {
                 Text(loginError).font(.footnote).foregroundStyle(.red)
             }
+            if model.claudeStage == .connected, model.chromeStage != .connected {
+                Text("Browser tasks need Chrome — connect it above, or later in Settings.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Text("Everything stays on this Mac except your conversation with Claude.")
+                .font(.footnote).foregroundStyle(.tertiary)
         }
     }
 
@@ -303,65 +313,32 @@ struct PermissionsChecklist: View {
     @ObservedObject var perms: Permissions
     @ObservedObject var model: AppModel
     var asCard: Bool
+    var includeConnect: Bool = true
     @State private var asked: Set<String> = []   // rows whose Allow… was clicked once (UX#18)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    var body: some View {
-        Group {
-            if asCard {
-                rowsView.padding(.vertical, -6)
-            } else {
-                rowsView
-            }
-        }
-    }
+    var body: some View { rowsView }
 
     private var rowsView: some View {
         VStack(spacing: 0) {
+                if includeConnect {
+                    ConnectRows(model: model)
+                    RowDivider()
+                }
                 row("Microphone", "To hear “Hey Mac” and what you ask.", perms.mic, "mic.fill", request: { perms.requestMic() })
-                Divider()
+                RowDivider()
                 row("Accessibility", "To click and type in apps for you.", perms.accessibility, "hand.point.up.left.fill",
                     request: perms.requestAccessibility, settings: true)
-                Divider()
+                RowDivider()
                 row("Automation", "To work with Mail, Calendar, Notes and more.", perms.automation, "applescript.fill",
                     request: perms.requestAutomation, settings: true)
-                Divider()
-                row("Screen Recording", "To see your screen when you ask about it.", perms.screen, "rectangle.dashed.badge.record",
+                RowDivider()
+                row("Screen Recording", "To see your screen when you ask “what’s this?”", perms.screen, "rectangle.dashed.badge.record",
                     request: perms.requestScreen, settings: true)
-                Divider()
+                RowDivider()
                 row("Notifications", "To tell you when a long task finishes. Optional.", perms.notifications, "bell.fill",
                     request: perms.requestNotifications)
-                Divider()
-                claudeRow
-                Divider()
-                chromeRow
             }
-    }
-
-    /// "Claude Code signed in" (UX#8): status from the daemon's `status.brain.auth`.
-    private var claudeRow: some View {
-        let auth = model.brainAuth
-        let st: Permissions.Status = auth == "ok" || auth == "api_key" ? .granted : (auth.isEmpty ? .unknown : .denied)
-        let why = auth == "missing" ? "Not installed. Mac thinks with Claude Code."
-                : auth == "signed_out" ? "Not signed in. Mac uses your Claude Code sign-in."
-                : auth.isEmpty && !model.connected ? "Mac uses your Claude Code sign-in. Checking…"
-                : "Mac uses your Claude Code sign-in."
-        return row("Claude Code", why, st, "sparkle", button: auth == "missing" ? "Install…" : "Sign in…") {
-            if auth == "missing" {
-                NSWorkspace.shared.open(URL(string: "https://claude.com/claude-code")!)
-            } else {
-                UX.openTerminal(running: "claude", name: "sign-in-to-claude")
-            }
-        }
-    }
-
-    /// "Chrome extension paired" (UX#8): `status.brain.chrome`. Optional.
-    private var chromeRow: some View {
-        let st: Permissions.Status = model.chromePaired == true ? .granted : (model.chromePaired == nil ? .unknown : .denied)
-        return row("Claude in Chrome", "For websites. Optional.", st,
-                   "globe", button: "Get it…") {
-            NSWorkspace.shared.open(URL(string: "https://claude.ai/chrome")!)
-        }
     }
 
     @ViewBuilder
@@ -369,14 +346,10 @@ struct PermissionsChecklist: View {
                      button: String? = nil, request: @escaping () -> Void, settings: Bool = false) -> some View {
         let btn = button ?? (settings && asked.contains(title) ? "Settings…" : "Allow…")
         HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(st == .granted ? .green : .secondary)
-                .frame(width: 20)
-                .accessibilityHidden(true)
+            IconBadge(symbol: icon, tint: st == .granted ? .green : .accentColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.body.weight(.medium))
-                Text(why).font(.callout).foregroundStyle(.secondary)
+                Text(title).font(.system(size: 13))
+                Text(why).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -389,7 +362,7 @@ struct PermissionsChecklist: View {
             .accessibilityLabel(btn == "Settings…" ? "Open System Settings for \(title)" : "\(btn.dropLast()) \(title)")
             .accessibilityHidden(st == .granted)
         }
-        .padding(.vertical, 5)
+        .padding(.horizontal, 12).padding(.vertical, 8)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(title): \(label(for: st)). \(why)")
     }
@@ -410,4 +383,193 @@ struct PermissionsChecklist: View {
         }
     }
 
+}
+
+/// The two rich "Connect" rows: Claude (Install → Sign in → Connected) and Chrome
+/// (Install extension → Connect → Connected), shown above the macOS permissions.
+struct ConnectRows: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(spacing: 0) {
+            claudeRow
+            RowDivider()
+            chromeRow
+        }
+    }
+
+    // MARK: Claude
+
+    private var claudeRow: some View {
+        let stage = model.claudeStage
+        let c = model.connect.claude
+        let apiKey = model.claudeUsesApiKey
+        return ConnectRow(icon: "sparkle", title: "Claude",
+                          steps: ["Install", "Sign in", "Connected"], stage: stage?.rawValue,
+                          status: claudeStatus(stage), badge: stage == .connected && apiKey
+                              ? ("API key — browser tasks unavailable", .orange) : nil,
+                          fix: stage == .connected
+                              ? (apiKey ? "Browser tasks need a claude.ai sign-in; the API key covers everything else." : "")
+                              : c.fix) {
+            switch stage {
+            case .install: Button("Install Claude Code…") { model.guided?.installClaude() }
+            case .signIn: Button("Sign in…") { model.guided?.signIn() }
+            case .connected: EmptyView()
+            case nil: Button("Sign in…") { model.guided?.signIn() }.disabled(model.guided == nil)
+            }
+        } secondary: { EmptyView() } accessory: { EmptyView() }
+    }
+
+    private func claudeStatus(_ stage: ClaudeStage?) -> String {
+        let c = model.connect.claude
+        switch stage {
+        case .install: return "Claude Code isn’t installed yet. Mac thinks with it."
+        case .signIn: return c.version.isEmpty ? "Installed — not signed in yet." : "Claude Code \(c.version) — not signed in yet."
+        case .connected:
+            let v = c.version.isEmpty ? "Claude Code" : "Claude Code \(c.version)"
+            return model.claudeUsesApiKey ? "\(v) · using an API key" : "\(v) · signed in with claude.ai"
+        case nil: return model.connected ? "Checking…" : "Waiting for Mac to connect…"
+        }
+    }
+
+    // MARK: Chrome
+
+    private var chromeRow: some View {
+        let stage = model.chromeStage
+        let ch = model.connect.chrome
+        let checking = model.connect.checking
+        return ConnectRow(icon: "globe", title: "Claude in Chrome",
+                          steps: ["Install extension", "Connect", "Connected"], stage: stage?.rawValue,
+                          status: chromeStatus(stage), badge: nil,
+                          fix: stage == .connected ? "" :
+                              (ch.fix.isEmpty ? "Chrome must be open and the extension signed in to the same claude.ai account." : ch.fix)) {
+            if stage == .install {
+                Button("Install Extension…") { model.guided?.installExtension() }
+            } else if stage == .connect {
+                Button("Connect Chrome…") { model.guided?.connectChrome() }
+            }
+        } secondary: {
+            Button {
+                model.guided?.checkConnection()
+            } label: {
+                if checking {
+                    HStack(spacing: 5) { ProgressView().controlSize(.mini); Text("Asking Claude… ~10 s") }
+                } else {
+                    Text("Check Connection")
+                }
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+            .fixedSize()
+            .disabled(checking || !model.connected || model.guided == nil)
+            .accessibilityLabel(checking ? "Checking the Chrome connection" : "Check the Chrome connection")
+        } accessory: {
+            HStack(spacing: 5) {
+                chip("Chrome open", ch.browserRunning)
+                chip("Extension", ch.extensionInstalled)
+                chip("Native host", ch.nativeHost)
+                chip("Enabled by default", ch.enabledByDefault)
+            }
+            .fixedSize()
+        }
+    }
+
+    private func chromeStatus(_ stage: ChromeStage?) -> String {
+        switch stage {
+        case .install: return "For websites. Optional — install the extension in Chrome."
+        case .connect: return "Extension found — Claude can’t reach it yet."
+        case .connected: return "Connected · Claude can browse for you."
+        case nil: return model.connected ? "Checking…" : "Waiting for Mac to connect…"
+        }
+    }
+
+    private func chip(_ label: String, _ ok: Bool?) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: ok == true ? "checkmark" : ok == false ? "xmark" : "minus")
+                .font(.system(size: 8, weight: .bold))
+            Text(label).font(.caption2).lineLimit(1)
+        }
+        .padding(.horizontal, 6).padding(.vertical, 2)
+        .foregroundStyle(ok == true ? Color.green : ok == false ? Color.orange : Color.secondary)
+        .background(Capsule().fill((ok == true ? Color.green : ok == false ? Color.orange : Color.secondary).opacity(0.12)))
+        .accessibilityLabel("\(label): \(ok == true ? "yes" : ok == false ? "no" : "unknown")")
+    }
+}
+
+/// One rich connect row: title + primary button, stepper (+ secondary action), status, badge,
+/// chips, fix text. Everything horizontal is fixed-size so nothing wraps mid-word.
+struct ConnectRow<Buttons: View, Secondary: View, Accessory: View>: View {
+    var icon: String
+    var title: String
+    var steps: [String]
+    var stage: Int?            // index of the current step; steps.count-1 = done; nil = unknown
+    var status: String
+    var badge: (String, Color)?
+    var fix: String
+    @ViewBuilder var buttons: () -> Buttons        // primary action, trailing on the title line
+    @ViewBuilder var secondary: () -> Secondary    // small action, trailing on the stepper line
+    @ViewBuilder var accessory: () -> Accessory    // chips
+
+    private var done: Bool { stage == steps.count - 1 }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            IconBadge(symbol: icon, tint: done ? .green : .accentColor).padding(.top, 1)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(title).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                    Spacer(minLength: 8)
+                    if done {
+                        Image(systemName: "checkmark.circle.fill").font(.system(size: 16)).foregroundStyle(.green)
+                            .accessibilityHidden(true)
+                    }
+                    buttons()
+                }
+                HStack(spacing: 8) {
+                    stepper
+                    Spacer(minLength: 8)
+                    secondary()
+                }
+                Text(status).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let (text, color) = badge {
+                    Text(text).font(.caption.weight(.medium)).fixedSize()
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .foregroundStyle(color)
+                        .background(Capsule().fill(color.opacity(0.14)))
+                }
+                accessory()
+                if !fix.isEmpty {
+                    Text(fix).font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(title): \(status)")
+    }
+
+    /// Install › Sign in › Connected ✓ with a dot per step.
+    private var stepper: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(steps.enumerated()), id: \.offset) { i, name in
+                let state: Int = stage.map { s in i < s || done ? 2 : (i == s ? 1 : 0) } ?? 0
+                HStack(spacing: 3) {
+                    Image(systemName: state == 2 ? "checkmark.circle.fill" : state == 1 ? "circle.fill" : "circle")
+                        .font(.system(size: 8))
+                        .foregroundStyle(state == 2 ? Color.green : state == 1 ? Color.accentColor : Color.secondary.opacity(0.5))
+                    Text(name).font(.caption).lineLimit(1)
+                        .foregroundStyle(state == 1 ? Color.primary : Color.secondary)
+                }
+                if i < steps.count - 1 {
+                    Image(systemName: "chevron.right").font(.system(size: 7, weight: .bold)).foregroundStyle(.tertiary)
+                }
+            }
+        }
+        .fixedSize()
+        .accessibilityHidden(true)
+    }
 }

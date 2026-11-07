@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import Combine
 import ServiceManagement
 import UserNotifications
 
@@ -32,7 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
         Log.info("Mac.app \(v) launching pid=\(ProcessInfo.processInfo.processIdentifier) MAC_HOME=\(Paths.home.path)")
 
-        power = Power(audio: audio, control: control)
+        power = Power(audio: audio, control: control, model: model)
         hud = HUDController(model: model)
         statusBar = StatusBar(model: model, actions: .init(
             talk: { [weak self] in self?.talk() },
@@ -83,6 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.model.muted { self.control.send("mute", ["value": true]) }
                 if let cmd = self.pendingPowerCmd { self.sendPower(cmd) }
                 self.pollStatus(force: true)
+                self.power.daemonConnected()
+                self.model.guided?.check(deep: false)  // static Claude/Chrome facts for Meet Mac
             }
             self.statusBar.refreshIcon()
         }
@@ -111,6 +114,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         setupNotifications()
+        model.guided = GuidedActions(control: control, model: model)
+        // Test hook: MAC_DEBUG_GUIDED=installClaude|signIn|installExtension|connectChrome runs
+        // that guided action 2 s after launch (with MAC_GUIDED_NO_OPEN=1 it only writes the script).
+        if let a = Paths.env["MAC_DEBUG_GUIDED"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                MainActor.assumeIsolated {
+                    switch a {
+                    case "installClaude": self?.model.guided?.installClaude()
+                    case "signIn": self?.model.guided?.signIn()
+                    case "installExtension": self?.model.guided?.installExtension()
+                    case "connectChrome": self?.model.guided?.connectChrome()
+                    default: break
+                    }
+                }
+            }
+        }
 
         installSignalHandlers()
         power.start()
@@ -119,6 +138,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey = Hotkey { [weak self] in self?.talk() }
 
         audio.startLink()
+        // OFF survives relaunch (app-side, so the mic never blips before the daemon says so).
+        if UserDefaults.standard.bool(forKey: "off") {
+            model.off = true
+            audio.setPowered(false)
+            Log.info("starting powered off (persisted)", "power")
+        }
+        offPersist = model.$off.removeDuplicates().sink { UserDefaults.standard.set($0, forKey: "off") }
         // Start the engine right away (while the TCC prompt is pending, input is silent).
         // If the user grants access afterwards, restart it so real audio flows.
         audio.start()
@@ -166,6 +192,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Screenshot/debug hook: MAC_DEBUG_UI=menu|onboarding|phone|voice|settings opens that UI a few seconds in.
         if let ui = Paths.env["MAC_DEBUG_UI"] {
+            if let a = Paths.env["MAC_DEBUG_APPEARANCE"] {   // light|dark screenshots
+                NSApp.appearance = NSAppearance(named: a == "dark" ? .darkAqua : .aqua)
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
                 MainActor.assumeIsolated {
                     switch ui {
@@ -199,6 +228,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             signalSources.append(src)
         }
     }
+
+    private var offPersist: AnyCancellable?
 
     func applicationWillTerminate(_ note: Notification) {
         Log.info("terminating")
@@ -237,6 +268,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let voice = (data["voice"] as? Bool) ?? true
             let reason = (data["voice_reason"] as? String) ?? ""
             self.model.voiceUnavailable = voice ? nil : (reason.isEmpty ? "speech models missing" : reason)
+            if let cc = data["connect"] as? [String: Any], !ConnectCheck.isPending(cc) {  // static block in status
+                var c = ConnectCheck.parse(cc); c.checking = self.model.connect.checking
+                if c != self.model.connect { self.model.connect = c }
+            }
             if var r = data["remote"] as? [String: Any] {
                 r["event"] = "remote"
                 self.model.handle(event: r)  // same shape as the pushed event
@@ -394,6 +429,10 @@ signal(SIGPIPE, SIG_IGN)
 
 // `Mac --unregister-login-item`: used by install.sh --uninstall (SMAppService registrations
 // can only be removed by the app itself).
+if CommandLine.arguments.contains("--register-login-item") {
+    do { try SMAppService.mainApp.register(); print("login item registered: \(SMAppService.mainApp.status.rawValue)") } catch { print("login item: \(error.localizedDescription)") }
+    exit(0)
+}
 if CommandLine.arguments.contains("--unregister-login-item") {
     do { try SMAppService.mainApp.unregister(); print("login item removed") } catch { print("login item: \(error.localizedDescription)") }
     exit(0)

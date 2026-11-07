@@ -211,7 +211,8 @@ async def test_handle_command_dispatch() -> None:
     assert await handle_command(orch, hooks, "mute", {"value": True}) == {"muted": True}  # type: ignore[arg-type]
     assert await handle_command(orch, hooks, "off", {}) == {"off": True}  # type: ignore[arg-type]
     assert await handle_command(orch, hooks, "power", {"event": "did_wake"}) == {}  # type: ignore[arg-type]
-    assert orch.calls == ["did_wake"] and powered == ["did_wake"]
+    assert await handle_command(orch, hooks, "power", {"event": "screen_locked"}) == {}  # type: ignore[arg-type]
+    assert orch.calls == ["did_wake", "screen_locked"] and powered == ["did_wake", "screen_locked"]
     assert await handle_command(orch, hooks, "remote_end", {}) == {}  # type: ignore[arg-type]
     assert await handle_command(orch, hooks, "confirm", {"approved": True}) == {"turn_id": 4, "approved": True}  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="nothing pending"):
@@ -290,7 +291,14 @@ async def test_settings_commands_dispatch() -> None:
         async def preview(self, voice: Any, text: Any = None) -> dict[str, Any]:
             return {"queued": True, "voice": voice, "text": text}
 
-    hooks = Hooks(settings=FakeSettings())
+    async def cc(deep: bool) -> dict[str, Any]:
+        return {"ready": deep}
+
+    hooks = Hooks(settings=FakeSettings(), connect_check=cc)
+    assert await handle_command(None, hooks, "connect_check", {"deep": True}) == {"ready": True}  # type: ignore[arg-type]
+    assert await handle_command(None, hooks, "connect_check", {}) == {"ready": False}  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="not available"):
+        await handle_command(None, Hooks(), "connect_check", {})  # type: ignore[arg-type]
     assert await handle_command(None, hooks, "settings_get", {}) == {"name": "Mac"}  # type: ignore[arg-type]
     assert (await handle_command(None, hooks, "settings_set", {"changes": {"name": "J"}}))["applied"] == {"name": "J"}  # type: ignore[arg-type]
     assert await handle_command(None, hooks, "voices_list", {}) == {"voices": [{"id": "af_heart"}]}  # type: ignore[arg-type]

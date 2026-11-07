@@ -130,6 +130,28 @@ def check_models() -> Check:
     return Check("fail", "speech models", "missing: " + ", ".join(map(str, missing)), "macctl models")
 
 
+def connect_checks(cfg: config.Config) -> list[Check]:
+    """Same data as `macctl connect` (static part; no Claude process is started)."""
+    from macd import connect
+
+    d = connect.check_all(cfg)
+    cl, ch = d["claude"], d["chrome"]
+    out = [
+        Check("ok" if cl["installed"] and cl["min_ok"] else "fail", "Claude Code", cl.get("version") or "not installed",
+              cl["fix"] if not (cl["installed"] and cl["min_ok"]) else ""),
+        Check("ok" if cl["signed_in"] == "yes" and cl["auth_method"] != "api_key" else "fail", "Claude sign-in",
+              f"{cl['signed_in']} ({cl['auth_method']})", cl["fix"] if cl["signed_in"] != "yes" or cl["auth_method"] == "api_key" else ""),
+        Check("ok" if ch["browser_running"] else "warn", "browser running", ", ".join(ch["browsers"]) or "no",
+              connect.FIX_BROWSER if not ch["browser_running"] else ""),
+        Check("ok" if ch["extension_installed"] else "fail", "Claude in Chrome extension",
+              "installed" if ch["extension_installed"] else "not found", "" if ch["extension_installed"] else connect.FIX_EXTENSION),
+        Check("ok" if ch["native_host"] and ch["enabled_by_default"] else "fail", "Claude in Chrome enabled",
+              f"native host {'ok' if ch['native_host'] else 'missing'}, enabled by default {ch['enabled_by_default']}",
+              "" if ch["native_host"] and ch["enabled_by_default"] else connect.FIX_ENABLE),
+    ]
+    return out
+
+
 def check_pocket_model() -> Check:
     """Optional: the Pocket TTS model used for voice cloning."""
     from macd.speech.models import missing_models
@@ -253,6 +275,7 @@ def run_checks(deep: bool = False, cfg: config.Config | None = None) -> list[Che
     cfg = cfg or config.load(write_default=False)
     checks: list[Check] = [check_arch(), check_macos()]
     checks += check_claude(cfg, deep)
+    checks += connect_checks(cfg)
     daemon, st = check_daemon()
     if st is not None:
         voice_ok = st.get("voice", True)

@@ -171,9 +171,33 @@ class ControlSide:
                                  "voice_engine": self.voice_engine, "clone_sample": self.clone_sample,
                                  "remote": {"active": False, "present": False, "verified": False, "pin": None}}
                 if self.status_polls > 1:
-                    reply["data"]["brain"] = {"alive": True, "auth": "ok", "chrome": "connected", "kind": "FakeBrain"}
+                    mode = os.environ.get("MAC_FAKE_CONNECT", "connected")
+                    auth = {"signed_out": "signed_out", "missing": "missing", "api_key": "api_key"}.get(mode, "ok")
+                    reply["data"]["brain"] = {"alive": True, "auth": auth,
+                                              "chrome": "connected" if mode == "connected" else "disconnected", "kind": "FakeBrain"}
             elif msg.get("cmd") == "remote_end":
                 reply["data"] = {"ended": True}
+            elif msg.get("cmd") == "connect_check":
+                # Keys as ConnectCheck.parse expects. MAC_FAKE_CONNECT = connected (default) |
+                # signed_out | missing | api_key | chrome_off lets the UI be screenshotted in each state.
+                mode = os.environ.get("MAC_FAKE_CONNECT", "connected")
+                deep = bool(msg.get("deep"))
+                signed = mode in ("connected", "api_key", "chrome_off")
+                claude = {"installed": mode != "missing", "version": "" if mode == "missing" else "2.1.3",
+                          "min_ok": mode != "missing", "signed_in": "yes" if signed else ("unknown" if mode == "missing" else "no"),
+                          "auth_method": "api_key" if mode == "api_key" else ("claude.ai" if signed else ""),
+                          "fix": {"signed_out": "Open Terminal and run: claude — then sign in.",
+                                  "missing": "Install Claude Code from claude.com/claude-code."}.get(mode, "")}
+                chrome_ok = mode == "connected"
+                chrome = {"browser_running": mode != "chrome_off", "extension_installed": True, "native_host": chrome_ok,
+                          "enabled_by_default": chrome_ok, "connected": chrome_ok,
+                          "connected_state": "connected" if chrome_ok else ("unavailable_api_key" if mode == "api_key" else "not_connected"),
+                          "fix": "" if chrome_ok else ("Open Chrome, then check again." if mode == "chrome_off"
+                                                       else "Chrome must be open and the extension signed in to the same claude.ai account.")}
+                reply["data"] = {"claude": claude, "chrome": chrome, "ready": signed and chrome_ok}
+                if deep:
+                    threading.Timer(1.2, self.send, args=(reply,)).start()   # the real check asks Claude (up to ~90 s)
+                    continue
             elif msg.get("cmd") == "settings_get":
                 reply["data"] = dict(self.settings)
             elif msg.get("cmd") == "settings_set":
@@ -303,6 +327,14 @@ def main() -> int:
         control.cv.wait_for(lambda: any(c.get("cmd") == "status" for c in control.cmds), 10)
     check("control_status_polled", any(c.get("cmd") == "status" for c in control.cmds),
           [c.get("cmd") for c in control.cmds])
+    with control.cv:
+        control.cv.wait_for(lambda: any(c.get("cmd") == "connect_check" for c in control.cmds), 10)
+    with control.cv:
+        control.cv.wait_for(lambda: any(c.get("cmd") == "power" for c in control.cmds), 10)
+    pw = [c for c in control.cmds if c.get("cmd") == "power"]
+    check("power_screen_state_on_connect", bool(pw) and pw[0].get("event") in ("screen_locked", "screen_unlocked"), pw[:1])
+    cc = [c for c in control.cmds if c.get("cmd") == "connect_check"]
+    check("connect_check_on_connect", bool(cc) and cc[0].get("deep") is False, cc[:1])
     # (a second poll — with the brain block — is checked at the end of the run)
     for ev in (
         {"event": "state", "state": "listening"},

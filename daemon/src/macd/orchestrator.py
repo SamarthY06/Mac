@@ -152,6 +152,7 @@ class Orchestrator:
         self.muted = False
         self.asleep = False
         self.off = False
+        self.locked = False  # screen locked (app event); listening continues, Claude is told
         self.voice_ok = True
         self.voice_reason = ""
         self.remote: dict[str, Any] = {"active": False, "present": False, "verified": False, "pin": None,
@@ -290,7 +291,8 @@ class Orchestrator:
     def _state_event(self, *, prev: str, reason: str) -> dict[str, Any]:
         detail = self.voice_reason or (PHONE_SESSION_DETAIL if self.remote["present"] else "")
         return {"event": "state", "state": self.state.value, "prev": prev, "turn_id": self.turn.id if self.turn else None,
-                "reason": reason, "muted": self.muted, "voice": self.voice_ok, "voice_reason": detail}
+                "reason": reason, "muted": self.muted, "locked": self.locked, "voice": self.voice_ok,
+                "voice_reason": detail}
 
     def _activity(self, kind: str, turn_id: int | None = None, **data: Any) -> None:
         """Log + publish one activity record (the HUD's "what's happening" line)."""
@@ -1079,9 +1081,27 @@ class Orchestrator:
         elif event == "did_wake":
             self.asleep = False
             self._apply_mute()
+        elif event in ("screen_locked", "screen_unlocked"):
+            await self.set_locked(event == "screen_locked")
+            return
         else:
             raise ValueError(f"unknown power event {event!r}")
         self._activity("power", None, power_event=event, text=event.replace("_", " "))
+
+    async def set_locked(self, locked: bool) -> None:
+        """Screen lock state from the app: no behaviour change here (listening, turns and speech
+        continue); Claude is told so it knows UI/Chrome tools won't work until unlock."""
+        changed = locked != self.locked
+        self.locked = locked
+        set_context = getattr(self.brain, "set_context", None)  # lands with B1's context work
+        if set_context is not None:
+            res = set_context(locked=locked)
+            if asyncio.iscoroutine(res):
+                await res
+        if changed:
+            self._activity("power", None, power_event="screen_locked" if locked else "screen_unlocked",
+                           text="Screen locked" if locked else "Screen unlocked")
+            self.publish(self._state_event(prev=self.state.value, reason="lock"))
 
     # ================================================================== remote (N7)
 
@@ -1138,6 +1158,7 @@ class Orchestrator:
                      "age_s": round(time.monotonic() - turn.started, 1)} if turn else None,
             "muted": self.muted,
             "off": self.off,
+            "locked": self.locked,
             "asleep": self.asleep,
             "voice": self.voice_ok,
             "voice_reason": self.voice_reason,
