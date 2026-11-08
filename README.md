@@ -1,26 +1,40 @@
-# Mac — a voice agent that lives in your menu bar
+# Hey Mac
 
-Say **"Hey Mac, …"** and your Mac does it: searches the web in your own Chrome, drafts and sends
-email, works across apps (Mail → WhatsApp → send), finds people on LinkedIn, reads your screen,
-runs commands — and talks back like a human assistant while it works. It can also *teach*:
-"Hey Mac, teach me consistent hashing" turns it into a conversational tutor.
+**Stop touching your Mac. Just talk to it.**
 
-The brain is **Claude** (the full Claude Code agent loop, through the Claude Agent SDK) using
-your own Claude login. Everything else — wake word, speech recognition, voice — runs **locally
-and free** on Apple Silicon.
+Say *"Hey Mac, find three trending repos, put them in a note and send the list to my team on
+WhatsApp"* and it does it, across apps, while you sit back. It answers in a human voice, tells
+you what it found, and asks before anything leaves your machine.
 
-- Wake word, STT and TTS are on-device (sherpa-onnx + Parakeet, Kokoro). Nothing is sent
-  anywhere except your conversation with Claude.
-- Always on with a small idle footprint (the app idles at ~1 % and the daemon at ~5 % of one core; ~1.8 GB RAM with
-  all speech models resident): the Claude process starts when you say the wake word and shuts
-  itself down after 10 idle minutes.
-- A real **Off** switch releases the microphone entirely; **Mute** keeps it open but deaf.
-- Safety by capability, not by prompt: anything irreversible (send, post, pay, delete, upload)
-  is blocked by a hook until you say **"yes"** to a spoken summary of that exact action.
-- Optional: talk to your Mac from your phone over LiveKit (QR code, 15-minute link, spoken PIN).
-- **Give Mac your voice**: record 15 seconds (or pick a file) in the *Voice…* panel and Mac answers
-  in that voice — cloned locally with Kyutai Pocket TTS (free, ~200 ms to first audio). Short
-  fillers stay on Kokoro, and anything the clone can't handle falls back to it automatically.
+<!-- DEMO -->
+
+> Requires an Apple Silicon Mac (macOS 14+) and a [Claude Code](https://docs.claude.com/claude-code)
+> login. Free and open source (MIT). Wake word, speech recognition and voice run on your Mac.
+
+```bash
+git clone https://github.com/SamarthY06/Mac.git && cd Mac && ./install.sh
+```
+
+## What it can do
+
+- **Works across your apps**: Chrome (your own logged-in browser), Mail, WhatsApp, Notes,
+  Calendar, Reminders, Finder, Terminal. "Draft an email to Sam" → "paste it in WhatsApp" →
+  "looks good, send it".
+- **Sees your screen**: "what's this error?" and it looks.
+- **Works with the screen off or locked**: voice, Chrome, files and app automation keep going.
+- **Talks like a person**: short answers, no step-by-step chatter, one natural voice. Pick from
+  54 voices in 9 languages, or clone your own voice locally.
+- **Teaches**: "Hey Mac, teach me consistent hashing" turns it into a conversational tutor.
+- **Remembers you**: your name, preferences and projects, in a plain `memory.md` you can read.
+- **Safe by design**: anything irreversible (send, post, pay, delete, upload) is blocked by a
+  hook until you say "yes" to a spoken summary of that exact action.
+- **Light**: the app idles at about 1 % CPU; Claude starts when you say the wake word and
+  shuts down after 10 quiet minutes. A real Off switch releases the microphone.
+- **Optional**: talk to your Mac from your phone over LiveKit (QR code, spoken PIN).
+
+The brain is **Claude** (the full Claude Code agent loop, through the Claude Agent SDK) with
+your own login. Wake word (sherpa-onnx), speech recognition (Parakeet) and voice (Kokoro,
+Kyutai Pocket TTS for cloning) run **locally and free**. Audio never leaves your Mac.
 
 ## Requirements
 
@@ -52,11 +66,11 @@ Flags: `--yes` (non-interactive) · `--no-models` · `--no-open` · `--app-only`
 Mac uses **your** Claude and **your** Chrome. The Meet Mac window walks you through both and
 shows live status; here is what happens underneath.
 
-1. **Claude** — install [Claude Code](https://code.claude.com/docs/en/quickstart) and sign in
+1. **Claude**, install [Claude Code](https://code.claude.com/docs/en/quickstart) and sign in
    (`claude`, then `/login`). Mac runs your `claude` with your claude.ai plan.
    An API key works too (`macctl secret set ANTHROPIC_API_KEY`, `auth = "api_key"`), but
    **Claude in Chrome only works with a claude.ai sign-in**, per Anthropic's docs.
-2. **Chrome** — install the
+2. **Chrome**, install the
    [Claude in Chrome extension](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
    (v1.0.36+), sign it in to the same claude.ai account, then run `claude --chrome` once in a
    terminal: press Enter at the dialog, type `/chrome` and choose **Enabled by default**.
@@ -92,11 +106,11 @@ macctl secret set LIVEKIT_URL      # secrets live in the macOS Keychain
 
 Menu bar → **Settings…** (⌘,), also shown right after onboarding:
 
-- **General** — Mac's name (the wake word follows it: "Hey Jarvis"), your name, the language Mac
-  speaks (English US/UK, Spanish, French, Hindi, Italian, Japanese, Portuguese, Chinese — you
+- **General**, Mac's name (the wake word follows it: "Hey Jarvis"), your name, the language Mac
+  speaks (English US/UK, Spanish, French, Hindi, Italian, Japanese, Portuguese, Chinese, you
   still speak English for now), idle shutdown, follow-up window, launch at login.
-- **Voice** — 54 built-in voices with ▶ preview, speed, and your cloned voice.
-- **Appearance** — your picture (Mac's portrait), HUD position.
+- **Voice**, 54 built-in voices with ▶ preview, speed, and your cloned voice.
+- **Appearance**, your picture (Mac's portrait), HUD position.
 - **Permissions**, **Phone**, **Advanced** (Chrome, your own Claude MCP servers/skills, results
   folder, config and logs).
 
@@ -108,7 +122,7 @@ CLI: `macctl settings get`, `macctl settings set tts.voice=bm_george tts.speed=1
 
 - **Default (`auth = "claude_cli"`)**: Mac runs your installed `claude` with your own login.
   Anthropic's Agent SDK terms say third-party products may not *offer* claude.ai login to their
-  users without approval — Mac is an open-source tool you install on your own machine with your
+  users without approval, Mac is an open-source tool you install on your own machine with your
   own account; if you distribute a build to others, read those terms.
 - **API key (`auth = "api_key"`)**: `macctl secret set ANTHROPIC_API_KEY`, then set
   `auth = "api_key"` under `[brain]` in `~/.mac-agent/config.toml`.
@@ -158,7 +172,7 @@ Mac keeps listening with the display off or the screen locked (it runs in your u
 on the lock screen). *Settings → General → Stay awake while listening* keeps the Mac from
 sleeping while plugged in. While locked: voice, Chrome, shell, files and AppleScript automation
 (Mail, Calendar, Notes, Messages) all work; clicking/typing inside apps and screenshots wait
-until you unlock — Mac knows the difference and never tries to unlock. A closed MacBook lid still
+until you unlock, Mac knows the difference and never tries to unlock. A closed MacBook lid still
 sleeps the Mac unless an external display is attached.
 
 Ask "what's on my screen?" or "what's this error?" and Mac looks at your screen (Screen
@@ -166,8 +180,8 @@ Recording permission).
 
 ## Memory
 
-Mac keeps a small `~/.mac-agent/workspace/memory.md` — your name, how you like answers, your
-projects, people you mention, recurring tasks — and updates it on its own from what *you* say
+Mac keeps a small `~/.mac-agent/workspace/memory.md`, your name, how you like answers, your
+projects, people you mention, recurring tasks, and updates it on its own from what *you* say
 (never from web pages or documents it reads). Ask "what do you remember about me?" or say
 "forget that". Before a conversation is retired, Mac writes a short "recent context" note so
 "what were we doing?" works after a restart.
@@ -181,6 +195,6 @@ Secrets live in the Keychain. Logs are in `~/Library/Logs/Mac/`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Speech models carry their own licenses (sherpa-onnx: Apache-2.0;
-Parakeet: CC-BY-4.0; Kokoro: Apache-2.0; Silero VAD: MIT; Kyutai Pocket TTS weights: CC-BY-4.0 —
+MIT, see [LICENSE](LICENSE). Speech models carry their own licenses (sherpa-onnx: Apache-2.0;
+Parakeet: CC-BY-4.0; Kokoro: Apache-2.0; Silero VAD: MIT; Kyutai Pocket TTS weights: CC-BY-4.0 , 
 only clone voices you own or have permission to use).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mac — installer. Idempotent: safe to re-run after `git pull`.
+# Mac, installer. Idempotent: safe to re-run after `git pull`.
 #
 #   ./install.sh               interactive install
 #   ./install.sh --yes         non-interactive (assume "yes" to installs, skip optional prompts)
@@ -79,7 +79,7 @@ if [[ $UNINSTALL == 1 ]]; then
   exit 0
 fi
 
-echo "${B}Mac — an always-on voice agent for macOS, powered by Claude${O}"
+echo "${B}Mac, an always-on voice agent for macOS, powered by Claude${O}"
 
 # ------------------------------------------------------------------------- system
 step "Checking your system"
@@ -153,7 +153,7 @@ if [[ -z $CLAUDE ]]; then
     bash -c "$CLAUDE_INSTALL_CMD" || warn "the installer reported an error"
     find_claude
     if [[ -n $CLAUDE ]]; then ok "installed $CLAUDE"
-    else warn "'claude' still isn't on PATH — open a new terminal and re-run ./install.sh"; fi
+    else warn "'claude' still isn't on PATH, open a new terminal and re-run ./install.sh"; fi
   else
     warn "Skipped. Install it, run 'claude' once to sign in, then re-run ./install.sh (or choose Restart Daemon in Mac's menu)."
   fi
@@ -164,10 +164,10 @@ if [[ -n $CLAUDE ]]; then
     ok "signed in ($(sed -n 's/.*"authMethod": *"\([^"]*\)".*/\1/p' <<<"$STATUS"))"
   elif [[ -n $STATUS ]]; then
     warn "Claude Code is installed but not signed in."
-    if [[ $YES == 0 ]] && ask "Sign in now? (opens 'claude' here — follow the prompts, then type /exit)" y; then
+    if [[ $YES == 0 ]] && ask "Sign in now? (opens 'claude' here, follow the prompts, then type /exit)" y; then
       "$CLAUDE" || true
       if claude_signed_in; then ok "signed in"
-      else warn "still not signed in — run 'claude' later, then choose Restart Daemon in Mac's menu"; fi
+      else warn "still not signed in, run 'claude' later, then choose Restart Daemon in Mac's menu"; fi
     else
       warn "Run 'claude' in a terminal and sign in, then choose Restart Daemon in Mac's menu."
     fi
@@ -220,21 +220,21 @@ if codesign -dv "$APP_DEST" 2>&1 | grep -q "Signature=adhoc"; then
 fi
 
 # First-minute collision: don't launch (and prompt for permissions) while the models are
-# still missing — the app would show "voice unavailable" right away.
+# still missing, the app would show "voice unavailable" right away.
 if [[ $OPEN == 1 && ( $MODELS_OK == 1 || $MODELS == 0 || $APP_ONLY == 1 ) ]]; then
   open "$APP_DEST" --args --show
-  ok "Mac is running — look for the waveform icon in the menu bar; the Meet Mac window is open"
+  ok "Mac is running, look for the waveform icon in the menu bar; the Meet Mac window is open"
 elif [[ $OPEN == 1 ]]; then
   warn "not opening Mac.app because the speech models are missing; run 'macctl models', then: open ~/Applications/Mac.app"
 fi
 
 echo
 echo "${B}Next steps${O} (the Meet Mac window walks you through them, in this order)"
-echo "  1. Permissions — allow Microphone, Accessibility, Automation, Screen Recording (Notifications optional)."
-echo "  2. Claude — the window shows whether Claude Code is installed and signed in; use its"
+echo "  1. Permissions, allow Microphone, Accessibility, Automation, Screen Recording (Notifications optional)."
+echo "  2. Claude, the window shows whether Claude Code is installed and signed in; use its"
 echo "     “Install Claude Code…” / “Sign in…” buttons if not (they open Terminal for you)."
-echo "  3. Chrome (optional, for browser tasks) — “Install extension…” then “Connect Chrome…”:"
+echo "  3. Chrome (optional, for browser tasks), “Install extension…” then “Connect Chrome…”:"
 echo "     press Enter at the dialog, type /chrome, choose “Enabled by default”, then /exit."
-echo "  4. Try it — say ${B}“Hey Mac, what can you do?”${O}  — or press ${B}⌥Space${O} to talk."
+echo "  4. Try it, say ${B}“Hey Mac, what can you do?”${O} , or press ${B}⌥Space${O} to talk."
 echo "  Settings: ~/.mac-agent/config.toml   Logs: ~/Library/Logs/Mac/   CLI: macctl status"
 echo "  Menu bar icon → Permissions… reopens the Meet Mac window; so does double-clicking Mac.app."
