@@ -33,8 +33,9 @@ final class VoicePanel {
             w.setAccessibilityLabel("Give Mac a voice")
             let hc = NSHostingController(rootView: VoiceView(state: state, model: model, close: { [weak w] in w?.close() }))
             hc.sizingOptions = []  // crash fix: with .fullSizeContentView, content-driven sizing loops (safe area ↔ frame) until AppKit throws
-            w.setContentSize(NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height)))
+            let size = NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height))
             w.contentViewController = hc
+            w.setContentSize(size)  // after assigning the controller, or the window collapses to 0x0
             w.center()
             window = w
         }

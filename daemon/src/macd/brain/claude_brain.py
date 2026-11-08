@@ -755,6 +755,7 @@ class ClaudeBrain:
         if self._memory.needs_consolidation():
             text = await asyncio.to_thread(self._memory.text)
             prompt += CONSOLIDATE_PROMPT.format(kb=len(text.encode()) / 1024, memory=text[:12000])
+        self._recent_backup = await asyncio.to_thread(self._memory.recent_context)
         await asyncio.to_thread(self._memory.set_recent_context, [])
         now = self._clock()
         self._active = _Turn(HANDOFF_TURN, now + HANDOFF_TIMEOUT_S, texts=[], handoff=True,
@@ -768,6 +769,9 @@ class ClaudeBrain:
 
     async def _end_handoff(self, a: _Turn, ok: bool) -> None:
         log.info("brain: session handoff %s", "done" if ok else "cut short")
+        backup, self._recent_backup = getattr(self, "_recent_backup", []), []
+        if backup and not await asyncio.to_thread(self._memory.recent_context):
+            await asyncio.to_thread(self._memory.set_recent_context, backup)  # keep the old notes
         if a.future is not None and not a.future.done():
             a.future.set_result(ok)
         if a.after is not None:

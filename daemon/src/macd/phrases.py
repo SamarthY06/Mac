@@ -188,7 +188,7 @@ VOICE_RESET_PHRASES = frozenset(
 
 
 _RENAME_RE = re.compile(
-    r"^(?:(?:please|okay|ok|hey|mac)\s+)*(?:call yourself|change your name to|your name is now|rename yourself(?: to)?|"
+    r"^(?:(?:please|okay|ok|hey|mac)\s+)*(?:(?:hey|ok|okay)\s+[a-z]+\s+)?(?:please\s+)?(?:call yourself|change your name(?: back)? to|go back to being|your name is now|rename yourself(?: to)?|"
     r"from now on you're|from now on you are|your new name is|i'll call you|i will call you)\s+(?P<name>[a-z][a-z0-9 -]{0,31}?)"
     r"(?:\s+(?:please|now|from now on|okay))*[.!]?$",
     re.IGNORECASE,

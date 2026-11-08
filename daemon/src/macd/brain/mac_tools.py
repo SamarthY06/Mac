@@ -539,9 +539,9 @@ class MacTools:
     def tools(self) -> list[Any]:
         obj = {"type": "object"}
         specs: list[tuple[str, str, dict[str, Any], Callable[[dict[str, Any]], Any]]] = [
-            ("say", ("Speak one short progress line (8 words or fewer) right now, e.g. \"On it.\" or "
-                     "\"Found the group, typing it now.\" Use at most once per 15-20 seconds and only when "
-                     "something the user cares about changed. Never internals (ids, fields, tools)."),
+            ("say", ("Speak one short line (8 words or fewer) mid-task. Rarely needed: only for a question, a "
+                     "real problem, or a partial result on a task over a minute. Never acknowledge or "
+                     "announce steps (no \"On it.\", \"Opening X\"). Never internals (ids, fields, tools)."),
              {**obj, "properties": {"text": {"type": "string"}}, "required": ["text"]}, self.say),
             ("request_confirmation",
              ("Ask the user out loud to approve the outward action the safety check just refused "

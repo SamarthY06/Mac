@@ -700,7 +700,7 @@ async def test_error_event_spoken_from_one_table(rig: Rig) -> None:
     await wait_until(lambda: rig.orch.state == State.IDLE)
 
 
-async def test_tool_narration_and_repeat() -> None:
+async def test_tool_steps_shown_on_hud_never_spoken() -> None:
     cfg = make_cfg()
     cfg.brain.narration_silence_s = 0.1
     r, task = await make_rig(cfg)
@@ -708,11 +708,11 @@ async def test_tool_narration_and_repeat() -> None:
     try:
         r.scripts["find Bob on linkedin"] = [*tool("navigate", {"url": "linkedin.com"}, duration=LONG)]
         r.mic.say("find Bob on linkedin", woke=True)
-        await wait_until(lambda: "Using navigate" in r.spoken, timeout=2)
+        await wait_until(lambda: any(e["event"] == "activity" and e["kind"] == "narration"
+                                     and e["text"] == "Using navigate" for e in r.events), timeout=2)
         await asyncio.sleep(0.35)
-        assert r.spoken.count("Using navigate") == 1  # no repeat within NARRATION_REPEAT_S
-        acts = [e for e in r.events if e["event"] == "activity" and e["kind"] == "tool_start"]
-        assert acts and acts[0]["text"] == "Using navigate"
+        assert "Using navigate" not in r.spoken  # step lines are HUD-only
+        assert not any(s.startswith("Still using") for s in r.spoken)
     finally:
         await teardown(r, task)
 

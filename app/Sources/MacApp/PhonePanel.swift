@@ -45,8 +45,9 @@ final class PhonePanel {
                                                              retry: { [weak self] in self?.state.content = .loading; self?.onRetry?() },
                                                              close: { [weak w] in w?.close() }))
             hc.sizingOptions = []  // crash fix: with .fullSizeContentView, content-driven sizing loops (safe area ↔ frame) until AppKit throws
-            w.setContentSize(NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height)))
+            let size = NSSize(width: max(w.contentLayoutRect.width, hc.view.fittingSize.width), height: max(w.contentLayoutRect.height, hc.view.fittingSize.height))
             w.contentViewController = hc
+            w.setContentSize(size)  // after assigning the controller, or the window collapses to 0x0
             w.center()
             window = w
         }
@@ -61,6 +62,9 @@ final class PhonePanel {
             return .link(url, pin: pin == "<null>" ? "" : pin)
         }
         let e = (error ?? "").lowercased()
+        if let enabled = data["enabled"] as? Bool, !enabled {
+            return .disabled(canEnable: (data["configured"] as? Bool) ?? false)
+        }
         if e.contains("disabled") || e.contains("not enabled") || e.contains("remote access is off") {
             let configured = (data["configured"] as? Bool) ?? !(e.contains("not configured") || e.contains("livekit"))
             return .disabled(canEnable: configured)

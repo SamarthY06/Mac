@@ -899,33 +899,24 @@ class Orchestrator:
             if wait > 0:
                 await asyncio.sleep(wait)
                 continue
-            text = self._narration_text(turn, now)
+            line = turn.current_narration
+            if line and line not in turn.narrated:  # step lines go to the HUD only, never aloud
+                turn.narrated[line] = now
+                self._activity("narration", turn.id, text=line)
+            text = self._heartbeat_text(turn, now)
             turn.last_speech = now  # rate limit even if nothing was said
             if text:
                 self.metrics.incr("narrations")
                 self._activity("narration", turn.id, text=text)
                 self._speak(turn, text, "narration")
 
-    def _narration_text(self, turn: Turn, now: float) -> str | None:
-        line = turn.current_narration
-        if line:
-            last = turn.narrated.get(line)
-            if last is None:
-                turn.narrated[line] = now
-                return line
-            if now - last >= P.NARRATION_REPEAT_S:
-                turn.narrated[line] = now
-                return "Still " + line[0].lower() + line[1:]
-        if now - turn.started >= P.HEARTBEAT_EVERY_S and now - turn.last_heartbeat >= P.HEARTBEAT_EVERY_S:
-            if turn.heartbeats < len(P.HEARTBEATS):
-                text = P.HEARTBEATS[turn.heartbeats]
-            elif now - turn.last_heartbeat >= P.NARRATION_REPEAT_S:
-                text = P.elapsed_phrase(now - turn.started)
-            else:
-                return None
+    def _heartbeat_text(self, turn: Turn, now: float) -> str | None:
+        """One spoken "Still on it." on a long silent task; nothing more (no step-by-step talk)."""
+        if (turn.heartbeats == 0 and now - turn.started >= P.HEARTBEAT_EVERY_S
+                and now - turn.last_heartbeat >= P.HEARTBEAT_EVERY_S):
             turn.last_heartbeat = now
             turn.heartbeats += 1
-            return text
+            return P.HEARTBEATS[0]
         return None
 
     # ================================================================== commands (called from control.py)

@@ -228,6 +228,9 @@ class MemoryFile:
         mem.set_recent_context(lines)
         self.save(mem)
 
+    def recent_context(self) -> list[str]:
+        return list(self.load().sections["Recent context"])
+
     def add_recent_context(self, line: str) -> None:
         mem = self.load()
         mem.set_recent_context([*mem.sections["Recent context"], line])
