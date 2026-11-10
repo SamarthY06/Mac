@@ -27,6 +27,9 @@ PIN_OK = "Thanks, go ahead."
 PIN_WRONG = "That's not the code. Please try again."
 VOICE_LOST = "I lost my connection to Claude. Please try again."
 CLONE_LOAD_FAILED = "I couldn't load the cloned voice, using my default voice."
+STOPPED_OTHER = "Okay, I stopped the other task."  # "Hey Mac, stop the other task" (W6)
+NO_OTHER_TASK = "Nothing else is running."
+STOP_OTHER_FAILED = "I couldn't reach the other task. Use Stop in the Mac menu."
 
 SLOW_BLIP_S = 3.0  # soft tick if the brain is still silent this long after the turn started
 SLOW_SAY_S = 7.0  # "Still working on it." if nothing at all by then
@@ -178,6 +181,18 @@ OFF_PHRASES = frozenset(
 def is_off_request(text: str) -> bool:
     n = normalize(text)
     return bool(n) and any(p in OFF_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS - {"it", "that"}))
+
+
+STOP_OTHER_PHRASES = frozenset(
+    {"stop the other task", "stop the other one", "stop the other thing", "cancel the other task",
+     "stop whatsapp", "stop the whatsapp task", "cancel whatsapp", "stop the background task"}
+)
+
+
+def is_stop_other(text: str) -> bool:
+    """"Hey Mac, stop the other task" / "stop WhatsApp": cancel the running chat turns (W6)."""
+    n = normalize(text)
+    return bool(n) and any(p in STOP_OTHER_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS))
 
 
 VOICE_RESET_PHRASES = frozenset(

@@ -77,6 +77,7 @@ class BrainConfig:
     warm_on_wake: bool = True  # start the claude process as soon as the wake word is heard
     max_turn_s: int = 900
     narration_silence_s: float = 6.0
+    mode: str = "local"  # "local" (brain inside macd) | "remote" (agentd's voice:local over agent.sock, W6)
 
 
 @dataclass

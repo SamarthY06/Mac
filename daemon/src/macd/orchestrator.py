@@ -62,6 +62,7 @@ WAKE_BLIP_DELAY_S = 0.25  # the wake blip plays only if the user paused after "H
 LONG_TURN_DONE_EARCON_S = 30.0
 SPEECH_STALL_S = 30.0
 HANDOFF_TIMEOUT_S = 60.0  # brain.handoff() (session notes) before reset / OFF  # an output that hasn't finished a turn's speech by then is treated as broken
+STOP_OTHER_TIMEOUT_S = 5.0
 CONFIRM_SPEECH_SLACK_S = 10.0  # confirm timeout armed at CONFIRM arrival, before the prompt is spoken
 DescribeTool = Callable[[str, dict[str, Any]], str | None]
 
@@ -139,6 +140,7 @@ class Orchestrator:
         describe_tool: DescribeTool = _describe_tool,
         voice_reset: Callable[[], Awaitable[Any]] | None = None,
         rename: Callable[[str], Awaitable[Any]] | None = None,
+        stop_other: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self.cfg = cfg
         self.brain = brain
@@ -151,6 +153,7 @@ class Orchestrator:
         self.describe_tool = describe_tool
         self.voice_reset = voice_reset  # "Hey Mac, use your default voice" (wired in __main__)
         self.rename = rename  # "Hey Mac, call yourself Jarvis" → settings (wired in __main__)
+        self.stop_other = stop_other  # "Hey Mac, stop the other task" → agentd stop_other (W6, wired in __main__)
 
         self.state = State.IDLE
         self.turn: Turn | None = None
@@ -536,6 +539,16 @@ class Orchestrator:
         if remote:
             origin = "remote"
 
+        # ---------------------------------------------------------------- "stop the other task" (W6)
+        if self.stop_other is not None and P.is_stop_other(text) and (
+                (woke and not continuation) or window == WindowReason.FOLLOWUP):
+            self._activity("stop_other", turn.id if turn else None, text="Stopping the other task")
+            if turn is None and self.state in (State.LISTENING, State.FOLLOWUP):
+                self._cancel_timer("followup")
+                self._set_state(State.IDLE, "stop other")
+            self._tasks.spawn(self._stop_other(self._output_for_source(source)), "stop-other")
+            return
+
         # ---------------------------------------------------------------- mid-turn
         if turn is not None and not turn.brain_done:
             if not woke:
@@ -599,6 +612,18 @@ class Orchestrator:
             self._tasks.spawn(self.rename(new_name), "rename")
         else:
             await self._start_turn(text, source, origin=origin, transcript_t=ev.t)
+
+    async def _stop_other(self, output: str) -> None:
+        assert self.stop_other is not None
+        try:
+            stopped = await asyncio.wait_for(self.stop_other(), STOP_OTHER_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 - agentd down or slow: say so, never raise
+            log.warning("stop_other failed: %r", e)
+            line = P.STOP_OTHER_FAILED
+        else:
+            line = P.STOPPED_OTHER if stopped else P.NO_OTHER_TASK
+        self.eventlog.emit("stop_other", result=line)
+        self._say_system(line, output, priority=True)
 
     def _ignore(self, source: str, text: str, why: str) -> None:
         log.debug("ignored utterance from %s (%s): %r", source, why, text)

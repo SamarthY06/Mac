@@ -18,6 +18,7 @@ import fcntl
 import logging
 import logging.handlers
 import os
+import secrets
 import signal
 import sys
 from typing import IO, Any
@@ -114,6 +115,10 @@ class Daemon:
         self.settings: Settings | None = None
         self.connect: ConnectChecker | None = None
         self._bg: set[asyncio.Task[Any]] = set()
+        self.client_epoch = secrets.token_hex(16)  # agentd client epoch of this process (V2)
+        self.lifeline_line: str | None = None  # Mac.app's first stdin line: {"token": <voice token>}
+        self._lifeline_buf = b""
+        self.remote_gate: Any = None
 
     # ------------------------------------------------------------------ setup
 
@@ -167,6 +172,13 @@ class Daemon:
         self.output = SoundDeviceOutput(self.cfg)
         self.backend = "sounddevice"
 
+    def brain_mode(self) -> str:
+        mode = str(self.cfg.brain.mode).strip().lower()
+        if mode not in ("local", "remote"):
+            log.error("unknown brain.mode %r; using local", self.cfg.brain.mode)
+            return "local"
+        return mode
+
     def _make_brain(self, gate: ConfirmationGate) -> Brain:
         if self.args.fake_brain:
             return FakeBrain()
@@ -174,8 +186,29 @@ class Daemon:
         def chrome_status(connected: bool) -> None:
             self.brain_status["chrome"] = "connected" if connected else "disconnected"
 
+        if self.brain_mode() == "remote":  # W6: the voice brain lives in agentd
+            from macd.brain.remote import RemoteBrain, voice_token
+
+            def notify(title: str, body: str, path: str | None) -> None:
+                self._spawn(self._notify(title, body, path), "notify")
+
+            brain = RemoteBrain(self.cfg, token=lambda: voice_token(self.lifeline_line), epoch=self.client_epoch,
+                                on_notify=notify, chrome_status_cb=chrome_status)
+            self.remote_gate = brain.gate
+            return brain
+
         return ClaudeBrain(self.cfg, gate, chrome_status_cb=chrome_status, on_notify=self._notify_app,
                            recent_user_text=lambda n=10: self.orch.recent_user_text(n) if self.orch else [])
+
+    async def _stop_other(self) -> list[str]:
+        """"Hey Mac, stop the other task" (W6): agentd's stop_other in both brain modes. Remote mode
+        uses the brain's own connection; local mode opens a short voice-token connection."""
+        stop = getattr(self.brain, "stop_other", None)
+        if stop is not None:
+            return list(await stop())
+        from macd.brain.remote import stop_other_once, voice_token
+
+        return await stop_other_once(voice_token(self.lifeline_line), self.client_epoch)
 
     def _make_listener(self, inp: AudioInput) -> Any:
         from macd.speech.factory import make_listener
@@ -329,11 +362,13 @@ class Daemon:
             tts = self.stack.tts if self.stack is not None else None
             self.speech = SpeechQueue(tts, {"local": self.output}, default_output="local",
                                       on_drop=lambda item, why: self.metrics.incr(f"speech_dropped_{why}"))
-            gate = ConfirmationGate()
+            gate: Any = ConfirmationGate()
             self.brain = self._make_brain(gate)
+            gate = self.remote_gate or gate  # remote mode: RemoteGate answers by question id (V1)
             self.orch = Orchestrator(self.cfg, brain=self.brain, gate=gate, speech=self.speech,
                                      eventlog=self.eventlog, metrics=self.metrics, earcon=earcon,
-                                     voice_reset=self._voice_reset, rename=self._rename)
+                                     voice_reset=self._voice_reset, rename=self._rename,
+                                     stop_other=self._stop_other)
             self.orch.set_voice(self.stack is not None, self.voice_reason)
             if self.stack is not None:
                 for i, inp in enumerate(self.inputs):
@@ -413,6 +448,12 @@ class Daemon:
                 data = os.read(fd, 4096)
             except OSError:
                 data = b""
+            if self.lifeline_line is None and data:
+                self._lifeline_buf += data
+                line, nl, _ = self._lifeline_buf.partition(b"\n")
+                if nl or len(self._lifeline_buf) > 4096:
+                    self.lifeline_line = line.decode("utf-8", "replace")
+                    self._lifeline_buf = b""
             if not data:
                 loop.remove_reader(fd)
                 if not self.stop.is_set():
