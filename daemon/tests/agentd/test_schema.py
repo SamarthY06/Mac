@@ -1,8 +1,10 @@
+
 """agentd.schema matches docs/agentd-api.md: every op, response, event, error code and the
 kind policy, plus a round trip of every example in the doc."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from dataclasses import fields
@@ -105,7 +107,11 @@ def test_response_data_matches_doc(name, cells):
     is_list, keys = _data_keys(cells[2])
     tp = s.RESPONSE_DATA[name]
     if is_list:
-        (tp,) = get_args(tp)
+        args = get_args(tp)
+        if not args:  # an object wrapping one list, e.g. {workspaces: [...]}
+            (f,) = dataclasses.fields(tp)
+            args = get_args(f.type if not isinstance(f.type, str) else eval(f.type, vars(s)))
+        (tp,) = args
     assert keys <= _field_names(tp), f"{name}: doc data keys {keys}"
 
 
@@ -233,7 +239,7 @@ RESPONSES = {
     "subscribe": {"boot": "00ff", "seq": 41}, "ack": {},
     "status": {"conversations": [{"conv": "voice:local", "alive": False, "session_title": "", "paused": "",
                                   "unacked": [], "loop_lag_ms_p99": 0.4}]},
-    "pause": {"paused": True}, "ws_list": [{"path": "~/R", "name": "R", "approved": True, "settings_changed": False}],
+    "pause": {"paused": True}, "ws_list": {"workspaces": [{"path": "~/R", "name": "R", "approved": True, "settings_changed": False}]},
     "ws_approve": {"settings_hash": "ab" * 32}, "ws_remove": {},
 }
 

@@ -387,7 +387,7 @@ class Pause(Op):
     OP: ClassVar[str] = "pause"
     conv: str
     value: bool
-    reason: Literal["loop", "user"] | None = None
+    reason: Literal["loop", "user", "members_changed"] | None = None
 
 
 # 4.5 workspaces
@@ -489,6 +489,11 @@ class PauseData:
 
 
 @dataclass(kw_only=True)
+class WsListData:
+    workspaces: list[Workspace]
+
+
+@dataclass(kw_only=True)
 class WsApproveData:
     settings_hash: str
 
@@ -508,7 +513,7 @@ RESPONSE_DATA: dict[str, Any] = {
     "question_posted": Empty, "reply": ReplyData, "set_context": Empty, "set_language": Empty,
     "set_name": Empty, "voice_settings": Empty, "connect_check": ConnectCheckData,
     "subscribe": SubscribeData, "ack": Empty, "status": ConversationStatus | StatusAll,
-    "pause": PauseData, "ws_list": list[Workspace], "ws_approve": WsApproveData, "ws_remove": Empty,
+    "pause": PauseData, "ws_list": WsListData, "ws_approve": WsApproveData, "ws_remove": Empty,
 }
 
 
