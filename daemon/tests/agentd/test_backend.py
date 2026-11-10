@@ -4,6 +4,7 @@ the brain factory seam and loop lag (V7)."""
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
 import os
@@ -130,7 +131,12 @@ def test_claude_factory_args_exist_in_claude_brain():
     brains.claude_factory(config.Config())
 
 
-async def test_loop_lag_stays_low_while_hashing_and_writing(short_root):
+LAG_BUDGET_MS = 15.0
+
+
+async def test_loop_lag_max_during_hash_and_attach_burst(short_root):
+    """V7 / SPIKES P0.0: assert the MAX lag, not only p99, while chat turns hash a 2 MB approved
+    tree (worker process), write records (thread) and stream attach events (path checks)."""
     a = await make_agent(short_root, lag_interval_s=0.005)
     try:
         proj = a.paths.home / "Big"
@@ -138,17 +144,50 @@ async def test_loop_lag_stays_low_while_hashing_and_writing(short_root):
         skills.mkdir(parents=True)
         for i in range(200):  # 2 MB, as in spike P0.0
             (skills / f"f{i:03}.md").write_bytes(os.urandom(5120).hex().encode())
+        out = a.paths.home / "out"
+        out.mkdir()
+        files = [out / f"r{i}.csv" for i in range(10)]
+        for f in files:
+            f.write_text("x\n")
+        await a.svc.workspaces.approve(proj)
+        n = [0]
+
+        def burst(_t: str) -> list[fb.Step]:
+            n[0] += 1
+            return [fb.Step(fb.BrainEventKind.ATTACH, delay=0.005,
+                            data={"attach_id": f"{n[0]}-{i}", "path": str(f), "caption": ""})
+                    for i, f in enumerate(files)] + [fb.say("x", delay=0.005) for _ in range(20)]
+
+        a.scripts[CHAT] = burst
+        c = await a.client(CHAT_TOKEN, [CHAT])
         t0 = time.perf_counter()
         settings_hash(proj, a.paths.home)
         on_loop_ms = (time.perf_counter() - t0) * 1000
-        await asyncio.sleep(0.05)
-        a.svc.lag.reset()
-        for _ in range(5):
-            await a.svc.workspaces.trust(proj)  # hash in a thread
-            await a.svc.persist()  # record write with fsync in a thread
-        await asyncio.sleep(0.05)
-        assert a.svc.lag.max_ms < max(10.0, on_loop_ms / 2), (a.svc.lag.max_ms, on_loop_ms)
-        assert a.svc.lag.p99() < 10.0
+        turn = 0
+        # one retry: a single stall from another process on a busy machine (parallel test runs)
+        # must not fail it, but a loop that really blocks fails both runs
+        for _attempt in range(2):
+            gc.collect()
+            gc.freeze()  # a full collection of the test process's own heap is not agentd's lag
+            # the lag sampler is asleep across the collect above (and the on-loop hash): let its
+            # late tick land BEFORE the reset, or that test-side stall is counted as agentd's
+            await asyncio.sleep(0.05)
+            a.svc.lag.reset()
+            attaches = 0
+            for _ in range(4):
+                turn += 1
+                await c.call({"op": "new_session", "conv": CHAT})
+                await c.call({"op": "ask", "conv": CHAT, "turn": turn, "text": "jobs in the Big folder"})
+                while (e := await c.event(timeout=10))["ev"] != "done":
+                    attaches += e["ev"] == "attach"
+                await a.svc.workspaces.trust(proj)  # an extra hash between turns
+            await asyncio.sleep(0.05)
+            gc.unfreeze()
+            if a.svc.lag.max_ms < LAG_BUDGET_MS and a.svc.lag.p99() < 5.0:
+                break
+        assert attaches == 40 and a.brain(CHAT).spec.setting_sources == ["user", "project", "local"]
+        assert a.svc.lag.max_ms < LAG_BUDGET_MS, (a.svc.lag.max_ms, on_loop_ms)
+        assert a.svc.lag.p99() < 5.0
         assert a.svc.conversation(V).status().loop_lag_ms_p99 == a.svc.lag.p99()
     finally:
         await stop_agent(a)
@@ -184,3 +223,28 @@ def test_lifeline_tokens_and_dev_tokens(tmp_path):
     fd = m.take_pid_lock(tmp_path / "run" / "agent.pid.lock")
     assert fd is not None and m.take_pid_lock(tmp_path / "run" / "agent.pid.lock") is None
     os.close(fd)
+
+
+async def test_offload_breaker_and_unpicklable_args(monkeypatch):
+    """After MAX_BROKEN failed worker starts every call stays in a thread; a TypeError from
+    pickling the arguments falls back to a thread too."""
+    import threading
+    from concurrent.futures.process import BrokenProcessPool
+
+    from agentd import offload
+
+    starts = [0]
+
+    def broken():
+        starts[0] += 1
+        raise BrokenProcessPool("no worker")
+
+    monkeypatch.setattr(offload, "_broken", 0)
+    monkeypatch.setattr(offload, "_get_pool", broken)
+    for _ in range(offload.MAX_BROKEN + 2):
+        assert await offload.run(len, "abc") == 3
+    assert starts[0] == offload.MAX_BROKEN
+    monkeypatch.setattr(offload, "_broken", 0)
+    monkeypatch.undo()
+    lock = threading.Lock()
+    assert await offload.run(repr, lock) == repr(lock)  # "cannot pickle '_thread.lock'"

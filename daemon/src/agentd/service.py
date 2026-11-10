@@ -15,15 +15,19 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import dataclasses
+import hashlib
+import json
 import logging
 import os
 import time
-import tomllib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentd import offload
+from agentd import profiles as pf
 from agentd import schema as s
 from agentd.brains import (
     CHAT,
@@ -49,9 +53,11 @@ from agentd.workspaces import (
     display,
     is_skipped,
     resolve_user_path,
+    under,
 )
 from macd.brain.gate import ConfirmationGate
 from macd.contracts import Brain, BrainEvent, BrainEventKind
+from macd.settings import rename_refusal
 
 log = logging.getLogger(__name__)
 
@@ -59,12 +65,15 @@ SERVER_NAME = "agentd/0.9.0"
 HANDOFF_TIMEOUT_S = 60.0
 CONNECT_CHECK_TIMEOUT_S = 25.0
 VOICE_GRACE_S = 3.0  # a voice connection gone this long interrupts its running turn (V2)
-CATCH_UP_AFTER_S = 3600.0
+CATCH_UP_NOTE_S = 300.0  # a replayed ask older than this tells the model when it was sent (AG5)
 QUESTION_TTL_S = {s.QuestionKind.FOLDER_APPROVAL: 600.0, s.QuestionKind.ROUTE: 3600.0,
-                  s.QuestionKind.CATCH_UP: 3600.0, s.QuestionKind.RESTART: 3600.0}
-NEVER_CHAT_NAMES = ("Timetable",)
-RESTART_TEXT = "My brain on the Mac restarted, so I stopped. Want me to pick it up?"
+                  s.QuestionKind.CATCH_UP: 3600.0, s.QuestionKind.RESTART: 3600.0,
+                  s.QuestionKind.PROFILE: 600.0}
+RESTART_TEXT = "I restarted on your Mac in the middle of this, so I stopped. Want me to pick it up?"
 AGENTD_EPOCH = "agentd"  # epoch of turns agentd starts itself (a "yes" to a restart question)
+# a late STATUS/DONE of a finished turn is dropped; these mean the brain started a new query on it
+_NEW_QUERY_KINDS = frozenset({BrainEventKind.TEXT, BrainEventKind.SAY, BrainEventKind.TOOL_START,
+                              BrainEventKind.CONFIRM, BrainEventKind.ATTACH})
 
 
 class ApiError(Exception):
@@ -99,6 +108,15 @@ class AgentPaths:
     def chat_config(self) -> Path:
         """Fixed (api §3): never taken from a hello or a request."""
         return self.mac_home / "chat" / "config.toml"
+
+    @property
+    def pairing(self) -> Path:
+        """Fixed, read-only (P1): the WhatsApp pairing's chat list."""
+        return self.mac_home / "chat" / "pairing.json"
+
+    def chat_dir(self, conv: str) -> Path:
+        """The empty per-chat dir a chat without a folder works in (W9.5)."""
+        return self.mac_home / "agent" / "chats" / hashlib.sha1(conv.encode()).hexdigest()[:12]
 
     @property
     def voice_cwd(self) -> Path:
@@ -140,7 +158,14 @@ class Turn:
     steers: list[str] = field(default_factory=list)  # arrived before the brain started the turn
     tool_ids: dict[str, list[str]] = field(default_factory=dict)
     n_tools: int = 0
+    note: str = ""  # context for the brain only, before the text (catch-up time, restart)
+    switch: asyncio.Future[tuple[Path | None, str] | str] | None = None  # AG1: a move the model asked for
+    held: BrainEvent | None = None  # the brain's DONE/ERROR, held while a switch is decided
+    moved: bool = False  # a request moves at most once (no ping-pong between folders)
+    torn: bool = False  # its profile was disabled or deleted: nothing more of it is shown (P3)
+    switch_tools: int = 0  # tools the moving run had already used: the user decides first
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    ended: asyncio.Event = field(default_factory=asyncio.Event)  # finished, or the brain turn held
 
 
 class Conversation:
@@ -155,9 +180,11 @@ class Conversation:
         self.brain: Brain | None = None
         self.brain_key: tuple[Any, ...] | None = None
         self._pump: asyncio.Task[None] | None = None
+        self._alive_sent = False  # the last `status{alive}` pushed on this stream
         self.turn: Turn | None = None  # the newest turn
         self.turns: dict[int, Turn] = {}  # internal id -> turn, until finished
         self.uids: set[str] = set()
+        self.last_finished: Turn | None = None
         self.question: Question | None = None
         self._q_waiters: dict[str, asyncio.Future[Binding | str]] = {}
         self._q_timer: asyncio.TimerHandle | None = None
@@ -179,6 +206,8 @@ class Conversation:
 
     def emit(self, cls: type[s.Event], turn: Turn | None = None, **fields: Any) -> None:
         epoch = None
+        if turn is not None and turn.torn:
+            return  # P3/I2: a torn-down turn shows nothing more, not even its `done`
         if turn is not None:
             fields.update(turn=turn.client_turn, turn_uid=turn.uid)
             epoch = turn.epoch if self.voice else None
@@ -189,6 +218,51 @@ class Conversation:
         return t if t is not None and not t.finished else None
 
     # -- brain ---------------------------------------------------------------------------
+    def brain_alive(self) -> bool:
+        return bool(self.brain is not None and getattr(self.brain, "alive", False))
+
+    def check_alive(self) -> None:
+        """Push `status{alive}` when the brain process connected or went away (warm, idle
+        shutdown, sleep, crash, close), so clients need not poll `status` for it."""
+        alive = self.brain_alive()
+        if alive != self._alive_sent:
+            self._alive_sent = alive
+            self.emit(s.StatusEvent, data={"alive": alive})
+
+    def _on_alive(self, _alive: bool) -> None:
+        self.check_alive()  # re-read the brain: the callback may race a close
+
+    def _confirm_files(self) -> bool:
+        """Live: a file send asks first if the profile says so; with no readable row, it asks."""
+        p = self.svc.profile_of(self.conv)
+        return True if p is None else bool(p.confirm_files)
+
+    def _capabilities(self) -> frozenset[str]:
+        """Live (W9.4): the gate reads this at every tool call, so narrowing applies at once."""
+        return self.svc.live_caps(self.conv)
+
+    async def _on_set_persona(self, text: str) -> str | None:
+        """The model's set_persona, after the owner's bound yes (B's tool asks): write the row."""
+        try:
+            await self.svc.set_persona(self.conv, text)
+        except pf.ProfileError as e:
+            return e.message
+        return None
+
+    def _on_rename(self, name: str) -> str | None:
+        """Voice: the model's rename_assistant tool. The voice client applies and saves it, after
+        the same pure check here, so a refusal reaches the model instead of "Renamed" (N11)."""
+        if refused := rename_refusal(name):
+            return refused
+        self.emit(s.StatusEvent, data={"rename": {"name": name}})
+        return None
+
+    def _on_reset_voice(self) -> None:
+        self.emit(s.StatusEvent, data={"reset_voice": {}})
+
+    def _on_go_to_sleep(self) -> None:
+        self.emit(s.StatusEvent, data={"go_to_sleep": {}})
+
     def _session_get(self) -> SessionInfo | None:
         r = self.record
         if not r.session_id:
@@ -206,13 +280,24 @@ class Conversation:
         self.svc.save_soon()
 
     async def ensure_brain(self, cwd: Path, sources: list[str], *, rebuild: bool = False) -> Brain:
-        vs = self.svc.voice_settings
+        vs, svc = self.svc.voice_settings, self.svc
+        prof = None if self.voice else svc.profile_of(self.conv)
+        caps = pf.granted(prof)
         spec = BrainSpec(
             conv=self.conv, profile=self.profile, cwd=cwd, setting_sources=list(sources), gate=self.gate,
             session_store=RecordSessionStore(self._session_get, self._session_put),
             memory_file=self.svc.memory_file, desktop=self.desktop, recent_user_text=lambda: list(self.recent),
-            model=vs.model if self.voice else "", chrome=vs.chrome if self.voice else True,
-            name=vs.name, language=vs.language, never_chat_names=NEVER_CHAT_NAMES)
+            model=vs.model if self.voice else "", chrome=vs.chrome if self.voice else "chrome" in caps,
+            name=vs.name, language=vs.language, on_alive=self._on_alive,
+            never_chat_names=() if self.voice else svc.never.names,
+            capabilities=None if self.voice else self._capabilities,
+            confirm_send_file=self._confirm_files,
+            chat_persona=prof.persona if prof else "", display_name=prof.display_name if prof else "",
+            chat_shared=bool(prof and prof.shared),
+            on_set_persona=None if self.voice else self._on_set_persona,
+            on_rename=self._on_rename if self.voice else None,
+            on_reset_voice=self._on_reset_voice if self.voice else None,
+            on_go_to_sleep=self._on_go_to_sleep if self.voice else None)
         busy = any(t.in_brain and not t.finished for t in self.turns.values())
         if self.brain is not None and (busy or (not rebuild and spec.key() == self.brain_key)):
             return self.brain  # never swap a brain under a running turn
@@ -227,6 +312,7 @@ class Conversation:
         if self.voice:
             await brain.set_name(vs.name)
             await brain.set_language(vs.language)
+        self.check_alive()
         log.info("conv %s: brain started (sources=%s)", self.conv, ",".join(sources))
         return brain
 
@@ -239,6 +325,7 @@ class Conversation:
                 await pump
         if brain is not None:
             await close_quietly(brain)
+        self.check_alive()
 
     async def _pump_events(self, brain: Brain) -> None:
         try:
@@ -247,18 +334,31 @@ class Conversation:
                     await self._on_event(ev)
                 except Exception:
                     log.exception("conv %s: event handling failed", self.conv)
+                self.check_alive()
         finally:
+            crashed = self.brain is brain  # its event stream ended without close_brain
             for t in list(self.turns.values()):  # the brain ended under a running turn
-                if t.in_brain and not t.finished and self.brain is brain:
+                if crashed and t.in_brain and not t.finished:
                     self.emit(s.ErrorEvent, t, kind=s.EventErrorKind.INTERNAL,
                               message="Mac's brain stopped unexpectedly.")
                     await self.finish(t, error=True)
+            if crashed and self.brain is brain:  # the next turn starts a new brain
+                self.brain, self.brain_key, self._pump = None, None, None
+                self.check_alive()
+                await close_quietly(brain)
 
     async def _on_event(self, ev: BrainEvent) -> None:
         t = self.turns.get(ev.turn_id)
         if t is None or t.finished:
-            return
+            t = self._resumed(ev) if ev.kind in _NEW_QUERY_KINDS else None
+            if t is None:
+                return
         k = ev.kind
+        if t.switch is not None and t.internal == ev.turn_id and not t.stopping:
+            if k in (BrainEventKind.DONE, BrainEventKind.ERROR):  # run_turn moves the request
+                t.held, t.in_brain = ev, False
+                t.ended.set()
+            return  # nothing more from the turn that is moving is shown
         if k is BrainEventKind.TEXT:
             follows = ev.data.get("tool_follows")
             if ev.text and not follows:
@@ -281,11 +381,15 @@ class Conversation:
                 ids.remove(ev.tool_use_id)
             self.emit(s.ToolEndEvent, t, tool=ev.tool_name, tool_use_id=tid, is_error=ev.is_error)
         elif k is BrainEventKind.CONFIRM:
-            self.open_confirm(t, ev.text, str(ev.data.get("target", "")))
+            self.open_confirm(t, ev.text, str(ev.data.get("target", "")), str(ev.data.get("question") or ""),
+                              str(ev.data.get("detail") or ""))  # detail: set_persona's full new text
         elif k is BrainEventKind.ATTACH:
             await self._attach(t, ev)
         elif k is BrainEventKind.STATUS:
             data = dict(ev.data)
+            req = data.pop("switch_workspace", None)
+            if isinstance(req, dict) and not self.voice and t.switch is None and not t.stopping:
+                self._switch_requested(t, req)
             if isinstance(data.get("session_title"), str):
                 self.record.session_title = data["session_title"]
             if data:
@@ -300,8 +404,18 @@ class Conversation:
             kind = ev.error_kind.value if ev.error_kind else "internal"
             if kind == "rate_limit":
                 self.svc.breaker.trip(ev.data.get("reset_at") or ev.data.get("resets_at"))
-            self.emit(s.ErrorEvent, t, kind=s.EventErrorKind(kind), message=ev.text or "Something went wrong.")
+            self.emit(s.ErrorEvent, t, kind=s.EventErrorKind(kind), message=ev.text)  # "" passes through: voice speaks its own per-kind line
             await self.finish(t, error=True)
+
+    def _resumed(self, ev: BrainEvent) -> Turn | None:
+        """Voice: a steer that crossed the turn's DONE makes the brain run a new query on the
+        same turn (local ClaudeBrain semantics). Its events continue that turn, as in local mode."""
+        last = self.last_finished
+        if not self.voice or last is None or last.internal != ev.turn_id or last.stopping or self.running():
+            return None
+        t = self.svc.continue_turn(self, last, "", internal=ev.turn_id)
+        t.in_brain = True
+        return t
 
     async def _attach(self, t: Turn, ev: BrainEvent) -> None:
         path = str(ev.data.get("path") or ev.text)
@@ -328,14 +442,19 @@ class Conversation:
         r = self.record
         if r.running is not None and r.running.uid == t.uid:
             r.running = None
-        if not self.voice:  # voice turns never enter unacked
+        if not self.voice and not t.torn:  # voice and torn turns never enter unacked
             r.add_unacked({"turn_uid": t.uid, "answer": "".join(t.answer).strip(), "attaches": t.attaches})
         if not interrupted and not error:
             r.last_answer_at = self.svc.clock()
         if self.turn is t:
             self.turn = None
+        self.last_finished = t
         t.done.set()
-        await self.svc.persist()
+        t.ended.set()
+        if self.voice:
+            self.svc.save_soon()  # off the pump: the next voice turn's first TEXT never waits on fsync
+        else:
+            await self.svc.persist()
 
     async def run_turn(self, t: Turn, meta: s.AskMeta | None, before: Turn | None) -> None:
         try:
@@ -353,10 +472,13 @@ class Conversation:
                 raise asyncio.CancelledError
             assert self.brain is not None
             t.in_brain = True
-            await self.brain.ask(t.internal, t.text)
+            await self.brain.ask(t.internal, t.note + t.text)
             for text in t.steers:
                 await self.brain.steer(t.internal, text)
-            await t.done.wait()
+            while True:
+                await t.ended.wait()
+                if t.finished or not await self._move(t):
+                    break
         except asyncio.CancelledError:
             if self.svc.closing:
                 raise  # shutdown: the record keeps `running`, announced as interrupted next boot
@@ -373,25 +495,42 @@ class Conversation:
 
     async def _prepare_chat(self, t: Turn, meta: s.AskMeta | None) -> bool:
         svc, r = self.svc, self.record
-        now = svc.clock()
-        if meta is not None and meta.replayed and meta.sent_at and now - meta.sent_at > CATCH_UP_AFTER_S:
-            when = time.strftime("%I:%M %p", time.localtime(meta.sent_at)).lstrip("0")
-            ans = await self.ask_question(t, s.QuestionKind.CATCH_UP,
-                                          f'Back online. You asked at {when} while I was asleep: '
-                                          f'"{_short(t.text)}". Still want it?')
-            if not (isinstance(ans, Binding) and ans.choice == 0):
-                raise asyncio.CancelledError
+        if meta is not None and meta.replayed and meta.sent_at and svc.clock() - meta.sent_at > CATCH_UP_NOTE_S:
+            t.note = _catch_up_note(meta.sent_at, svc.clock())  # AG5: the model decides to ask or act
         current = Path(r.folder) if r.folder else None
-        route: Route = await svc.router.route(t.text, folder=current, last_answer_at=r.last_answer_at,
-                                              fresh=r.fresh_next, named=r.fresh_folder)
+        prof = svc.profile_of(self.conv)
+        default = svc.default_workspace(prof)
+        if prof is not None and "files_read" not in pf.granted(prof):
+            # W9.5: no folders at all; the empty per-chat dir, and no router call
+            route = Route(None, "new" if r.fresh_next or current is not None else "same")
+        elif r.fresh_next and not r.fresh_folder and default is not None:
+            route = Route(default, "new")  # a new session starts in the chat's folder
+        else:
+            route = await svc.router.route(t.text, folder=current, last_answer_at=r.last_answer_at,
+                                           fresh=r.fresh_next, named=r.fresh_folder, default=default)
         folder, session = route.folder, route.session
         if route.question:
             opts = [{"label": o.label, "keys": o.keys} for o in route.options]
-            ans = await self.ask_question(t, s.QuestionKind.ROUTE, route.question, {"options": opts})
-            if not isinstance(ans, Binding) or ans.choice is None:
+            ans = await self.ask_question(t, s.QuestionKind.ROUTE, route.question,
+                                          {"options": opts, "yes": route.yes})
+            if not isinstance(ans, Binding):
                 raise asyncio.CancelledError
-            folder, session = route.options[ans.choice].folder, route.options[ans.choice].session
+            if ans.choice is not None:
+                folder, session = route.options[ans.choice].folder, route.options[ans.choice].session
+            else:  # AG4: their own words go back to the model, which decides without asking again
+                again = await svc.router.route(t.text, folder=current, last_answer_at=0.0, fresh=r.fresh_next,
+                                               named=None, answer=(route.question, ans.steer_text),
+                                               default=default)
+                folder, session = (None, "new") if again.question else (again.folder, again.session)
         r.fresh_next, r.fresh_folder = False, None
+        await self._enter(t, folder, session)
+        return True
+
+    async def _enter(self, t: Turn, folder: Path | None, session: str) -> None:
+        """Point the conversation at `folder` and `session` ("same" | "new" | "continue:<id>"),
+        with the trust check and approval question (W3.5), and get its brain ready."""
+        svc, r = self.svc, self.record
+        current = Path(r.folder) if r.folder else None
         fresh_session, prev_sid = False, r.session_id
         if session == "same" and folder == current:
             pass
@@ -423,10 +562,79 @@ class Conversation:
         self.emit(s.StatusEvent, t, data={"folder": display(folder, svc.paths.home) or ""})
         existing = self.brain
         rebuild = session.startswith("continue:") and r.session_id != prev_sid
-        brain = await self.ensure_brain(folder or svc.paths.chat_cwd, sources, rebuild=rebuild)
+        cwd = folder or (svc.paths.chat_dir(self.conv) if svc.profile_of(self.conv) else svc.paths.chat_cwd)
+        brain = await self.ensure_brain(cwd, sources, rebuild=rebuild)
         if fresh_session and brain is existing:
             await brain.reset()  # a reused brain may hold an older session
+
+    # -- switch_workspace (AG1): the running model says the request belongs elsewhere ----------
+    def _switch_requested(self, t: Turn, req: dict[str, Any]) -> None:
+        fut: asyncio.Future[tuple[Path | None, str] | str] = asyncio.get_running_loop().create_future()
+        t.switch = fut
+        internal = t.internal
+        try:
+            t.switch_tools = max(0, int(req.get("tools_run") or 0))
+        except (TypeError, ValueError):
+            t.switch_tools = 1  # unknown: assume work was done, so ask
+
+        async def decide() -> None:
+            try:
+                res: tuple[Path | None, str] | str = await self.svc.validate_switch(
+                    self, str(req.get("folder", "")), str(req.get("mode", "")))
+            except Exception:
+                log.exception("conv %s: switch_workspace check failed", self.conv)
+                res = "the move could not be checked"
+            if not fut.done():
+                fut.set_result(res)
+            if t.finished or t.held is not None or self.brain is None or t.internal != internal:
+                return
+            if isinstance(res, str):  # refused: the turn carries on where it is
+                t.switch = None
+                await self.brain.steer(internal, f"Mac did not move this request: {res}. Carry on here.")
+            elif not t.switch_tools:  # with work done the brain ends on its own (tools blocked); ask then
+                await self.brain.interrupt(internal)  # its DONE is held; run_turn moves the request
+
+        self.spawn(decide(), "switch")
+
+    async def _move(self, t: Turn) -> bool:
+        """The brain turn ended while a switch was pending. True when the request was re-run in
+        the new folder and session (the turn goes on), False when the held end was applied."""
+        fut, held = t.switch, t.held
+        t.ended.clear()
+        res = await fut if fut is not None else "no move"
+        t.switch, t.held = None, None
+        if not isinstance(res, str) and not t.stopping and t.switch_tools > 0 and not await self._move_ok(t, res[0]):
+            res = "the user chose to stay"
+        if isinstance(res, str) or t.stopping:
+            if held is not None:
+                await self._on_event(held)  # the turn ends as the brain ended it
+            return False
+        self.turns.pop(t.internal, None)
+        t.moved = True
+        await self._enter(t, *res)
+        if t.stopping:
+            raise asyncio.CancelledError
+        assert self.brain is not None
+        t.internal = self.svc.next_internal()
+        self.turns[t.internal] = t
+        t.answer.clear()
+        t.in_brain = True
+        await self.brain.ask(t.internal, t.note + t.text)
         return True
+
+    async def _move_ok(self, t: Turn, folder: Path | None) -> bool:
+        """Work already ran here (tools_run > 0): moving re-runs the request from the start, so
+        the user decides. An exact yes or "move" moves; "stay" stays. Any other reply also stays,
+        and is then started as the next request, with this one as context (P2-1, as a restart)."""
+        where = (display(folder, self.svc.paths.home) or str(folder)) if folder else "no particular folder"
+        opts = [{"label": "move", "keys": ["move", "1"]}, {"label": "stay", "keys": ["stay", "here", "2"]}]
+        ans = await self.ask_question(
+            t, s.QuestionKind.ROUTE, f"I already started on this here. Move it to {where} and start over there?",
+            {"options": opts, "yes": 0})
+        if isinstance(ans, Binding) and ans.choice is None and ans.steer_text:
+            await self.svc.follow_up(self, ans.steer_text, t.text, t.msg_ref,
+                                     "asked whether to move it to another folder and start over")
+        return isinstance(ans, Binding) and ans.choice == 0
 
     async def interrupt(self, t: Turn | None) -> bool:
         if t is None or t.finished:
@@ -458,15 +666,16 @@ class Conversation:
         if self.question is not None:
             self.close_question(self.question, s.CloseOutcome.SKIPPED)
 
-    def open_confirm(self, t: Turn, summary: str, target: str) -> None:
+    def open_confirm(self, t: Turn, summary: str, target: str, question: str = "", detail: str = "") -> None:
         self._replace()
         q = Question(_qid(), s.QuestionKind.CONFIRM, summary,
                      self.svc.clock() + self.profile.confirm_window_s + 1.0,
-                     payload={"target": target}, turn_internal=t.internal)
+                     payload={"target": target, "question": question, "detail": detail}, turn_internal=t.internal)
         self.question = q
         self._set_timer(q)
         self.svc.desktop.release_conv(self.conv)  # never hold the desktop while confirming (F3)
-        self.emit(s.ConfirmEvent, t, question_id=q.question_id, summary=summary, target=target)
+        self.emit(s.ConfirmEvent, t, question_id=q.question_id, summary=summary, target=target,
+                  question=question or None, detail=detail or None)
 
     def open_question(self, kind: s.QuestionKind, text: str, payload: dict[str, Any] | None = None,
                       turn: Turn | None = None) -> Question:
@@ -515,13 +724,19 @@ class Conversation:
             running = s.RunningStatus(uid=r.running.uid, text=r.running.text, folder=r.running.folder,
                                       minutes=int(max(0.0, svc.clock() - r.running.started_at) // 60))
         q = self.question
-        question = s.QuestionStatus(question_id=q.question_id, kind=q.kind, text=q.text,
-                                    expires_at=q.expires_at) if q else None
+        question = None
+        if q is not None:
+            confirm = q.kind is s.QuestionKind.CONFIRM
+            question = s.QuestionStatus(
+                question_id=q.question_id, kind=q.kind, text=q.text, expires_at=q.expires_at,
+                question=(q.payload.get("question") or None) if confirm else None,
+                target=(q.payload.get("target") or None) if confirm else None,
+                detail=(q.payload.get("detail") or None) if confirm else None)
         unacked = [] if self.voice else [
             s.UnackedTurn(turn_uid=u["turn_uid"], answer=u.get("answer", ""),
                           attaches=[s.AttachRef(**a) for a in u.get("attaches", [])]) for u in r.unacked]
         return s.ConversationStatus(
-            conv=self.conv, alive=bool(self.brain is not None and getattr(self.brain, "alive", False)),
+            conv=self.conv, alive=self.brain_alive(),
             folder=display(r.folder, svc.paths.home), session_title=r.session_title, paused=r.paused,
             running=running, question=question, desktop=svc.desktop.status(), unacked=unacked,
             loop_lag_ms_p99=svc.lag.p99())
@@ -529,6 +744,27 @@ class Conversation:
 
 def _qid() -> str:
     return os.urandom(8).hex()
+
+
+_UNAVAILABLE = "Chat settings can't be read right now, so WhatsApp is off. Voice still works."
+
+
+@contextlib.contextmanager
+def _profile_errors() -> Any:
+    try:
+        yield
+    except pf.ProfileError as e:
+        raise ApiError(e.code, e.message) from None
+
+
+def _catch_up_note(sent_at: float, now: float) -> str:
+    """AG5: the model decides whether a late request still makes sense (no fixed rule asks)."""
+    when = time.strftime("%I:%M %p", time.localtime(sent_at)).lstrip("0")
+    mins = int(max(0.0, now - sent_at) // 60)
+    ago = f"{mins} min" if mins < 120 else f"{mins // 60} h"
+    return (f"[Note from Mac: the user sent this at {when}, {ago} ago, while Mac was asleep. If acting "
+            "now could be stale or unwanted (time-sensitive things, sending messages, purchases), reply "
+            "with one short question instead of acting; otherwise just do it.]\n\n")
 
 
 def _short(text: str, n: int = 60) -> str:
@@ -563,6 +799,10 @@ class Service:
         self.voice_settings = VoiceSettings()
         self.convs: dict[str, Conversation] = {}
         self._store = JsonStore(paths.state_dir / "conversations.json")
+        self.profiles = pf.ProfileStore(paths.state_dir / pf.DB_NAME, clock=clock)
+        self.never = pf.NeverSet()
+        self._never_torn: set[str] = set()
+        self.notice_sink: Callable[[dict[str, Any]], None] = lambda _n: None  # the server broadcasts
         self._notices: dict[str, list[s.InterruptedTurn]] = {}
         self._next_internal = 0
         self._save_pending = False
@@ -576,6 +816,9 @@ class Service:
     # -- lifecycle -----------------------------------------------------------------------
     async def start(self) -> None:
         await self.workspaces.load()
+        await self.profiles.open()
+        await self.refresh_never()
+        await self._seed()
         raw = await self._store.load({})
         for conv, d in (raw.get("conversations", {}) if isinstance(raw, dict) else {}).items():
             if isinstance(d, dict):
@@ -586,6 +829,7 @@ class Service:
             self._recover(c)
         await self.persist()  # notices are marked before any client can connect (W2.4)
         self._lag_task = asyncio.create_task(self.lag.run(), name="agentd:lag")
+        self.spawn(offload.warm())
 
     def _recover(self, c: Conversation) -> None:
         r = c.record
@@ -619,6 +863,7 @@ class Service:
         for t in list(self._tasks):
             t.cancel()
         await self.persist()
+        await self.profiles.close()
 
     def spawn(self, coro: Awaitable[Any]) -> None:
         t = asyncio.ensure_future(coro)
@@ -646,20 +891,305 @@ class Service:
         return c
 
     # -- identity --------------------------------------------------------------------------
-    async def chat_allowed(self, convs: list[str]) -> bool:
-        """Every conv is `<channel>:<chat id>` with the id in that channel's `chats` and not in its
-        `never_chats`, read from the fixed chatd config path (api §3)."""
-        cfg = await asyncio.to_thread(_read_toml, self.paths.chat_config)
-        channels = cfg.get("channels") if isinstance(cfg.get("channels"), dict) else {}
-        for conv in convs:
-            channel, sep, chat_id = conv.partition(":")
-            sec = channels.get(channel) if sep and chat_id else None
-            if not isinstance(sec, dict):
-                return False
-            chats, never = sec.get("chats") or [], sec.get("never_chats") or []
-            if chat_id not in chats or chat_id in never:
-                return False
-        return True
+    # -- profiles (W9) ----------------------------------------------------------------------
+    def profile_of(self, conv: str) -> s.Profile | None:
+        channel, _, chat_id = conv.partition(":")
+        return self.profiles.get(channel, chat_id) if chat_id else None
+
+    def chat_ok(self, p: s.Profile | None) -> bool:
+        return p is not None and p.enabled and not self.never.blocks(p.chat_id)
+
+    def chat_check(self, conv: str) -> None:
+        """Live grant (P2): every chat op is checked against the profile cache."""
+        if not self.profiles.available:
+            raise ApiError(s.ErrorCode.PROFILES_UNAVAILABLE, _UNAVAILABLE)
+        if conv == s.VOICE_CONV or not self.chat_ok(self.profile_of(conv)):
+            raise ApiError(s.ErrorCode.FORBIDDEN_CONVERSATION, "Mac is not set up to answer in that chat.")
+
+    def live_chat_convs(self) -> list[str]:
+        if not self.profiles.available:
+            return []
+        return [f"{p.channel}:{p.chat_id}" for p in self.profiles.rows() if self.chat_ok(p)]
+
+    def live_caps(self, conv: str) -> frozenset[str]:
+        p = self.profile_of(conv)
+        return pf.granted(p) if self.profiles.available and self.chat_ok(p) else frozenset()
+
+    def default_workspace(self, p: s.Profile | None) -> Path | None:
+        """The chat's folder, if it is still an approved workspace (W9.5)."""
+        if p is None or not p.default_workspace:
+            return None
+        path = resolve_user_path(p.default_workspace, self.paths.home)
+        return path if path is not None and str(path) in self.workspaces.approved else None
+
+    def _approved_ws(self, raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        path = resolve_user_path(raw, self.paths.home)
+        if path is None or str(path) not in self.workspaces.approved:
+            raise pf.ProfileError(s.ErrorCode.WORKSPACE_NOT_APPROVED,
+                                  "That folder is not an approved workspace. Approve it first.")
+        return display(path, self.paths.home)
+
+    async def refresh_never(self, add: frozenset[str] = frozenset()) -> None:
+        """Re-read the never-set (fixed paths, read-only) and make every JID in it sticky in the
+        profile store (I1: emptying pairing.json or config.toml unblocks nothing). A row whose
+        chat became never-listed, or every row when the set is unreadable, is shown disabled:
+        teardown, a new rev and a notice (I3)."""
+        loaded = await asyncio.to_thread(pf.load_never_set, self.paths.chat_config, self.paths.pairing)
+        st = self.profiles
+        bumped = False
+        if st.available:
+            try:
+                bumped = await st.add_never((loaded.jids if loaded.ok else frozenset()) | add)
+            except Exception:  # the in-memory set below still blocks them
+                log.warning("profiles: could not store never-listed chats", exc_info=True)
+        self.never = dataclasses.replace(loaded, jids=loaded.jids | st.never_jids | add)
+        if not st.available:
+            return
+        for p in st.rows():
+            conv = f"{p.channel}:{p.chat_id}"
+            if not self.never.blocks(p.chat_id):
+                self._never_torn.discard(conv)
+            elif p.enabled and conv not in self._never_torn:
+                self._never_torn.add(conv)
+                log.warning("profiles: %s is never-listed now; Mac stops answering there", conv)
+                if not bumped:
+                    with contextlib.suppress(Exception):
+                        await st.bump()
+                    bumped = True
+                await self.teardown(conv, lambda p=p: self.notify_profile(p.channel, p.chat_id, p))
+
+    async def never_list(self, conv: str) -> None:
+        """`pause{reason: never_listed}` (chatd saw the subject turn Timetable): sticky at once."""
+        await self.refresh_never(frozenset({conv.partition(":")[2]}))
+
+    async def teardown(self, conv: str, notice: Callable[[], None] | None = None) -> None:
+        """P3 in the I2 order: (a) agentd state first (every unfinished turn of the chat is torn,
+        so nothing more of it is shown, not even `done`, and it stays out of unacked; the open
+        question closes skipped; confirmation tokens are revoked), (b) the notice, (c) only
+        then the brain interrupt, which may be slow."""
+        c = self.convs.get(conv)
+        if c is None:
+            if notice is not None:
+                notice()
+            return
+        if c.question is not None:
+            c.close_question(c.question, s.CloseOutcome.SKIPPED)
+        c.gate.revoke_all()
+        torn = [t for t in c.turns.values() if not t.finished]
+        if c.turn is not None and not c.turn.finished and c.turn not in torn:
+            torn.append(c.turn)
+        for t in torn:
+            t.torn = True
+        if notice is not None:
+            notice()
+        for t in torn:
+            await c.interrupt(t)
+
+    def shown(self, p: s.Profile | None) -> s.Profile | None:
+        """A never-listed row reads as disabled everywhere (I3), whatever is stored."""
+        if p is not None and p.enabled and self.never.blocks(p.chat_id):
+            return dataclasses.replace(p, enabled=False)
+        return p
+
+    def notify_profile(self, channel: str, chat_id: str, p: s.Profile | None) -> None:
+        n = s.ProfileChanged(rev=self.profiles.rev, channel=channel, chat_id=chat_id, profile=self.shown(p),
+                             deleted=None if p is not None else True)
+        self.notice_sink(s.encode_notice(n))
+
+    def _need_store(self) -> None:
+        if not self.profiles.available:
+            raise ApiError(s.ErrorCode.PROFILES_UNAVAILABLE, _UNAVAILABLE)
+
+    async def profile_list(self, kind: s.ClientKind) -> s.ProfileListData:
+        self._need_store()
+        rows = [self.shown(p) for p in self.profiles.rows()]
+        if kind is not s.ClientKind.APP:
+            rows = [p for p in rows if self.chat_ok(p)]
+        return s.ProfileListData(rev=self.profiles.rev, profiles=rows)
+
+    async def profile_create(self, op: s.ProfileCreate) -> s.ProfileData:
+        self._need_store()
+        await self.refresh_never()
+        with _profile_errors():
+            if not op.channel or not op.chat_id or ":" in op.channel:
+                raise pf.ProfileError(s.ErrorCode.BAD_ARGS, "channel and chat_id are needed.")
+            extra = {k: getattr(op, k) for k in pf.EDITABLE if k != "display_name" and getattr(op, k) is not None}
+            fields = pf.validate({"display_name": op.display_name, **extra})
+            if self.never.blocks(op.chat_id) or pf.is_never_subject(fields["display_name"]):
+                raise pf.ProfileError(s.ErrorCode.NEVER_LISTED, "I never answer in that chat.")
+            if "default_workspace" in fields:
+                fields["default_workspace"] = self._approved_ws(fields["default_workspace"])
+            name = fields.pop("display_name")
+            p = await self.profiles.create(pf.new_row(op.channel, op.chat_id, name, op.owner_only, fields, self.clock()))
+        self.notify_profile(p.channel, p.chat_id, p)
+        return s.ProfileData(profile=p)
+
+    async def profile_set(self, op: s.ProfileSet) -> s.ProfileData:
+        self._need_store()
+        await self.refresh_never()
+        with _profile_errors():
+            cur = self.profiles.get(op.channel, op.chat_id)
+            if cur is None:
+                raise pf.ProfileError(s.ErrorCode.PROFILE_NOT_FOUND, "There are no settings for that chat.")
+            patch = pf.validate(op.patch)  # capabilities: a delta, merged inside the write (CQ race)
+            if (patch.get("enabled") and self.never.blocks(cur.chat_id)) or \
+                    pf.is_never_subject(patch.get("display_name", "")):
+                raise pf.ProfileError(s.ErrorCode.NEVER_LISTED, "I never answer in that chat.")
+            if "default_workspace" in patch:
+                patch["default_workspace"] = self._approved_ws(patch["default_workspace"])
+            p = await self.profiles.update(op.channel, op.chat_id, patch, expect_rev=op.rev)
+        await self._after_write(p.channel, p.chat_id, p)
+        return s.ProfileData(profile=p)
+
+    async def profile_delete(self, op: s.ProfileDelete) -> None:
+        self._need_store()
+        with _profile_errors():
+            await self.profiles.delete(op.channel, op.chat_id)
+        await self._after_write(op.channel, op.chat_id, None)
+
+    async def _after_write(self, channel: str, chat_id: str, p: s.Profile | None) -> None:
+        if self.chat_ok(p):
+            self.notify_profile(channel, chat_id, p)
+        else:
+            await self.teardown(f"{channel}:{chat_id}", lambda: self.notify_profile(channel, chat_id, p))
+
+    async def set_persona(self, conv: str, text: str) -> None:
+        """The model's `set_persona`, after a bound yes: this chat only (bound at brain build)."""
+        cur = self.profile_of(conv)
+        if cur is None or not self.chat_ok(cur):
+            raise pf.ProfileError(s.ErrorCode.PROFILE_NOT_FOUND, "This chat has no settings.")
+        patch = pf.validate({"persona": text})
+        p = await self.profiles.update(cur.channel, cur.chat_id, patch)
+        self.notify_profile(p.channel, p.chat_id, p)
+
+    async def profile_command(self, op: s.ProfileCommand) -> s.ProfileCommandData:
+        """W9.3 owner commands (parsed by chatd). `add` and `allow` open a profile question;
+        only a bound yes applies them, as a patch on the row as it is then."""
+        self._need_store()
+        c = self.conversation(op.conv)
+        channel = op.conv.partition(":")[0]
+        if op.command == "disallow":
+            cap = self._capability(op.capability)
+            cur = self.profile_of(op.conv)
+            if cur is not None and pf.caps_dict(cur)[cap]:
+                with _profile_errors():
+                    p = await self.profiles.update(cur.channel, cur.chat_id, {"capabilities": {cap: False}})
+                self.notify_profile(p.channel, p.chat_id, p)
+            return s.ProfileCommandData(applied=True)
+        if op.command == "allow":
+            cap = self._capability(op.capability)
+            q = c.open_question(s.QuestionKind.PROFILE, f"Turn on {s.CAPABILITY_WORDS[cap]} in this chat? "
+                                "Reply yes to this message.", {"command": "allow", "capability": cap})
+            return s.ProfileCommandData(question_id=q.question_id)
+        subject, cid = (op.subject or "").strip(), (op.chat_id or "").strip()
+        if not subject or not cid or op.owner_only is None:
+            raise ApiError(s.ErrorCode.BAD_ARGS, "add needs subject, chat_id and owner_only.")
+        await self.refresh_never()
+        if self.never.blocks(cid) or pf.is_never_subject(subject):
+            raise ApiError(s.ErrorCode.NEVER_LISTED, "I never answer in that chat.")
+        if self.profiles.get(channel, cid) is not None:
+            raise ApiError(s.ErrorCode.PROFILE_EXISTS, f"I already answer in “{subject[:80]}”.")
+        q = c.open_question(s.QuestionKind.PROFILE, f"Answer in “{subject[:80]}” too? Reply yes to this message.",
+                            {"command": "add", "channel": channel, "chat_id": cid, "subject": subject[:80],
+                             "owner_only": op.owner_only})
+        return s.ProfileCommandData(question_id=q.question_id)
+
+    @staticmethod
+    def _capability(raw: str | None) -> str:
+        if raw not in s.CAPABILITIES:
+            raise ApiError(s.ErrorCode.BAD_ARGS, f"capability must be one of {', '.join(s.CAPABILITIES)}.")
+        return raw
+
+    async def _apply_profile_question(self, c: Conversation, payload: dict[str, Any]) -> None:
+        """A bound yes: re-check the never-set and existence, then patch the row as it is now (N6)."""
+        await self.refresh_never()
+        cmd = payload.get("command")
+        result: dict[str, Any] = {"command": cmd, "applied": False}
+        try:
+            if cmd == "add":
+                channel, cid, subject = str(payload["channel"]), str(payload["chat_id"]), str(payload["subject"])
+                if self.never.blocks(cid) or pf.is_never_subject(subject):
+                    result["message"] = f"I never answer in “{subject}”."
+                elif self.profiles.get(channel, cid) is not None:
+                    result["message"] = f"I already answer in “{subject}”."
+                else:
+                    row = pf.new_row(channel, cid, subject, bool(payload.get("owner_only")), {}, self.clock())
+                    p = await self.profiles.create(row)
+                    self.notify_profile(p.channel, p.chat_id, p)
+                    result.update(applied=True, message=f"Done. I answer in “{subject}” now, with everything "
+                                                        "turned on. Turn things off in Mac ▸ WhatsApp.")
+            elif cmd == "allow":
+                cap, cur = str(payload["capability"]), self.profile_of(c.conv)
+                if cur is not None and self.chat_ok(cur):
+                    p = await self.profiles.update(cur.channel, cur.chat_id, {"capabilities": {cap: True}})
+                    self.notify_profile(p.channel, p.chat_id, p)
+                    w = s.CAPABILITY_WORDS[cap]
+                    result.update(applied=True, message=f"{w[0].upper()}{w[1:]} is on in this chat.")
+        except pf.ProfileError as e:
+            result["message"] = e.message
+        c.emit(s.StatusEvent, data={"profile_command": result})
+
+    async def _seed(self) -> None:
+        """W9.10, once: Interview prep (and the old `chats` key) from pairing.json and chatd's
+        config. Never Timetable. Never again, even if the table is later emptied."""
+        st = self.profiles
+        if not st.available or st.seeded_from is not None:
+            return
+        pairing = await asyncio.to_thread(pf.read_pairing, self.paths.pairing)
+        if st.cache:
+            await st.mark_seeded(json.dumps({"sources": [], "at": self.clock(), "note": "rows existed"}))
+            return
+        if not self.never.ok:
+            return  # never-set unreadable (N4): seed nothing, try again at the next start
+        resumes = [a for a in self.workspaces.approved if Path(a).name == "Resume"]
+        approved = display(Path(resumes[0]), self.paths.home) if len(resumes) == 1 else None
+        for row in pf.seed_rows(self.never, pairing, approved, self.clock()):
+            with contextlib.suppress(pf.ProfileError):
+                await st.create(row)
+        sources = [n for n, ok in (("pairing.json", pairing is not None), ("config.toml", self.never.config is not None))
+                   if ok]
+        await st.mark_seeded(json.dumps({"sources": sources, "at": self.clock()}))
+        log.info("profiles: seeded %d chat(s) from %s", len(st.cache), ", ".join(sources))
+
+    async def validate_switch(self, c: Conversation, folder: str, mode: str) -> tuple[Path | None, str] | str:
+        """AG1, deterministic: the folder exists under home and is not skipped, one match only,
+        and `continue` picks a session that folder really has. Approval and the hash check run
+        as at any turn start. Returns (folder, session) or why not."""
+        if c.voice:
+            return "voice requests do not move between folders"
+        if c.turn is not None and c.turn.moved:
+            return "this request already moved once"
+        if mode not in ("continue", "new"):
+            return "mode must be continue or new"
+        current = Path(c.record.folder) if c.record.folder else None
+        cands = await self.router.candidates()
+        if folder.strip().lower() == "general":
+            path = None
+        else:
+            hits = await self.router.find_folder(folder.strip(), cands)
+            hits = [h for h in hits if under(h, self.paths.home) and not is_skipped(h, self.paths.home)]
+            if not hits:
+                return f"there is no folder called {folder} in the home folder"
+            if len(hits) > 1:
+                listed = ", ".join(display(h, self.paths.home) or str(h) for h in hits[:4])
+                return f"several folders match {folder} ({listed}); give the path"
+            path = hits[0]
+        if mode == "new":
+            session = "new"
+        elif path == current:
+            session = "same"
+        else:
+            sessions = next((cd.sessions for cd in cands if cd.path == path), [])
+            session = f"continue:{sessions[0][0]}" if sessions and path is not None else "new"
+        if path == current and session == "same":
+            return "the request is already in that folder"
+        return path, session
+
+    def next_internal(self) -> int:
+        self._next_internal += 1
+        return self._next_internal
 
     def take_notices(self, convs: list[str]) -> list[s.InterruptedTurn]:
         out: list[s.InterruptedTurn] = []
@@ -723,10 +1253,16 @@ class Service:
         uid = s.turn_uid(self.boot, c.conv, epoch, client_turn)
         if uid in c.uids:
             raise ApiError(s.ErrorCode.BAD_ARGS, "That turn number was already used.")
-        self._next_internal += 1
-        t = Turn(self._next_internal, uid, epoch, client_turn, text, time.monotonic(), msg_ref)
+        t = Turn(self.next_internal(), uid, epoch, client_turn, text, time.monotonic(), msg_ref)
         c.uids.add(uid)
         return t
+
+    async def follow_up(self, c: Conversation, text: str, before: str, msg_ref: str, what: str) -> None:
+        """AG4: the user's free-text answer is the next request; the one asked about is context."""
+        t = self._new_turn(c, AGENTD_EPOCH, self._next_internal + 1, text, msg_ref)
+        t.note = (f'[Note from Mac: Mac was working on "{_short(before, 200)}" and {what}. The user answered '
+                  "with the message below.]\n\n")
+        await self._start_turn(c, t, None)
 
     async def ask(self, epoch: str, op: s.Ask) -> s.AskData:
         c = self.conversation(op.conv)
@@ -749,9 +1285,24 @@ class Service:
         c.turns[t.internal] = t
         c.recent.append(t.text)
         c.record.running = RunningTurn(t.uid, t.text, self.clock(), t.msg_ref)
-        await self.persist()
+        if c.voice:
+            self.save_soon()  # voice: never on the path to the first TEXT; a lost notice fails quiet
+        else:
+            await self.persist()  # chat: durable before `accepted` (chatd marks the message handled)
         self.events.emit("agentd.turn", conv=c.conv, turn_uid=t.uid)
         t.task = c.spawn(c.run_turn(t, meta, before), f"turn{t.internal}")
+
+    def continue_turn(self, c: Conversation, last: Turn, text: str, *, internal: int = 0) -> Turn:
+        """A new query on a finished voice turn: same client turn and uid, new brain turn
+        (unless the brain already runs it under `internal`)."""
+        if not internal:
+            internal = self.next_internal()
+        t = Turn(internal, last.uid, last.epoch, last.client_turn, text or last.text, time.monotonic())
+        c.turn = t
+        c.turns[internal] = t
+        c.record.running = RunningTurn(t.uid, t.text, self.clock())
+        self.save_soon()
+        return t
 
     def _find(self, c: Conversation, epoch: str, voice_turn: int | None, uid: str | None) -> Turn | None:
         t = c.running()
@@ -764,6 +1315,16 @@ class Service:
     async def steer(self, epoch: str, op: s.Steer) -> s.AcceptedData:
         c = self.conversation(op.conv)
         t = self._find(c, epoch, op.turn, op.turn_uid)
+        if t is None and c.voice:
+            last = c.last_finished
+            if (last is not None and not last.stopping and last.epoch == epoch and last.client_turn == op.turn
+                    and c.running() is None):
+                # Local ClaudeBrain semantics: a steer for a just-finished voice turn starts a new
+                # query on the same turn. Its events carry the same turn and turn_uid.
+                c.recent.append(op.text)
+                cont = self.continue_turn(c, last, op.text)
+                cont.task = c.spawn(c.run_turn(cont, None, None), f"turn{cont.internal}")
+                return s.AcceptedData(accepted=True)
         if t is None or t.stopping:
             return s.AcceptedData(accepted=False)
         c.recent.append(op.text)
@@ -833,12 +1394,20 @@ class Service:
             t = c.turns.get(q.turn_internal)
             if b.outcome is s.ReplyOutcome.CHANGED and t is not None and t.in_brain and c.brain is not None:
                 await c.brain.steer(t.internal, b.steer_text)  # "change it": deny, then steer (U11)
+        elif q.kind is s.QuestionKind.PROFILE:
+            c.close_question(q, outcome, b)
+            if b.outcome is s.ReplyOutcome.APPROVED:
+                await self._apply_profile_question(c, q.payload)
         elif q.kind is s.QuestionKind.RESTART:
             c.close_question(q, outcome, b)
-            if b.outcome is s.ReplyOutcome.APPROVED and c.running() is None:
-                t = self._new_turn(c, AGENTD_EPOCH, self._next_internal + 1, str(q.payload.get("text", "")),
-                                   str(q.payload.get("msg_ref", "")))
-                await self._start_turn(c, t, None)
+            again = b.outcome is s.ReplyOutcome.APPROVED or (b.outcome is s.ReplyOutcome.ANSWERED and b.steer_text)
+            if again and c.running() is None:
+                before, ref = str(q.payload.get("text", "")), str(q.payload.get("msg_ref", ""))
+                if b.outcome is s.ReplyOutcome.APPROVED:
+                    await self._start_turn(c, self._new_turn(c, AGENTD_EPOCH, self._next_internal + 1, before, ref),
+                                           None)
+                else:
+                    await self.follow_up(c, b.steer_text, before, ref, "restarted, then asked whether to pick it up")
         else:
             c.close_question(q, outcome, b)
         return s.ReplyData(bound=True, outcome=b.outcome)
@@ -885,6 +1454,7 @@ class Service:
         c = self.conversation(conv)
         if c.brain is not None:
             await c.brain.reset()
+        c.check_alive()
 
     async def warm(self, conv: str) -> None:
         c = self.conversation(conv)
@@ -894,23 +1464,27 @@ class Service:
                 await brain.warm()
         except Exception:
             log.warning("warm failed", exc_info=True)  # never fails (Brain.warm)
+        c.check_alive()
 
     async def sleep(self, conv: str) -> None:
         c = self.conversation(conv)
         if c.brain is not None:
             await c.brain.sleep()
+        c.check_alive()
 
     async def set_context(self, conv: str, locked: bool) -> None:
         c = self.conversation(conv)
         c.locked = locked
         if c.brain is not None:
             await c.brain.set_context(locked)
+        c.check_alive()
 
     async def set_language(self, conv: str, lang: str) -> None:
         self.voice_settings.language = lang
         c = self.conversation(conv)
         if c.brain is not None:
             await c.brain.set_language(lang)
+        c.check_alive()
 
     async def set_name(self, conv: str, name: str) -> None:
         self.voice_settings.name = name
@@ -926,6 +1500,7 @@ class Service:
         if c.brain is not None:
             await c.brain.set_name(op.name)
             await c.brain.set_language(op.language)
+        c.check_alive()
 
     # -- records ---------------------------------------------------------------------------
     async def new_session(self, op: s.NewSession) -> None:
@@ -944,6 +1519,8 @@ class Service:
         c = self.conversation(conv)
         if not value and kind is not s.ClientKind.APP:
             raise ApiError(s.ErrorCode.FORBIDDEN, "Only the Mac menu can unpause a chat.")
+        if value and reason == "never_listed":
+            await self.never_list(conv)
         c.record.paused = (reason or "user") if value else ""
         await self.persist()
         return s.PauseData(paused=c.record.paused)
@@ -969,18 +1546,15 @@ class Service:
         return s.WsApproveData(settings_hash=await self.workspaces.approve(p))
 
     async def ws_remove(self, raw: str) -> None:
-        await self.workspaces.remove(self._ws_path(raw))
-
-
-def _read_toml(path: Path) -> dict[str, Any]:
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except FileNotFoundError:
-        return {}
-    except (OSError, tomllib.TOMLDecodeError):
-        log.warning("chat config at %s is unreadable; no chat conversations allowed", path)
-        return {}
+        path = self._ws_path(raw)
+        await self.workspaces.remove(path)
+        if not self.profiles.available:
+            return
+        for p in self.profiles.rows():  # W9.5: a removed workspace is nobody's folder any more
+            if p.default_workspace and resolve_user_path(p.default_workspace, self.paths.home) == path:
+                with _profile_errors():
+                    np = await self.profiles.update(p.channel, p.chat_id, {"default_workspace": None})
+                self.notify_profile(np.channel, np.chat_id, np)
 
 
 __all__ = ["AgentPaths", "ApiError", "Conversation", "GapError", "Service"]

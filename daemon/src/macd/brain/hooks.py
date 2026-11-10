@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import inspect
 import logging
 import os
 import time
@@ -32,7 +33,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from macd.brain.gate import (
+    CAPABILITY,
     MEMORY_WRITE,
+    UNKNOWN_TOOL,
     ConfirmationGate,
     GateContext,
     GateDecision,
@@ -85,7 +88,8 @@ def is_desktop_tool(name: str) -> bool:
 
 
 class DesktopLock(Protocol):
-    """A non-blocking lock the guard polls. agentd's in-process lock implements this too."""
+    """A non-blocking lock. The guard polls it, unless it also offers the event-driven
+    ``async acquire(timeout, cancelled) -> bool`` (agentd's DesktopHandle), which is awaited."""
 
     def try_acquire(self) -> bool: ...
     def release(self) -> None: ...
@@ -166,35 +170,42 @@ class DesktopGuard:
     def held(self) -> bool:
         return self.owner is not None
 
-    def _try_all(self) -> bool:
-        for lock in self.locks:
-            if lock in self._held:
-                continue
-            if not lock.try_acquire():
-                return False
-            self._held.append(lock)
-        return True
-
     async def acquire(self, turn: int, tool_use_id: str, cancelled: Callable[[], bool]) -> str:
-        """"ok", "busy" (bounded wait ran out) or "cancelled" (the turn stopped meanwhile)."""
+        """"ok", "busy" (bounded wait ran out) or "cancelled" (the turn stopped meanwhile).
+
+        Locks are taken in order. A lock with an async ``acquire(timeout, cancelled)`` (agentd's
+        handle) is awaited and wakes on the release itself; others (the transitional flock) are
+        polled every ``poll_s``."""
         if cancelled():
             return "cancelled"
         if self.owner is not None and self.owner != turn:
             self.release()  # a previous turn of this brain left it: turns are sequential
         deadline = self._clock() + self.wait_s
         waited = False
-        while not self._try_all():
-            if cancelled():
-                self._drop_partial()
-                return "cancelled"
-            if self._clock() >= deadline:
-                self._drop_partial()
-                return "busy"
-            if not waited and self.on_wait is not None:
-                waited = True
-                with contextlib.suppress(Exception):
-                    self.on_wait(turn)
-            await asyncio.sleep(self.poll_s)
+        for lock in self.locks:
+            if lock in self._held:
+                continue
+            while not lock.try_acquire():
+                if cancelled():
+                    self._drop_partial()
+                    return "cancelled"
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    self._drop_partial()
+                    return "busy"
+                if not waited and self.on_wait is not None:
+                    waited = True
+                    with contextlib.suppress(Exception):
+                        self.on_wait(turn)
+                event_acquire = getattr(lock, "acquire", None)
+                if event_acquire is not None and inspect.iscoroutinefunction(event_acquire):
+                    if await event_acquire(remaining, cancelled):
+                        break  # granted by the release itself
+                    if not cancelled() and self._clock() < deadline:
+                        await asyncio.sleep(self.poll_s)  # spurious refusal: never spin
+                else:
+                    await asyncio.sleep(self.poll_s)
+            self._held.append(lock)
         if cancelled():  # re-check after the wait: a stopped turn's waiter never keeps it (F3)
             if self.owner is None:
                 self.release()
@@ -257,6 +268,7 @@ class ActionFingerprint:
     tool: str
     code: str
     target: str
+    detail: str = ""  # shown with the confirmation (set_persona's full text); not in the key
 
     @property
     def key(self) -> str:
@@ -338,11 +350,16 @@ class PreToolHook:
                       "tell the user you can't do that.")
         elif d.verdict == "sensitive_read" and d.code == MEMORY_WRITE:
             reason = REASON_MEMORY_WRITE
+        elif d.code.startswith(f"{CAPABILITY}:"):  # W9.5: plain words the model relays once
+            reason = (f"Not allowed: {d.reason}. Tell the user that in one short line, once, and carry on "
+                      "without it. Don't try another way.")
+        elif d.code == UNKNOWN_TOOL:
+            reason = f"Not allowed: {d.reason}. Don't try it again; carry on without it."
         elif d.verdict == "sensitive_read":
             reason = (f"Blocked: {d.reason}. Reading or copying secrets, keys, keychains or browser "
                       "profiles is never allowed. Don't try another way; tell the user.")
         elif d.verdict == "outward":
-            fp = ActionFingerprint(turn, name, d.code, d.target)
+            fp = ActionFingerprint(turn, name, d.code, d.target, d.detail)
             if self.gate.consume(turn, fp.key):
                 self._record(turn, name, tool_use_id, True, d, "confirmed by the user")
                 return True, ""

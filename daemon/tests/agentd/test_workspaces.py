@@ -126,6 +126,7 @@ def _proj(agent) -> Path:
     (proj / ".claude" / "hooks" / "x.sh").write_text("echo ok\n")
     (proj / "CLAUDE.md").write_text("# Resume\n")
     agent.mdfind_out = f"{proj}\n"  # what Spotlight finds for the name
+    agent.model.reply = '{"folder": "Resume", "session": "new", "confidence": 0.9}'
     return proj
 
 
@@ -168,6 +169,7 @@ async def test_hash_rechecked_at_every_turn_start(agent):
 async def test_unapproved_folder_without_settings_asks_nothing(agent):
     (agent.paths.home / "Plain").mkdir()
     agent.mdfind_out = f"{agent.paths.home / 'Plain'}\n"
+    agent.model.reply = '{"folder": "Plain", "session": "new", "confidence": 0.9}'
     c = await agent.client(CHAT_TOKEN, [CHAT])
     await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "list files in the Plain folder"})
     st = await c.event("status")

@@ -44,6 +44,7 @@ class Conn:
         self.epoch = ""
         self.client = ""
         self.granted: list[str] = []
+        self.voice_bound = False  # this connection drives voice:local (epoch rules, V2)
         self.subs: dict[str, Stream] = {}
         self._q: collections.deque[tuple[bytes, bool]] = collections.deque()
         self._events = 0
@@ -121,6 +122,7 @@ class Server:
         self.conns: set[Conn] = set()
         self._server: asyncio.base_events.Server | None = None
         self._handlers: set[asyncio.Task[Any]] = set()
+        service.notice_sink = self._notice_chat_clients
 
     async def start(self) -> None:
         sock = bind_private_unix_socket(self.sock_path)
@@ -139,6 +141,12 @@ class Server:
             await asyncio.gather(*self._handlers, return_exceptions=True)
         with contextlib.suppress(OSError):
             self.sock_path.unlink()
+
+    def _notice_chat_clients(self, notice: dict[str, Any]) -> None:
+        """`profile_changed` (connection-level: no conv, no seq, not replayed) to every chat client."""
+        for c in self.conns:
+            if c.kind is s.ClientKind.CHAT:
+                c.send(notice)
 
     # -- connection ----------------------------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -167,7 +175,7 @@ class Server:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(wtask, 2.0)
             self.conns.discard(conn)
-            if conn.kind is s.ClientKind.VOICE:
+            if conn.voice_bound:
                 self.svc.voice_disconnected(conn.epoch)
             if task is not None:
                 self._handlers.discard(task)
@@ -232,14 +240,26 @@ class Server:
         if kind is s.ClientKind.VOICE:
             ok = all(c == s.VOICE_CONV for c in convs)
         elif kind is s.ClientKind.CHAT:
-            ok = s.VOICE_CONV not in convs and await self.svc.chat_allowed(convs)
+            await self.svc.refresh_never()
+            if not convs:  # live grants (P2): the enabled, not never-listed profiles
+                convs = self.svc.live_chat_convs()
+            for c in convs:
+                try:
+                    self.svc.chat_check(c)
+                except ApiError as e:
+                    if e.code is s.ErrorCode.PROFILES_UNAVAILABLE:
+                        raise
+                    raise ApiError(s.ErrorCode.FORBIDDEN_CONVERSATION,
+                                   "A chat client may not use one of those conversations.") from None
+            ok = True
         else:
             ok = not convs
         if not ok:
             raise ApiError(s.ErrorCode.FORBIDDEN_CONVERSATION,
                            f"A {kind.value} client may not use one of those conversations.")
         conn.kind, conn.epoch, conn.client, conn.granted = kind, op.client_epoch, op.client, convs
-        if kind is s.ClientKind.VOICE:
+        if kind is s.ClientKind.VOICE and s.VOICE_CONV in convs:  # not a side connection (stop_other)
+            conn.voice_bound = True
             await self.svc.voice_connected(op.client_epoch)
         log.info("api: hello from %s (%s)", op.client, kind.value)
         return s.HelloData(api=s.API_VERSION, server=SERVER_NAME, kind=kind, boot=self.svc.boot,
@@ -249,6 +269,8 @@ class Server:
         if conn.kind is s.ClientKind.APP:
             if conv not in self.svc.convs:
                 raise ApiError(s.ErrorCode.BAD_ARGS, "There is no such conversation.")
+        elif conn.kind is s.ClientKind.CHAT:
+            self.svc.chat_check(conv)  # live, every op (P2)
         elif conv not in conn.granted:
             raise ApiError(s.ErrorCode.FORBIDDEN_CONVERSATION, "This client did not open that conversation.")
 
@@ -261,7 +283,10 @@ class Server:
         except s.SchemaError as e:
             raise ApiError(e.code, str(e)) from None
         conv = getattr(op, "conv", None)
-        if conv is not None:
+        if isinstance(op, s.Pause) and op.reason == "never_listed" and op.value:
+            if op.conv == s.VOICE_CONV or ":" not in op.conv:  # only narrows: any kind, any chat
+                raise ApiError(s.ErrorCode.BAD_ARGS, "never_listed is for a chat conversation.")
+        elif conv is not None:
             self._check_conv(conn, conv)
         svc, ep = self.svc, conn.epoch
         match op:
@@ -310,6 +335,8 @@ class Server:
             case s.Status():
                 if op.conv is not None:
                     return svc.conversation(op.conv).status()
+                if conn.kind is s.ClientKind.CHAT:
+                    return svc.status(svc.live_chat_convs())
                 return svc.status(None if conn.kind is s.ClientKind.APP else conn.granted)
             case s.Pause():
                 return await svc.pause(op.conv, op.value, op.reason, conn.kind)
@@ -319,6 +346,16 @@ class Server:
                 return await svc.ws_approve(op.path)
             case s.WsRemove():
                 await svc.ws_remove(op.path)
+            case s.ProfileList():
+                return await svc.profile_list(conn.kind)
+            case s.ProfileCreate():
+                return await svc.profile_create(op)
+            case s.ProfileSet():
+                return await svc.profile_set(op)
+            case s.ProfileDelete():
+                await svc.profile_delete(op)
+            case s.ProfileCommand():
+                return await svc.profile_command(op)
             case _:
                 raise ApiError(s.ErrorCode.UNKNOWN_OP, f"unknown op {op.OP!r}")
         return None

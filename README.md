@@ -158,7 +158,8 @@ Prompt injection from web pages cannot bypass it, because the model never holds 
 ```bash
 make app          # build + sign build/Mac.app
 make test         # Swift + Python tests
-cd daemon && uv run pytest -q -m "not live and not models"   # fast unit suite
+cd daemon && uv run pytest -q -m "not live and not models and not perf"   # fast unit suite
+cd daemon && uv run pytest -q -s -m perf                       # benchmarks, run alone (W6 latency gate)
 cd daemon && uv run pytest -q -m models                       # needs downloaded models
 cd daemon && uv run pytest -q -m live                         # needs claude login / LiveKit creds
 uv run macd --audio sounddevice   # headless daemon (permissions attribute to your terminal)

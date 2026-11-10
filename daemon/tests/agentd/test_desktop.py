@@ -124,6 +124,59 @@ async def test_handles_with_the_brains_desktop_guard():
     assert lock.holder is None
 
 
+async def test_handle_wait_released_wakes_on_release_not_poll():
+    lock = DesktopLock()
+    chat, voice = lock.handle(CHAT, "chat"), lock.handle(V, "voice")
+    assert chat.try_acquire()
+    assert await chat.wait_released(0) is True  # its own hold counts as free for it
+    assert await voice.wait_released(0.01) is False  # bounded
+    loop = asyncio.get_running_loop()
+    waiter = asyncio.create_task(voice.wait_released(5))
+    await asyncio.sleep(0)
+    t0 = loop.time()
+    loop.call_later(0.05, chat.release)
+    assert await waiter is True
+    assert loop.time() - t0 < 0.5 and voice.try_acquire()
+    assert not lock._release_waiters
+
+
+async def test_handle_acquire_is_fifo_and_event_driven():
+    lock = DesktopLock(idle_release_s=0.01)
+    chat, voice = lock.handle(CHAT, "chat"), lock.handle(V, "voice")
+    assert await chat.acquire(1)
+    waiter = asyncio.create_task(voice.acquire(5))
+    await asyncio.sleep(0.05)  # longer than the idle release: a handle hold is not idle-managed
+    assert lock.holder is chat.token and not waiter.done()
+    chat.release()
+    assert await waiter is True and lock.holder is voice.token
+    assert voice.try_acquire()  # re-entrant for its own hold
+    assert await chat.acquire(0.01) is False  # bounded
+    voice.release()
+    assert lock.holder is None
+
+
+async def test_handle_acquire_cancelled_turn_never_keeps_it():
+    lock = DesktopLock()
+    chat, voice = lock.handle(CHAT, "chat"), lock.handle(V, "voice")
+    assert chat.try_acquire()
+    stopped = {"v": False}
+    waiter = asyncio.create_task(voice.acquire(5, lambda: stopped["v"]))
+    await asyncio.sleep(0)
+    stopped["v"] = True
+    chat.release()
+    assert await waiter is False and lock.holder is None
+    assert voice.try_acquire()  # the stale flag does not outlive the failed acquire
+    voice.release()
+
+
+async def test_wait_released_drops_a_stopped_holder():
+    lock = DesktopLock()
+    a = tok(CHAT)
+    await lock.acquire(a, 1)
+    a.stop["v"] = True
+    assert await lock.handle(V, "voice").wait_released(0.01) is True
+
+
 async def test_service_releases_on_confirm_and_on_turn_end(agent):
     step = confirm_step()
     step.delay = 0.2

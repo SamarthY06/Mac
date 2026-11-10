@@ -14,7 +14,7 @@ app-test:       ## Swift unit tests (audio framing, NDJSON)
 	cd app && swift test
 
 daemon-test:    ## Python tests
-	cd daemon && uv run pytest -q
+	cd daemon && uv run pytest -q -m "not live and not models and not perf"
 
 e2e: app        ## app ⇄ fake daemon over real sockets (plays a quiet tone)
 	scripts/e2e.sh

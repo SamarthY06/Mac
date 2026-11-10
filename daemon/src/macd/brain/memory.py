@@ -56,11 +56,17 @@ FLOCK_TIMEOUT_S = 5.0  # a write never waits longer than this for another proces
 log = logging.getLogger(__name__)
 
 _STOPWORDS = frozenset(["about", "above", "after", "again", "against", "also", "always", "answer", "answers", "anything", "around", "because", "been", "before", "being", "between", "both", "could", "does", "doing", "done", "during", "each", "either", "every", "from", "have", "having", "here", "into", "just", "like", "mine", "more", "most", "much", "must", "never", "only", "other", "over", "please", "prefer", "prefers", "quite", "rather", "really", "same", "shall", "should", "since", "some", "such", "than", "that", "their", "them", "then", "there", "these", "they", "thing", "things", "this", "those", "through", "under", "until", "very", "want", "wants", "were", "what", "when", "where", "which", "while", "will", "with", "would", "your", "yours"])
-_WORD = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
+# Three-letter words count too ("tea", "son", "gym"); the common short function words do not.
+_STOPWORDS = _STOPWORDS | frozenset(["the", "and", "for", "you", "are", "was", "his", "her", "she", "him", "has",
+                                     "had", "not", "but", "our", "its", "who", "how", "why", "can", "did", "get",
+                                     "got", "use", "new", "now", "all", "any", "may", "one", "too", "out", "own",
+                                     "yes", "let", "say", "see", "way", "off", "per", "via", "user"])
+_WORD = re.compile(r"[A-Za-z][A-Za-z'-]{2,}")
 
 
 def _norm(text: str) -> str:
-    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", text.lower().replace(KEPT.strip(), "")).split())
+    """Lowercase words of any script (\\w is Unicode-aware), punctuation and [kept] removed."""
+    return " ".join(re.sub(r"[^\w ]+|_", " ", text.replace(KEPT.strip(), "").casefold()).split())
 
 
 def _stem(word: str) -> str:
@@ -72,16 +78,30 @@ def _stem(word: str) -> str:
 
 
 def content_words(text: str) -> set[str]:
-    return {_stem(w) for w in _WORD.findall(text) if w.lower() not in _STOPWORDS}
+    stems = {_stem(w) for w in _WORD.findall(text) if w.lower() not in _STOPWORDS}
+    return stems - _STOPWORDS  # "likes" stems to the stopword "like" (the user's "like" is dropped too)
+
+
+def _ngrams(text: str, n: int = 3) -> set[str]:
+    s = _norm(text).replace(" ", "")
+    return {s[i : i + n] for i in range(len(s) - n + 1)}
 
 
 def grounded(fact: str, recent_user_text: str, ratio: float = GROUNDING_RATIO) -> bool:
-    """True if ≥ `ratio` of the fact's content words occur in what the user recently said."""
+    """True if ≥ `ratio` of the fact's content words occur in what the user recently said.
+
+    Content words are English (stopwords, light stemming). For a fact in another script, or one
+    with no English content words, the deterministic fallback (AG12) is character 3-gram
+    overlap: ≥ `ratio` of the fact's 3-grams (letters only, spaces and punctuation dropped,
+    casefolded) must occur in what the user said."""
     words = content_words(fact)
-    if not words:
+    if words and fact.isascii():
+        said = content_words(recent_user_text)
+        return len(words & said) / len(words) >= ratio
+    grams = _ngrams(fact)
+    if len(grams) < 2:
         return False
-    said = content_words(recent_user_text)
-    return len(words & said) / len(words) >= ratio
+    return len(grams & _ngrams(recent_user_text)) / len(grams) >= ratio
 
 
 def section_for(kind: str | None) -> str:

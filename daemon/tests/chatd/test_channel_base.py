@@ -47,6 +47,7 @@ class _Mini:
     async def link(self): ...
     async def unlink(self): ...
     async def list_chats(self): return []
+    async def set_allowed(self, chat_ids): pass
 
 
 def test_protocol_is_satisfiable():

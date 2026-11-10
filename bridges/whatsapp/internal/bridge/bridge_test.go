@@ -550,7 +550,7 @@ func TestInboundEmitsOwnerMessage(t *testing.T) {
 	}})
 	ev := h.event("message")
 	if ev["chat"] != group || ev["msg"] != "M1" || ev["text"] != "find me 20 jobs" || ev["sender_device"] != float64(0) ||
-		ev["replayed"] != false || ev["unsupported"] != "" || ev["sent_at"] != float64(now.Unix()) {
+		ev["from_me"] != true || ev["replayed"] != false || ev["unsupported"] != "" || ev["sent_at"] != float64(now.Unix()) {
 		t.Fatalf("message = %v", ev)
 	}
 	q := ev["quoted"].(map[string]any)

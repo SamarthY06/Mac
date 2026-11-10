@@ -10,8 +10,8 @@ Input policy:
 | IDLE / LISTENING    | woke (or PTT window / remote)      | new turn                            |
 | FOLLOWUP            | any from the turn's source         | new turn (same conversation)        |
 | THINKING / SPEAKING | woke: stop words                   | interrupt                           |
-|                     | woke: "actually…", "no, <change>"  | interrupt + new ask                 |
-|                     | woke: anything else / continuation | steer (+ "Got it." unless cont.)    |
+|                     | woke: anything else / continuation | steer (+ "Got it." unless cont.);   |
+|                     |   ("actually…" included, AG17)     | the model redirects or adds         |
 |                     | SPEAKING window (bare stop word)   | interrupt                           |
 | CONFIRMING          | affirmative                        | gate.resolve(True)                  |
 |                     | bare negative / timeout            | gate.resolve(False)                 |
@@ -138,8 +138,6 @@ class Orchestrator:
         earcon: Callable[[str], tuple[Any, int]] | None = None,
         segmenter_factory: Callable[[], Segmenter] = SentenceSegmenter,
         describe_tool: DescribeTool = _describe_tool,
-        voice_reset: Callable[[], Awaitable[Any]] | None = None,
-        rename: Callable[[str], Awaitable[Any]] | None = None,
         stop_other: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self.cfg = cfg
@@ -151,8 +149,6 @@ class Orchestrator:
         self.earcon = earcon
         self.segmenter_factory = segmenter_factory
         self.describe_tool = describe_tool
-        self.voice_reset = voice_reset  # "Hey Mac, use your default voice" (wired in __main__)
-        self.rename = rename  # "Hey Mac, call yourself Jarvis" → settings (wired in __main__)
         self.stop_other = stop_other  # "Hey Mac, stop the other task" → agentd stop_other (W6, wired in __main__)
 
         self.state = State.IDLE
@@ -162,6 +158,7 @@ class Orchestrator:
         self.muted = False
         self.asleep = False
         self.off = False
+        self._off_after_turn = False  # the model's mac.go_to_sleep: OFF once its goodbye is spoken (AG20)
         self.locked = False  # screen locked (app event); listening continues, Claude is told
         self.voice_ok = True
         self.voice_reason = ""
@@ -387,7 +384,11 @@ class Orchestrator:
                 and self.speech.pending(turn.id) == 0:
             self._set_state(State.THINKING, "speech idle")
 
-    def _filler(self, text: str) -> str:
+    def _filler(self, text: str) -> str | None:
+        """The instant English filler; none in another TTS language (AG19): an English line in a
+        French voice is worse than the slow-start tick that already covers the wait."""
+        if not P.is_english(self.cfg.tts.lang):
+            return None
         if not self.brain.alive:
             return P.SLOW_FILLER
         if P.is_question(text):
@@ -562,9 +563,7 @@ class Orchestrator:
             elif P.is_off_request(text):
                 await self._cancel_turn(turn, "off request", speak=False)
                 self._go_off_spoken(turn.output)
-            elif (corr := P.correction_text(text)) is not None:
-                await self._redirect(turn, text, corr, source, origin, ev.t)
-            else:
+            else:  # "actually…", "no rush, also…": the model decides how to take it (AG17)
                 self._steer(turn, text)
             return
 
@@ -590,7 +589,7 @@ class Orchestrator:
             if self.state == State.LISTENING:
                 self._set_state(State.IDLE, "ignored utterance")
             return
-        if not woke and not P.is_followup_intent(text):
+        if not woke and not P.is_followup_intent(text, english=P.is_english(self.cfg.tts.lang)):
             # A bystander fragment ("Then") must not become a Claude turn; keep listening.
             self.metrics.incr("followup_ignored")
             self.eventlog.emit("followup_ignored", source=source, text=text)
@@ -604,12 +603,6 @@ class Orchestrator:
             self._set_state(State.IDLE, "stop words")
         elif P.is_off_request(text):
             self._go_off_spoken(self._output_for_source(source))
-        elif P.is_voice_reset_request(text) and self.voice_reset is not None:
-            self._activity("voice_reset", None, text="Back to the default voice")
-            self._tasks.spawn(self.voice_reset(), "voice-reset")
-        elif (new_name := P.rename_request(text)) and self.rename is not None:
-            self._activity("rename", None, text=f"Renaming to {new_name}")
-            self._tasks.spawn(self.rename(new_name), "rename")
         else:
             await self._start_turn(text, source, origin=origin, transcript_t=ev.t)
 
@@ -629,12 +622,6 @@ class Orchestrator:
         log.debug("ignored utterance from %s (%s): %r", source, why, text)
         self.eventlog.emit("utterance_ignored", source=source, reason=why, text=text)
 
-    async def _redirect(self, turn: Turn, text: str, corr: str, source: str, origin: str, t: float) -> None:
-        self.metrics.incr("corrections")
-        self._activity("correction", turn.id, text=corr)
-        await self._cancel_turn(turn, "correction", speak=False)
-        await self._start_turn(text, source, origin=origin, transcript_t=t)
-
     # ================================================================== turns
 
     async def _start_turn(self, text: str, source: str, *, origin: str, transcript_t: float | None = None) -> Turn:
@@ -652,7 +639,8 @@ class Orchestrator:
         self.eventlog.emit("turn_start", turn_id=tid, text=text, source=source, origin=origin, output=turn.output)
         self._activity("turn_start", tid, text=text, source=source, origin=origin)
         self._set_state(State.THINKING, "new turn")
-        self._speak(turn, self._filler(text), "filler")
+        if (filler := self._filler(text)) is not None:
+            self._speak(turn, filler, "filler")
         turn.tasks.spawn(self._ask(turn), "ask")
         turn.tasks.spawn(self._narration_loop(turn), "narration")
         turn.tasks.spawn(self._slow_start(turn), "slow-start")
@@ -683,6 +671,7 @@ class Orchestrator:
             return
         self.turn = None
         self.last_turn = turn
+        self._off_after_turn = False  # stopped or superseded: the user is still talking to Mac
         turn.tasks.cancel()
         self.speech.cancel_turn(turn.id)
         self._cancel_timer("confirm")
@@ -719,6 +708,9 @@ class Orchestrator:
         self.turn = None
         self.last_turn = turn
         self._cancel_timer("thinking")
+        if self._off_after_turn:
+            self._off_after_turn = False
+            self.set_off(True)
         self.metrics.observe_since("turn_total", turn.started)
         full = " ".join(turn.assistant).strip()
         elapsed = time.monotonic() - turn.started
@@ -895,7 +887,7 @@ class Orchestrator:
             return  # a second request while one is pending: the brain answers it (N16)
         self._flush_segmenter(turn)
         target = str(ev.data.get("target") or "")
-        line = P.confirmation_line(ev.text, target)  # humanized, the raw target is never spoken
+        line = P.confirmation_line(ev.text, target, ev.data.get("question"))  # the raw target is never spoken
         turn.confirming = True
         if turn.first_text_t is None:
             turn.first_text_t = time.monotonic()  # no slow-start tick / "One moment" around the question
@@ -1100,6 +1092,14 @@ class Orchestrator:
         self._activity("off" if off else "on", None, text="Listening off" if off else "Listening on")
         if persist:
             self._tasks.spawn(asyncio.to_thread(config.update_state, listening_off=off), "persist-off")
+
+    def sleep_after_turn(self) -> None:
+        """The model's `mac.go_to_sleep()` (AG20): switch OFF when the current turn's reply has
+        been spoken (never cut its own goodbye), or now when no turn is running."""
+        if self.turn is None:
+            self.set_off(True)
+        else:
+            self._off_after_turn = True
 
     async def _sleep_brain(self) -> None:
         """Shut Claude down for OFF even if a turn was in flight: the brain ignores sleep()

@@ -135,6 +135,9 @@ class ChannelAdapter(Protocol):
     async def link(self) -> None: ...
     async def unlink(self) -> None: ...
     async def list_chats(self) -> list[dict[str, Any]]: ...
+    async def set_allowed(self, chat_ids: frozenset[str]) -> None:
+        """The allowlist from agentd's enabled profiles (W9.8). The adapter keeps the last set and
+        re-applies it after every restart of its transport. Under test mode: logged, not applied."""
 
 
 class DestinationRefused(Exception):

@@ -50,12 +50,7 @@ _APP_TARGET_RE = re.compile(r"^(?P<app>[A-Za-z][\w .'&-]*?)\s*:\s*(?P<rest>.*)$"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[\d\s().-]{6,}$")
 _HOST_RE = re.compile(r"^(?:https?://)?(?P<host>[a-z0-9-]+(?:\.[a-z0-9-]+)+)(?:[/:?#].*)?$", re.IGNORECASE)
-_CLAUSE_SPLIT_RE = re.compile(r"\s+(?:saying|that says|which says|with the text|reading|containing)\s+|[,;:]\s|\s[—–-]\s")
-_SEND_RE = re.compile(r"\b(send|sends|message|text|email|mail|reply|whatsapp|dm|tell|forward)\b")
-_POST_RE = re.compile(r"\b(post|publish|tweet|share|comment)\b")
-_DELETE_RE = re.compile(r"\b(delete|remove|erase|discard|clear|unsubscribe)\b")
-_PAY_RE = re.compile(r"\b(pay|buy|order|purchase|checkout|transfer|book|subscribe)\b")
-MAX_SUMMARY_WORDS = 25
+CONFIRM_FALLBACK_QUESTION = "Shall I go ahead?"  # when the model gave no question (AG18)
 _TRAILING_PUNCT_RE = re.compile(r"[.?!]+(['\"”’)\]]*)$")  # drop the final period, even inside closing quotes
 
 
@@ -98,34 +93,18 @@ def humanize_target(target: str) -> tuple[str, str]:
     return t.lower(), f"to {t}"
 
 
-def confirm_question(summary: str) -> str:
-    s = summary.lower()
-    if _SEND_RE.search(s):
-        return "Send it?"
-    if _POST_RE.search(s):
-        return "Post it?"
-    if _DELETE_RE.search(s):
-        return "Delete it?"
-    if _PAY_RE.search(s):
-        return "Go ahead and pay?"
-    return "Go ahead?"
+def confirmation_line(summary: str, target: str = "", question: str | None = None) -> str:
+    """The one spoken confirmation: "<summary>[ <where>]. <question>".
 
-
-def confirmation_line(summary: str, target: str = "") -> str:
-    """The one spoken confirmation: "<statement>[ <where>]. <action question>".
-
-    Long summaries are cut to their first clause; the target is added only when the summary
-    doesn't already mention it (case-insensitive)."""
+    The summary and question are the model's (its tool checks their shape). Kept deterministic:
+    invisible characters out, the hook-derived target added when the summary doesn't mention it,
+    no dashes, and a neutral question when the model gave none."""
     s = _TRAILING_PUNCT_RE.sub(r"\1", visible(summary).strip()).strip() or "I'm about to take an action"
-    if len(s.split()) > MAX_SUMMARY_WORDS:
-        first = _CLAUSE_SPLIT_RE.split(s, maxsplit=1)[0].strip().rstrip(".?!,;:")
-        s = first if first else s
-        if len(s.split()) > MAX_SUMMARY_WORDS:
-            s = " ".join(s.split()[:MAX_SUMMARY_WORDS])
     core, phrase = humanize_target(target)
     if phrase and core and core not in s.lower():
         s = f"{s} {phrase}"
-    return dedash(f"{s}. {confirm_question(summary)}")
+    q = visible(question or "").strip() or CONFIRM_FALLBACK_QUESTION
+    return dedash(f"{s}. {q}")
 
 
 def elapsed_phrase(seconds: float) -> str:
@@ -195,35 +174,6 @@ def is_stop_other(text: str) -> bool:
     return bool(n) and any(p in STOP_OTHER_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS))
 
 
-VOICE_RESET_PHRASES = frozenset(
-    {"use your default voice", "use the default voice", "default voice", "go back to your default voice",
-     "switch to your default voice", "reset your voice", "use your normal voice", "use your own voice",
-     "your default voice", "back to your default voice"}
-)
-
-
-_RENAME_RE = re.compile(
-    r"^(?:(?:please|okay|ok|hey|mac)\s+)*(?:(?:hey|ok|okay)\s+[a-z]+\s+)?(?:please\s+)?(?:call yourself|change your name(?: back)? to|go back to being|your name is now|rename yourself(?: to)?|"
-    r"from now on you're|from now on you are|your new name is|i'll call you|i will call you)\s+(?P<name>[a-z][a-z0-9 -]{0,31}?)"
-    r"(?:\s+(?:please|now|from now on|okay))*[.!]?$",
-    re.IGNORECASE,
-)
-
-
-def rename_request(text: str) -> str | None:
-    """'Hey Mac, call yourself Jarvis' → 'Jarvis'; None if not a rename."""
-    m = _RENAME_RE.match(" ".join(re.sub(r"[,!;:]", " ", text).split()))
-    if not m:
-        return None
-    name = m.group("name").strip().strip(".!").strip()
-    return name.title() if name else None
-
-
-def is_voice_reset_request(text: str) -> bool:
-    n = normalize(text)
-    return bool(n) and any(p in VOICE_RESET_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS))
-
-
 _NEG = re.compile(
     r"\b(no|nope|don'?t|not|never|cancel|stop|wait|hold on|but|instead|change|actually|after|once|before|first|"
     r"unless|except|only if)\b"
@@ -250,28 +200,6 @@ def classify_confirmation(text: str) -> str:
     return "no" if len(n.split()) <= 3 else "steer"
 
 
-_CORRECTION_RE = re.compile(
-    r"^(?:actually|no|nope|scratch that|i meant|instead)\b[\s,.;:!-]+(?P<rest>\S.*)$", re.IGNORECASE
-)
-_AGREEMENT_RE = re.compile(r"^(that|it|this|you)('s|'re| is| was|s)?\b", re.IGNORECASE)
-
-
-def correction_text(text: str) -> str | None:
-    """'Actually, make it Friday' → 'make it Friday'.
-
-    None when the lead-in is not followed by an alternative instruction: "no, that's right",
-    "actually never mind" (a stop), "wait for the page to load" (not a lead-in at all) — those are
-    steers or stops, never a cancel + redirect.
-    """
-    m = _CORRECTION_RE.match(text.strip())
-    if not m:
-        return None
-    rest = m.group("rest").strip()
-    if len(rest.split()) < 2 or _AGREEMENT_RE.match(rest) or is_stop(rest):
-        return None
-    return rest
-
-
 #: One-word replies that are a real follow-up (vs. a bystander fragment like "Then").
 SHORT_INTENTS = frozenset(
     {"continue", "next", "again", "why", "more", "repeat", "what", "how", "when", "where", "who", "yes", "yeah",
@@ -280,13 +208,19 @@ SHORT_INTENTS = frozenset(
 )
 
 
-def is_followup_intent(text: str) -> bool:
+def is_english(lang: str) -> bool:
+    """The fixed fillers and the follow-up word list are English (AG19); `tts.lang` is e.g. "en-us"."""
+    return lang.strip().lower().startswith("en")
+
+
+def is_followup_intent(text: str, *, english: bool = True) -> bool:
     """Is a wake-less follow-up utterance worth a turn? ≥ 2 words, or a known short intent
-    (affirmative/negative, stop word, "continue"/"next"/…, a number)."""
+    (affirmative/negative, stop word, "continue"/"next"/…, a number). The short-intent list is
+    English, so in another language a one-word reply ("oui") is let through rather than dropped."""
     words = normalize(text).split()
     if not words:
         return False
-    if len(words) >= 2:
+    if len(words) >= 2 or not english:
         return True
     w = words[0]
     return w in SHORT_INTENTS or w.isdigit() or w in _DIGIT_WORDS or is_stop(w) or classify_confirmation(w) == "yes"

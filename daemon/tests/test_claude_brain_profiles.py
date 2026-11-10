@@ -232,7 +232,7 @@ async def test_send_file_emits_attach_for_the_turn(make, tmp_path: Path) -> None
     async def r(c: MockClient, p: str) -> None:
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_bytes(b"%PDF-1.4 data")
-        seen["ok"] = await brain.tools.send_file({"path": "report.pdf", "caption": "Your report"})
+        seen["ok"] = await brain.tools.send_file({"path": "report.pdf"})
         seen["missing"] = await brain.tools.send_file({"path": "nope.pdf"})
         seen["dir"] = await brain.tools.send_file({"path": str(tmp_path)})
         c.push(result())
@@ -244,8 +244,8 @@ async def test_send_file_emits_attach_for_the_turn(make, tmp_path: Path) -> None
     await brain.close()
     (att,) = [e for e in evs if e.kind == K.ATTACH]
     assert att.turn_id == 3
-    assert set(att.data) == {"attach_id", "path", "caption"}
-    assert att.data["path"] == str(out_file.resolve()) and att.data["caption"] == "Your report"
+    assert set(att.data) == {"attach_id", "path"}
+    assert att.data["path"] == str(out_file.resolve())
     assert len(att.data["attach_id"]) == 32
     assert not seen["ok"].get("is_error")
     assert seen["missing"].get("is_error") and seen["dir"].get("is_error")
@@ -472,7 +472,7 @@ async def test_chat_profile_cwd_memory_persona_and_limits(make, tmp_path: Path) 
     assert not (folder / "CLAUDE.md").exists()  # write_claude_md False
     assert brain.tools.memory is shared and brain._memory is shared
     persona = MockClient.instances[0].options.system_prompt["append"]
-    assert "This channel: WhatsApp" in persona and "Name is Nikhil" in persona
+    assert "WhatsApp style" in persona and "Name is Nikhil" in persona
     assert brain._max_turn_s() == 2700
     assert brain.hook.context.whatsapp_ui_block
     assert brain.hook.context.memory_path == str(shared.path)
@@ -491,7 +491,8 @@ def test_voice_profile_defaults_are_todays(tmp_path: Path) -> None:
 
 
 def test_chat_note_has_no_dashes() -> None:
-    assert "—" not in prompts.CHAT_CHANNEL_NOTE and "–" not in prompts.CHAT_CHANNEL_NOTE
+    chat = prompts.persona_prompt(config.Config(), channel="chat", never_chat_names=("Timetable",))
+    assert "—" not in chat and "–" not in chat
     for reason in (cb.REASON_DESKTOP_BUSY_CHAT, cb.REASON_DESKTOP_BUSY_VOICE):
         assert "—" not in reason and "–" not in reason
 

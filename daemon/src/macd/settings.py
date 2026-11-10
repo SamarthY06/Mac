@@ -71,6 +71,17 @@ def wake_phrases_for(name: str) -> list[str]:
     return [f"hey {n}", f"ok {n}"]
 
 
+def rename_refusal(name: str) -> str | None:
+    """Why `name` can't be the assistant's name (it and its wake phrases are set all or nothing),
+    or None. Pure, so agentd's rename tool answers truthfully before macd applies it (N11)."""
+    try:
+        validate("name", name)
+        validate("wake.phrases", wake_phrases_for(name))
+    except ValueError as e:
+        return str(e)
+    return None
+
+
 @dataclass
 class Settings:
     cfg: config.Config

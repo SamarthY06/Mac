@@ -77,7 +77,7 @@ async def test_hello_reply_and_kind_from_token_not_payload(agent):
     r = await c.hello(VOICE_TOKEN, [V], kind="app", client_kind="app")
     assert r["ok"]
     d = r["data"]
-    assert d["api"] == "1.0" and d["kind"] == "voice" and d["boot"] == agent.svc.boot
+    assert d["api"] == "1.1" and d["kind"] == "voice" and d["boot"] == agent.svc.boot
     assert d["conversations"] == [V] and d["interrupted"] == []
     s.decode_response(r, "hello")
     # the voice token still may not use an app op
@@ -95,9 +95,9 @@ async def test_unknown_token_and_test_kind_are_unauthorized(agent):
 
 async def test_version_mismatch_plain_message_and_close(agent):
     c = await Client.open(agent.sock)
-    r = await c.hello(VOICE_TOKEN, [V], api="1.1")
+    r = await c.hello(VOICE_TOKEN, [V], api="1.0")
     assert r["code"] == "version_mismatch"
-    assert r["error"] == ("agentd speaks API 1.0 but this client speaks 1.1. "
+    assert r["error"] == ("agentd speaks API 1.1 but this client speaks 1.0. "
                           "Restart Mac to update all parts together.")
     await asyncio.wait_for(c.closed.wait(), 2)
 
@@ -125,7 +125,7 @@ async def test_chat_config_path_cannot_come_from_the_request(agent, short_root):
 
 async def test_chat_ops_on_an_ungranted_conversation(agent):
     c = await agent.client(CHAT_TOKEN, [CHAT])
-    r = await c.call({"op": "ask", "conv": "whatsapp:999@g.us", "turn": 1, "text": "hi"})
+    r = await c.call({"op": "ask", "conv": "whatsapp:555@g.us", "turn": 1, "text": "hi"})
     assert r["code"] == "forbidden_conversation"
 
 
@@ -168,15 +168,100 @@ async def test_voice_ask_event_stream_and_turn_uid(agent):
     assert agent.brain(V).asks[0][1] == "calendar"
 
 
-async def test_busy_and_steer_false_after_done(agent):
-    agent.scripts[V] = lambda t: slow(n=10, delay=0.02) if t == "long" else None
+async def test_busy_and_voice_steer_after_done_continues_the_turn(agent):
+    agent.scripts[V] = lambda t: slow(n=10, delay=0.02) if t == "long" else [fb.text(f"re: {t}")]
     c = await agent.client()
-    await c.call({"op": "ask", "conv": V, "turn": 1, "text": "long"})
+    uid = (await c.call({"op": "ask", "conv": V, "turn": 1, "text": "long"}))["data"]["turn_uid"]
     assert (await c.call({"op": "ask", "conv": V, "turn": 2, "text": "again"}))["code"] == "busy"
     assert (await c.call({"op": "steer", "conv": V, "turn": 1, "text": "more"}))["data"] == {"accepted": True}
     await c.event("done")
-    assert (await c.call({"op": "steer", "conv": V, "turn": 1, "text": "late"}))["data"] == {"accepted": False}
-    assert (await c.call({"op": "interrupt", "conv": V, "turn": 1}))["data"] == {"stopped": False}
+    # local ClaudeBrain semantics: a steer for the just-finished turn is a new query on that turn
+    assert (await c.call({"op": "steer", "conv": V, "turn": 1, "text": "late"}))["data"] == {"accepted": True}
+    ev = await c.event("text", pred=lambda e: e["text"] == "re: late")
+    assert ev["turn"] == 1 and ev["turn_uid"] == uid
+    assert (await c.event("done"))["turn_uid"] == uid
+    # never for an older turn, another epoch, or a stopped turn
+    assert (await c.call({"op": "steer", "conv": V, "turn": 7, "text": "x"}))["data"] == {"accepted": False}
+    await c.call({"op": "ask", "conv": V, "turn": 2, "text": "long"})
+    await c.call({"op": "interrupt", "conv": V, "turn": 2})
+    await c.event("done", pred=lambda e: e["turn"] == 2)
+    assert (await c.call({"op": "steer", "conv": V, "turn": 2, "text": "x"}))["data"] == {"accepted": False}
+    assert (await c.call({"op": "interrupt", "conv": V, "turn": 2}))["data"] == {"stopped": False}
+
+
+async def test_voice_steer_crossing_done_keeps_its_events(agent):
+    agent.scripts[V] = lambda t: [fb.text(f"re: {t}")]
+    c = await agent.client()
+    uid = (await c.call({"op": "ask", "conv": V, "turn": 1, "text": "hi"}))["data"]["turn_uid"]
+    await c.event("done")
+    conv = agent.svc.convs[V]
+    internal = conv.last_finished.internal
+    await conv.brain.steer(internal, "crossed")  # the steer reached the brain just after its DONE
+    ev = await c.event("text", pred=lambda e: e["text"] == "re: crossed")
+    assert ev["turn_uid"] == uid and (await c.event("done"))["turn_uid"] == uid
+    assert conv.running() is None and agent.svc.convs[V].record.running is None
+
+
+async def test_brain_error_text_passes_through_empty(agent):
+    from macd.contracts import BrainErrorKind
+
+    agent.scripts[V] = lambda t: [fb.error(BrainErrorKind.NETWORK, "")]
+    c = await agent.client()
+    await c.call({"op": "ask", "conv": V, "turn": 1, "text": "hi"})
+    ev = await c.event("error")
+    assert ev["kind"] == "network" and ev["message"] == ""
+
+
+async def test_voice_side_connection_without_voice_conv_is_neutral(agent):
+    from macd import config
+
+    config.update_state(brain={"session_id": "voice-s1", "updated_at": 1.0})
+    agent.scripts[V] = lambda t: slow(n=100, delay=0.01)
+    main = await agent.client(epoch="e1")
+    await main.call({"op": "ask", "conv": V, "turn": 1, "text": "long"})
+    await main.event("say")
+    side = await agent.client(VOICE_TOKEN, [], epoch="other")  # local-mode stop_other connection
+    assert (await side.call({"op": "stop_other"}))["data"] == {"stopped": []}
+    await side.close()
+    await asyncio.sleep(0.4)  # beyond the 0.2 s grace
+    assert agent.svc.convs[V].running() is not None  # neither epoch rule touched the voice turn
+    assert agent.brain(V).interrupts == []
+    side2 = await Client.open(agent.sock)
+    await side2.hello(VOICE_TOKEN, [], epoch="x")
+    assert agent.svc.convs[V].record.voice_migrated is True  # migrated by the real hello only
+
+
+async def test_voice_side_connection_does_not_migrate(agent):
+    side = await Client.open(agent.sock)
+    assert (await side.hello(VOICE_TOKEN, [], epoch="x"))["ok"]
+    assert s.VOICE_CONV not in agent.svc.convs
+
+
+async def test_voice_ask_does_not_wait_for_the_record_fsync(agent, monkeypatch):
+    from agentd import stores
+
+    real = stores.atomic_write_json
+    gate = __import__("threading").Event()
+
+    def slow_write(path, obj):
+        gate.wait(2)
+        real(path, obj)
+
+    c = await agent.client()
+    monkeypatch.setattr(stores, "atomic_write_json", slow_write)
+    t0 = time.monotonic()
+    await c.call({"op": "ask", "conv": V, "turn": 1, "text": "hi"})
+    await c.event("text")
+    assert time.monotonic() - t0 < 0.5  # the fsync is still blocked, the voice turn is not
+    gate.set()
+    await c.event("done")
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if not agent.svc._save_pending:
+            break
+    await agent.svc.persist()
+    rec = __import__("json").loads((agent.paths.state_dir / "conversations.json").read_text())
+    assert rec["conversations"][V]["running"] is None
 
 
 async def test_chat_steer_false_after_done_and_unacked_until_ack(agent):
@@ -547,7 +632,40 @@ async def test_voice_settings_reach_the_brain(agent):
 
 
 async def test_question_kind_single_enum():
-    assert [k.value for k in s.QuestionKind] == ["confirm", "folder_approval", "route", "catch_up", "restart"]
+    assert [k.value for k in s.QuestionKind] == ["confirm", "folder_approval", "route", "catch_up", "restart",
+                                                 "profile"]
     with pytest.raises(s.SchemaError):
         s.QuestionEvent(conv=CHAT, boot="b", seq=1, question_id="q", kind=s.QuestionKind.CONFIRM, text="", expires_at=0)
     s.QuestionStatus(question_id="q", kind=s.QuestionKind.CONFIRM, text="")
+
+
+async def test_brain_liveness_is_pushed_on_every_change(agent):
+    c = await agent.client()
+    alive = lambda ev: ev.get("data", {}).get("alive") is not None
+    await c.call({"op": "warm", "conv": V})
+    assert (await c.event("status", pred=alive))["data"] == {"alive": True}
+    await c.call({"op": "sleep", "conv": V})  # idle shutdown looks the same: the process went away
+    assert (await c.event("status", pred=alive))["data"] == {"alive": False}
+    await c.call({"op": "warm", "conv": V})
+    assert (await c.event("status", pred=alive))["data"] == {"alive": True}
+    conv = agent.svc.convs[V]
+    conv._on_alive(True)  # a repeated callback with no change pushes nothing
+    first = agent.brain(V)
+    await first._out.put(None)  # the brain's event stream ends: it crashed
+    assert (await c.event("status", pred=alive))["data"] == {"alive": False}
+    assert conv.brain is None
+    assert (await c.call({"op": "status", "conv": V}))["data"]["alive"] is False
+    await c.call({"op": "warm", "conv": V})  # a new brain, not the dead one
+    assert (await c.event("status", pred=alive))["data"] == {"alive": True}
+    assert agent.brain(V) is not first
+
+
+async def test_brain_on_alive_callback_pushes_status(agent):
+    c = await agent.client()
+    await c.call({"op": "warm", "conv": V})
+    alive = lambda ev: ev.get("data", {}).get("alive") is not None
+    await c.event("status", pred=alive)
+    b = agent.brain(V)
+    b.alive = False  # ClaudeBrain's idle shutdown, reported through on_alive
+    b.spec.on_alive(False)
+    assert (await c.event("status", pred=alive))["data"] == {"alive": False}

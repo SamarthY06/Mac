@@ -116,23 +116,37 @@ class Agent:
         return c
 
 
-def write_chat_config(mac_home: Path, chats: list[str], never: list[str]) -> None:
+def write_chat_config(mac_home: Path, chats: list[str], never: list[str], extra: str = "") -> None:
     p = mac_home / "chat" / "config.toml"
     p.parent.mkdir(parents=True, exist_ok=True)
     ids = [c.split(":", 1)[1] for c in chats]
     nids = [c.split(":", 1)[1] for c in never]
     p.write_text("[channels.whatsapp]\nenabled = true\n"
-                 f"chats = {json.dumps(ids)}\nnever_chats = {json.dumps(nids)}\n")
+                 f"chats = {json.dumps(ids)}\nnever_chats = {json.dumps(nids)}\n{extra}")
+
+
+def write_pairing(mac_home: Path, entries: dict[str, Any]) -> None:
+    p = mac_home / "chat" / "pairing.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(entries))
 
 
 async def make_agent(root: Path, *, scripts: dict[str, fb.Script] | None = None, boot: str | None = None,
                      voice_grace_s: float = 0.2, queue_events: int = s.CLIENT_QUEUE_EVENTS,
                      uid: int | None = None, clock: Callable[[], float] | None = None,
-                     lag_interval_s: float = 0.1, model: MockModel | None = None) -> Agent:
+                     lag_interval_s: float = 0.1, model: MockModel | None = None,
+                     full_caps: bool = True, config: bool = True,
+                     pairing: dict[str, Any] | None = None) -> Agent:
+    """A real agentd on a tmp HOME. The seed gives CHAT and OTHER_CHAT profiles from the old
+    `chats` key; `full_caps` makes sure they have every capability, so the pre-profile tests
+    keep their folders and router."""
     home = root / "home"
     home.mkdir(exist_ok=True)
     paths = AgentPaths(home=home, mac_home=root / "mac", log_dir=root / "logs")
-    write_chat_config(paths.mac_home, [CHAT, OTHER_CHAT, NEVER_CHAT], [NEVER_CHAT])
+    if config:
+        write_chat_config(paths.mac_home, [CHAT, OTHER_CHAT, NEVER_CHAT], [NEVER_CHAT])
+    if pairing is not None:
+        write_pairing(paths.mac_home, pairing)
     model = model or MockModel()
     agent_box: list[Agent] = []
 
@@ -153,6 +167,11 @@ async def make_agent(root: Path, *, scripts: dict[str, fb.Script] | None = None,
     agent = Agent(root, paths, svc, server, model, dict(scripts or {}))
     agent_box.append(agent)
     await svc.start()
+    if full_caps:
+        for conv in (CHAT, OTHER_CHAT):
+            channel, _, cid = conv.partition(":")
+            if svc.profiles.get(channel, cid) is not None:
+                await svc.profiles.update(channel, cid, {"capabilities": dict.fromkeys(s.CAPABILITIES, True)})
     await server.start()
     return agent
 
@@ -170,6 +189,7 @@ class Client:
         self.frames: list[dict[str, Any]] = []  # everything received, in order
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.errors: list[dict[str, Any]] = []  # id-less errors
+        self.notices: list[Any] = []  # profile_changed
         self.closed = asyncio.Event()
         self._task = asyncio.create_task(self._read())
 
@@ -183,7 +203,9 @@ class Client:
             while line := await self.r.readline():
                 obj = json.loads(line)
                 self.frames.append(obj)
-                if "ev" in obj:
+                if obj.get("ev") in s.NOTICES:
+                    self.notices.append(s.decode_notice(obj))  # connection-level, no conv or seq
+                elif "ev" in obj:
                     s.decode_event(obj)  # every event matches the schema
                     self.events.put_nowait(obj)
                 elif (f := self.replies.pop(obj.get("id"), None)) is not None:

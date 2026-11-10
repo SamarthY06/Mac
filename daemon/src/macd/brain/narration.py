@@ -10,6 +10,22 @@ _SILENT = {"mcp__mac__say", "mcp__mac__request_confirmation", "mcp__mac__remembe
            "TodoWrite", "mcp__claude-in-chrome__tabs_context_mcp"}
 _TELL_APP = re.compile(r"""tell\s+application\s+(?:id\s+)?["']([^"']+)["']""", re.IGNORECASE)
 _CHROME = "mcp__claude-in-chrome__"
+DESCRIPTION_MAX_CHARS = 60
+_DASH = re.compile(r"\s*[\u2013\u2014]\s*|\s+-\s+")
+_INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff\u00ad]")
+
+
+def model_description(inp: dict[str, Any]) -> str | None:
+    """AG13: the model's own `description` of the call (Bash, Task, Agent carry one), cleaned for
+    speech and chat: invisible characters out, dashes to commas, one line, no trailing period.
+    None when absent or longer than DESCRIPTION_MAX_CHARS (the template is used then)."""
+    raw = inp.get("description")
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(_DASH.sub(", ", _INVISIBLE.sub("", raw)).split()).strip(" ,").rstrip(".")
+    if not text or len(text) > DESCRIPTION_MAX_CHARS:
+        return None
+    return text[0].upper() + text[1:]
 
 
 def _host(url: str) -> str:
@@ -65,6 +81,10 @@ def describe_tool(name: str, tool_input: dict[str, Any] | None) -> str | None:
         return None
     if name.startswith(_CHROME):
         return _chrome(name.removeprefix(_CHROME), inp)
+    if not name.startswith("mcp__"):  # Chrome and mac.* keep their templates
+        described = model_description(inp)
+        if described:
+            return described
     if name == "Bash":
         cmd = str(inp.get("command", ""))
         m = _TELL_APP.search(cmd)

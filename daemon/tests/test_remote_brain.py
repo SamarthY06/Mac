@@ -872,3 +872,108 @@ async def test_real_agentd_process_two_macd_lifetimes(agentd_process: Path) -> N
             assert await brain.stop_other() == []
         finally:
             await brain.close()
+
+
+# ----------------------------------------------------------------------------- AG15/AG16/AG18 wiring
+
+
+async def test_rename_and_reset_voice_tools_reach_settings() -> None:
+    """Local mode: ClaudeBrain's mac.rename_assistant / mac.reset_voice call macd's callbacks, which
+    go through the one settings path (name + wake phrases) and report a refusal in plain words."""
+    from macd.brain.gate import ConfirmationGate
+    from macd.settings import Settings
+
+    d = _daemon()
+    brain = d._make_brain(ConfirmationGate())
+    assert brain.tools.on_rename == d._rename and brain.tools.on_reset_voice == d._reset_voice
+    assert brain.tools.on_go_to_sleep == d._go_to_sleep
+    assert await d._go_to_sleep() == "Mac is still starting up"
+    assert await d._rename("Jarvis") == "settings are not ready yet"
+    d.settings = Settings(d.cfg, save=lambda cfg: None)
+    assert await d._rename("Jarvis") is None
+    assert d.cfg.name == "Jarvis" and d.cfg.wake.phrases == ["hey jarvis", "ok jarvis"]
+    assert "wake phrase" in (await d._rename("Hal 9000") or "")  # a wake phrase must be letters
+    assert d.cfg.name == "Jarvis"
+    assert "voice is unavailable" in (await d._reset_voice() or "")  # no speech stack in tests
+
+
+async def test_remote_rename_and_reset_voice_status_events(short_root: Path) -> None:
+    calls: list[Any] = []
+
+    async def rename(name: str) -> None:
+        calls.append(("rename", name))
+
+    async def reset() -> None:
+        calls.append(("reset",))
+
+    async def sleep() -> None:
+        calls.append(("sleep",))
+
+    script = [fb.Step(K.STATUS, data={"rename": {"name": "Jarvis"}}), fb.Step(K.STATUS, data={"reset_voice": {}}),
+              fb.Step(K.STATUS, data={"go_to_sleep": {}}), fb.text("Done.")]
+    agentd = await start_agentd(short_root, lambda spec: fb.FakeBrain(lambda t: list(script)))
+    brain = await connect(agentd, on_rename=rename, on_reset_voice=reset, on_go_to_sleep=sleep)
+    try:
+        await brain.ask(1, "call yourself Jarvis, use your normal voice, then go to sleep")
+        evs = await collect(brain)
+        await wait_until(lambda: len(calls) == 3)
+    finally:
+        await brain.close()
+        await agentd.stop()
+    assert calls == [("rename", "Jarvis"), ("reset",), ("sleep",)]
+    assert [e.kind for e in evs] == [K.TEXT, K.DONE]  # handled in macd, not HUD statuses
+
+
+async def test_remote_rename_refusal_reaches_the_model(short_root: Path) -> None:
+    """N11: agentd's rename tool callback runs macd's pure check first, so an invalid name comes
+    back to the model as the reason (never "Renamed"), and macd is only told about a valid one."""
+    calls: list[str] = []
+    specs: list[BrainSpec] = []
+
+    async def rename(name: str) -> None:
+        calls.append(name)
+
+    def make(spec: BrainSpec) -> Any:
+        specs.append(spec)
+        return fb.FakeBrain()
+
+    agentd = await start_agentd(short_root, make)
+    brain = await connect(agentd, on_rename=rename)
+    try:
+        await brain.ask(1, "hello")
+        await collect(brain)
+        on_rename = next(sp.on_rename for sp in specs if sp.on_rename is not None)
+        assert "wake phrase" in (on_rename("Hal 9000") or "")
+        assert on_rename("Jarvis") is None
+        await wait_until(lambda: calls == ["Jarvis"])
+    finally:
+        await brain.close()
+        await agentd.stop()
+    assert P.confirmation_line("x", "", None).endswith(P.CONFIRM_FALLBACK_QUESTION)
+
+
+def test_remote_confirm_carries_the_models_question() -> None:
+    brain = RemoteBrain(Config(), token=lambda: None)
+    base = {"ev": "confirm", "conv": V, "boot": "b", "seq": 1, "turn": 3, "turn_uid": "b:v:e:3",
+            "question_id": "q1", "summary": "I'll delete the draft to Bob", "target": "Mail: Delete"}
+    brain._on_event({**base, "question": "Delete it?"})
+    brain._on_event({**base, "seq": 2, "question_id": "q2"})
+    a, b = brain._out.get_nowait(), brain._out.get_nowait()
+    assert a.kind is K.CONFIRM and a.data["question"] == "Delete it?" and "question" not in b.data
+    assert P.confirmation_line(a.text, a.data["target"], a.data.get("question")) == \
+        "I'll delete the draft to Bob in Mail. Delete it?"
+    assert P.confirmation_line(b.text, b.data["target"], b.data.get("question")).endswith(P.CONFIRM_FALLBACK_QUESTION)
+
+
+async def test_alive_is_pushed_by_agentd_without_polling(short_root: Path) -> None:
+    agentd = await start_agentd(short_root, lambda spec: fb.FakeBrain())
+    brain = await connect(agentd)
+    try:
+        assert not hasattr(rb, "ALIVE_POLL_S")
+        await agentd.svc.warm(V)  # agentd-side change, no op from this client
+        await wait_until(lambda: brain.alive is True)
+        await agentd.svc.sleep(V)
+        await wait_until(lambda: brain.alive is False)
+    finally:
+        await brain.close()
+        await agentd.stop()

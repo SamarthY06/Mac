@@ -37,4 +37,5 @@ packages = ["src/macd"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-markers = ["models: needs downloaded speech models", "live: needs claude login / hardware"]
+markers = ["models: needs downloaded speech models", "live: needs claude login / hardware",
+           "perf: benchmarks; run alone and serially (-m perf)"]

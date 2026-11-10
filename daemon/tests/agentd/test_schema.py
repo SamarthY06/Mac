@@ -74,9 +74,24 @@ def _field_names(cls) -> set[str]:
     return {f.name for f in fields(cls)}
 
 
+def _op_rows(text: str) -> list[tuple[str, list[str]]]:
+    """(op, [op, args, data]) from every op table, whatever other columns it has ("kinds" in
+    §4.6, "notes" elsewhere): the header row names the columns."""
+    out, cols = [], None
+    for cells in _table_rows(text):
+        if cells[0] == "op":
+            cols = cells
+            continue
+        m = re.fullmatch(r"`(\w+)`", cells[0])
+        if m and cols:
+            row = dict(zip(cols, cells, strict=False))
+            out.append((m.group(1), [cells[0], row.get("args", ""), row.get("data", "")]))
+    return out
+
+
 # ----------------------------------------------------------------------------- doc vs schema
 
-OP_ROWS = _first_col_names(_section("4. Ops"))
+OP_ROWS = _op_rows(_section("4. Ops"))
 EV_ROWS = _first_col_names(_section("6. Events"))
 CODE_ROWS = _first_col_names(_section("7. Error codes"))
 
@@ -135,8 +150,9 @@ def test_event_error_kinds_match_doc():
 
 
 def test_single_question_kind_enum_matches_doc():
-    assert "One enum in `agentd/schema.py`: `confirm|folder_approval|route|catch_up|restart`" in DOC
-    assert [k.value for k in s.QuestionKind] == ["confirm", "folder_approval", "route", "catch_up", "restart"]
+    assert "One enum in `agentd/schema.py`: `confirm|folder_approval|route|catch_up|restart|profile`" in DOC
+    assert [k.value for k in s.QuestionKind] == ["confirm", "folder_approval", "route", "catch_up", "restart",
+                                                 "profile"]
 
 
 def test_close_and_reply_outcomes_match_doc():
@@ -162,12 +178,45 @@ def test_api_version_and_limits_match_doc():
 
 # ----------------------------------------------------------------------------- doc examples
 
+def _raw_blocks() -> list[str]:
+    return re.findall(r"```json\n(.*?)```", DOC, flags=re.DOTALL)
+
+
 def _json_blocks() -> list[dict]:
-    return [json.loads(b) for b in re.findall(r"```json\n(.*?)```", DOC, flags=re.DOTALL)]
+    """The three single-object examples; the `profile_changed` block (one notice per line, with
+    an elided `{...}` profile) is checked by its own test."""
+    return [json.loads(b) for b in _raw_blocks() if "profile_changed" not in b]
 
 
-def test_doc_has_the_three_json_examples():
-    assert len(_json_blocks()) == 3
+def test_doc_has_the_json_examples():
+    assert len(_json_blocks()) == 3 and len(_raw_blocks()) == 4
+
+
+PROFILE = {"channel": "whatsapp", "chat_id": "1203...@g.us", "display_name": "Interview prep", "enabled": True,
+           "persona": "", "trigger": "prefix", "prefix": "Mac", "shared": True,
+           "default_workspace": "~/Desktop/Personal/Resume",
+           "capabilities": dict.fromkeys(s.CAPABILITIES, True), "confirm_files": True, "rev": 3,
+           "created_at": 1762790000.0, "updated_at": 1762790001.5}
+
+
+def test_profile_changed_notice_examples_round_trip():
+    (block,) = [b for b in _raw_blocks() if "profile_changed" in b]
+    lines = [json.loads(ln.replace("{...}", json.dumps(PROFILE))) for ln in block.strip().splitlines()]
+    assert len(lines) == 2
+    for wire in lines:
+        n = s.decode_notice(wire)
+        assert isinstance(n, s.ProfileChanged) and s.encode_notice(n) == wire
+    assert s.decode_notice(lines[0]).profile.capabilities.outward_sends is True
+    assert s.decode_notice(lines[1]).deleted is True and "conv" not in lines[1] and "seq" not in lines[1]
+
+
+def test_profile_fields_and_capabilities_match_doc():
+    sec = _section("4. Ops")
+    m = re.search(r"profile = \{(.*?)\}\n```", sec, flags=re.DOTALL)
+    caps = re.search(r"capabilities: \{([^}]*)\}", m.group(1)).group(1)
+    assert [c.strip() for c in caps.split(",")] == list(s.CAPABILITIES) == [f.name for f in fields(s.Capabilities)]
+    top = _names(re.sub(r"capabilities: \{[^}]*\}", "capabilities", m.group(1)).replace("\n", " "))
+    assert top == _field_names(s.Profile)
 
 
 def test_hello_request_example_round_trips():
@@ -194,14 +243,14 @@ def test_status_reply_example_round_trips():
 
 
 def test_version_mismatch_text_is_the_doc_text():
-    m = re.search(r'`error: "(agentd speaks API 1\.0 [^"]+)"`', DOC)
+    m = re.search(r'`error: "(agentd speaks API 1\.1 but this client speaks 1\.0[^"]+)"`', DOC)
     assert m and "Restart Mac to update all parts together." in m.group(1)
 
 
 # ----------------------------------------------------------------------------- every op, response and event
 
 REQUESTS = {
-    "hello": {"api": "1.0", "token": "ab" * 32, "client": "chatd/0.9.0", "client_epoch": "cd" * 16,
+    "hello": {"api": "1.1", "token": "ab" * 32, "client": "chatd/0.9.0", "client_epoch": "cd" * 16,
               "conversations": ["whatsapp:1203@g.us"]},
     "ask": {"conv": "whatsapp:1203@g.us", "turn": 3, "text": "find me 20 jobs",
             "attachments": [{"path": "/tmp/a.pdf", "kind": "document", "name": "a.pdf"}],
@@ -225,10 +274,17 @@ REQUESTS = {
     "status": {"conv": "voice:local"},
     "pause": {"conv": "whatsapp:1203@g.us", "value": True, "reason": "loop"},
     "ws_list": {}, "ws_approve": {"path": "~/Desktop/Personal/Resume"}, "ws_remove": {"path": "~/x"},
+    "profile_list": {},
+    "profile_create": {"channel": "whatsapp", "chat_id": "1203@g.us", "display_name": "Interview prep",
+                       "owner_only": False, "persona": "Reply in Hindi", "capabilities": {"web": True}},
+    "profile_set": {"channel": "whatsapp", "chat_id": "1203@g.us", "rev": 3, "patch": {"enabled": False}},
+    "profile_delete": {"channel": "whatsapp", "chat_id": "1203@g.us"},
+    "profile_command": {"conv": "whatsapp:1203@g.us", "command": "add", "subject": "Book club",
+                        "chat_id": "999@g.us", "owner_only": True},
 }
 
 RESPONSES = {
-    "hello": {"api": "1.0", "server": "agentd/0.9.0", "kind": "chat", "boot": "00ff",
+    "hello": {"api": "1.1", "server": "agentd/0.9.0", "kind": "chat", "boot": "00ff",
               "conversations": ["whatsapp:1203@g.us"], "interrupted": []},
     "ask": {"turn_uid": "00ff:whatsapp:1203@g.us:cdcd:3"}, "steer": {"accepted": False},
     "interrupt": {"stopped": True}, "new_session": {}, "reset": {}, "warm": {}, "sleep": {},
@@ -241,6 +297,8 @@ RESPONSES = {
                                   "unacked": [], "loop_lag_ms_p99": 0.4}]},
     "pause": {"paused": True}, "ws_list": {"workspaces": [{"path": "~/R", "name": "R", "approved": True, "settings_changed": False}]},
     "ws_approve": {"settings_hash": "ab" * 32}, "ws_remove": {},
+    "profile_list": {"rev": 7, "profiles": [PROFILE]}, "profile_create": {"profile": PROFILE},
+    "profile_set": {"profile": PROFILE}, "profile_delete": {}, "profile_command": {"question_id": "q9"},
 }
 
 T = {"conv": "voice:local", "boot": "00ff", "seq": 7, "turn": 2, "turn_uid": "00ff:voice:local:cdcd:2"}

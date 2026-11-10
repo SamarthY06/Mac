@@ -30,6 +30,10 @@ Chat profile (WhatsApp ARCHITECTURE W3.3), switched on through `GateContext`:
   (for example "Timetable") is catastrophic with code ``never_chat``.
 - ``.env`` files are readable only inside ``env_exempt_dir`` (default: the workspace), and only
   when that folder is one of Mac's own workspaces under ``~/.mac-agent`` (F10).
+- ``capabilities`` (v3.4, W9.5): the chat's granted tool classes (a set, or a callable read at
+  every decision; None = voice, no check). Every tool has one row in ``TOOL_MAP``; a call needs
+  every class `tool_classes()` gives it, an unknown tool (user MCP servers included) is denied.
+  Order: whatsapp_ui and the never-list, then a missing capability, then the rules above.
 
 `ConfirmationGate` is owned by the orchestrator and shared with the brain: the model asks
 via ``mcp__mac__request_confirmation``; the orchestrator speaks the summary, listens for a
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import logging
 import os
 import posixpath
@@ -51,8 +56,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentd.schema import (  # one table for what the user sees (UX5)
+    CAPABILITIES,
+    CAPABILITY_WORDS,
+)
 from macd import config
 from macd.brain import shell
+from macd.brain.prompts import check_persona
 from macd.contracts import GateVerdict
 
 log = logging.getLogger(__name__)
@@ -70,6 +80,7 @@ class GateDecision:
     code: str = "ok"
     reason: str = ""
     target: str = ""  # normalised recipient/host/label; part of the confirmation fingerprint
+    detail: str = ""  # shown with the confirmation, not part of the fingerprint (set_persona's text)
 
     @property
     def always_denied(self) -> bool:
@@ -119,6 +130,12 @@ SENSITIVE_ROOTS: tuple[str, ...] = (
     "~/Library/Application Support/Firefox",
     "~/Library/Application Support/1Password",
 )
+
+# I1: Mac's own policy, tokens, binaries and WhatsApp keys, under ~/.mac-agent (and MAC_HOME).
+# Never read or written by any tool: the profile store, pairing.json, chat config, the bridge binary,
+# dev tokens, device.db. The workspace and agent/chats/* stay usable.
+MAC_PRIVATE: tuple[str, ...] = ("agent/state", "run", "bin", "chat", "config.toml")
+MAC_READABLE: tuple[str, ...] = ("chat/whatsapp/media",)  # inbound attachments: read, never written
 
 SENSITIVE_BASENAMES: tuple[str, ...] = (
     "*.pem", "*.key", "*.p12", "*.pfx", "*.keychain", "*.keychain-db",
@@ -248,6 +265,9 @@ REASON_WHATSAPP_UI = ("WhatsApp's own screens are off limits on this channel, re
 MAC_SEND_FILE = "mcp__mac__send_file"
 MAC_TEST_OUTWARD = "mcp__mac__test_outward"
 MAC_CONFIRM = "mcp__mac__request_confirmation"
+MAC_SET_PERSONA = "mcp__mac__set_persona"
+CAPABILITY = "capability"  # reason code prefix: capability:<name> (W9.5)
+UNKNOWN_TOOL = "unknown_tool"
 
 UI_RETURN_COMBOS = {"return", "enter", "cmd+return", "cmd+enter", "ctrl+return", "ctrl+enter",
                     "shift+return", "shift+enter", "cmd+shift+d", "kp_enter"}
@@ -273,7 +293,12 @@ class GateContext:
     never_chat_names: tuple[str, ...] = ()  # chat: outward actions naming these are catastrophic
     env_exempt_dir: str | None = None  # .env readable here (None: the workspace); F10 limits it
     memory_path: str | None = None  # an injected shared memory.md is a memory file too
-    shared_chat: bool = False  # mac.send_file is outward in a chat with other members
+    # mac.send_file is outward (a bound yes): profile.confirm_files (P6); a callable is read per call
+    confirm_send_file: bool | Callable[[], bool] = False
+    # Chat profile capabilities (W9.5): granted classes, or a callable read at each decision.
+    # None = voice: no capability check at all.
+    capabilities: frozenset[str] | Callable[[], frozenset[str]] | None = None
+    display_name: str = ""  # the chat's name, for capability denials and the set_persona target
 
 
 def _read_small_file(path: str, limit: int = 256 * 1024) -> str | None:
@@ -311,6 +336,9 @@ class _Paths:
         self.home = posixpath.normpath(ctx.home)
         self.workspace = posixpath.normpath(ctx.workspace).lower()
         self.sensitive = [self._abs(self.expand_tilde(p), "/").lower() for p in SENSITIVE_ROOTS]
+        mac_homes = {posixpath.join(self.home, ".mac-agent").lower(), posixpath.normpath(str(config.HOME)).lower()}
+        self.mac_private = [posixpath.join(h, sub) for h in sorted(mac_homes) for sub in MAC_PRIVATE]
+        self.mac_readable = [posixpath.join(h, sub) for h in sorted(mac_homes) for sub in MAC_READABLE]
         self.sensitive_names = tuple(n.lower() for n in SENSITIVE_BASENAMES)
         self.protected = [_segments(self.expand_tilde(p)) for p in PROTECTED_ROOTS]
         self.memory_files = {
@@ -362,8 +390,9 @@ class _Paths:
     def _under(self, p: str, root: str) -> bool:
         return p == root or p.startswith(root.rstrip("/") + "/")
 
-    def sensitive_reason(self, raw: str, cwd: str, glob: bool = False) -> str | None:
-        """Return a reason string if `raw` (a path-ish word) names sensitive data."""
+    def sensitive_reason(self, raw: str, cwd: str, glob: bool = False, write: bool = False) -> str | None:
+        """Return a reason string if `raw` (a path-ish word) names sensitive data. `write`: the
+        path is written (Mac's inbound media folder is readable, never writable)."""
         if not raw or raw.startswith("-") and "=" not in raw:
             return None
         path = self.norm(raw, cwd)
@@ -380,6 +409,11 @@ class _Paths:
                     return f"{raw} is inside a protected secrets location"
                 if glob and _seg_match(_segments(cand)[: len(_segments(root))], _segments(root), True):
                     return f"{raw} may match a protected secrets location"
+            readable = not write and not glob and any(self._under(cand, r) for r in self.mac_readable)
+            for root in () if readable else self.mac_private:
+                if self._under(cand, root) or (
+                        glob and _seg_match(_segments(cand)[: len(_segments(root))], _segments(root), True)):
+                    return f"{raw} is Mac's own settings, tokens or keys"
         base = posixpath.basename(lowered)
         if base in ENV_TEMPLATE_NAMES:
             return None
@@ -396,7 +430,7 @@ class _Paths:
 
     def is_ancestor_of_sensitive(self, raw: str, cwd: str) -> bool:
         p = self.norm(raw, cwd).lower().rstrip("/") + "/"
-        return any(root.startswith(p) for root in self.sensitive)
+        return any(root.startswith(p) for root in [*self.sensitive, *self.mac_private])
 
     def is_memory_file(self, raw: str, cwd: str) -> bool:
         return self.norm(raw, cwd).lower() in self.memory_files
@@ -423,6 +457,7 @@ class _BashAnalyzer:
             "TMPDIR": ["/tmp"],
         }
         self.cwd = paths.ctx.workspace
+        self.commands: set[str] = set()  # every command name seen, nested ones included (tool_classes)
 
     # -- entry -------------------------------------------------------------------------
     def analyze(self, src: str, depth: int = 0) -> GateDecision:
@@ -570,6 +605,7 @@ class _BashAnalyzer:
     def _command(self, c: _Cmd, depth: int, stdin: str | None,
                  pipeline_words: list[shell.Word], feeds: bool = False) -> GateDecision:
         found: list[GateDecision] = []
+        self.commands.add(c.name)
         if c.name in SUDO_LIKE:
             return GateDecision("catastrophic", "sudo", f"{c.name} (privilege escalation) is never allowed")
         found.append(self._catastrophic(c, pipeline_words))
@@ -753,7 +789,11 @@ class _BashAnalyzer:
                     sub == "find-certificate" and "-p" in raw):
                 return GateDecision("sensitive_read", "keychain_cli", f"security {sub} reads the keychain")
         # Redirects first: `echo key >> ~/.ssh/authorized_keys` is a write by a "harmless" command.
-        for t, glob in self.words(list(c.cmd.redirects_out) + list(c.cmd.redirects_in)):
+        for t, glob in self.words(c.cmd.redirects_out):
+            reason = self.p.sensitive_reason(t, self.cwd, glob, write=True)
+            if reason:
+                return GateDecision("sensitive_read", "sensitive_redirect", reason)
+        for t, glob in self.words(c.cmd.redirects_in):
             reason = self.p.sensitive_reason(t, self.cwd, glob)
             if reason:
                 return GateDecision("sensitive_read", "sensitive_redirect", reason)
@@ -1019,7 +1059,7 @@ def _file_tool(name: str, inp: dict[str, Any], paths: _Paths) -> GateDecision:
         target = str(inp.get("file_path") or inp.get("notebook_path") or "")
         if target and paths.is_memory_file(target, cwd):
             return GateDecision("sensitive_read", MEMORY_WRITE, "memory files are append-only via remember")
-        reason = paths.sensitive_reason(target, cwd) if target else None
+        reason = paths.sensitive_reason(target, cwd, write=True) if target else None
         return GateDecision("sensitive_read", "sensitive_write", reason) if reason else ALLOW
     if name in _FILE_READ_TOOLS:
         target = str(inp.get("file_path") or inp.get("notebook_path") or "")
@@ -1194,7 +1234,7 @@ def _never_chat(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateC
     if not names:
         return None
     if tool_name == MAC_CONFIRM:
-        texts = [str(inp.get("summary", ""))]
+        texts = [str(inp.get("summary", "")), str(inp.get("question", ""))]
     elif d.verdict == "outward":
         texts = [d.target, d.reason]
     else:
@@ -1207,6 +1247,17 @@ def _never_chat(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateC
     return None
 
 
+def _confirm_files(ctx: GateContext) -> bool:
+    flag = ctx.confirm_send_file
+    if not callable(flag):
+        return bool(flag)
+    try:
+        return bool(flag())
+    except Exception:  # the live profile could not be read: ask
+        log.exception("gate: confirm_send_file unavailable")
+        return True
+
+
 def _mac_send_file(inp: dict[str, Any], paths: _Paths, ctx: GateContext) -> GateDecision:
     target = str(inp.get("path", ""))
     reason = paths.sensitive_reason(target, ctx.workspace) if target else None
@@ -1214,8 +1265,8 @@ def _mac_send_file(inp: dict[str, Any], paths: _Paths, ctx: GateContext) -> Gate
         return GateDecision("sensitive_read", "sensitive_path", reason)
     if target and paths.is_memory_file(target, ctx.workspace):
         return GateDecision("sensitive_read", "sensitive_path", f"{target} is Mac's private memory")
-    if ctx.shared_chat:
-        return GateDecision("outward", "send_file", "sends a file into a chat with other members",
+    if _confirm_files(ctx):
+        return GateDecision("outward", "send_file", "sends a file into this chat",
                             target=posixpath.basename(target))
     return ALLOW
 
@@ -1230,24 +1281,38 @@ def analyze(tool_name: str, tool_input: dict[str, Any] | None,
             wa = _whatsapp_ui(tool_name, inp, ctx)
             if wa is not None:
                 return wa
-        d = _analyze(tool_name, inp, ctx)
+        d, commands = _analyze(tool_name, inp, ctx)
         if ctx.never_chat_names:
-            return _never_chat(tool_name, inp, d, ctx) or d
-        return d
+            never = _never_chat(tool_name, inp, d, ctx)
+            if never is not None:
+                return never
     except Exception:
         log.exception("gate: classifier error for %s", tool_name)
+        if ctx.capabilities is not None:  # N2: a chat never gets a yes for a call it could not check
+            return GateDecision("sensitive_read", "classifier_error", "Mac could not check this action")
         return GateDecision("outward", "classifier_error", "could not verify this action")
+    if ctx.capabilities is None or d.verdict == "catastrophic":  # keep the stronger denial
+        return d
+    return _capability(tool_name, d, commands, ctx) or d
 
 
-def _analyze(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecision:
+def _analyze(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> tuple[GateDecision, frozenset[str]]:
+    """The decision, plus the command names a Bash call runs (empty for other tools)."""
     paths = _Paths(ctx)
+    if tool_name == "Bash":
+        bash = _BashAnalyzer(paths)
+        return bash.analyze(str(inp.get("command", ""))), frozenset(bash.commands)
+    return _analyze_tool(tool_name, inp, ctx, paths), frozenset()
+
+
+def _analyze_tool(tool_name: str, inp: dict[str, Any], ctx: GateContext, paths: _Paths) -> GateDecision:
     if tool_name == MAC_SEND_FILE:
         return _mac_send_file(inp, paths, ctx)
+    if tool_name == MAC_SET_PERSONA:
+        return _mac_set_persona(inp, ctx)
     if tool_name == MAC_TEST_OUTWARD:  # harmless tool for the live test: always needs a yes
         return GateDecision("outward", "test_outward", "test action that needs confirmation",
                             target=str(inp.get("target", "test")))
-    if tool_name == "Bash":
-        return _BashAnalyzer(paths).analyze(str(inp.get("command", "")))
     if tool_name in _FILE_WRITE_TOOLS | _FILE_READ_TOOLS | {"Grep", "Glob"}:
         return _file_tool(tool_name, inp, paths)
     if tool_name.startswith("mcp__mac__ui_"):
@@ -1260,6 +1325,96 @@ def _analyze(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecis
             return GateDecision("outward", "mcp_write", f"{short} looks like it sends or changes something",
                                 target=tool_name)
     return ALLOW
+
+
+# ----------------------------------------------------------------------------- capabilities (W9)
+
+# W9.1 (P5): every tool a chat brain can call has exactly ONE row ("" = no capability needed).
+# Patterns are fnmatch. A tool that matches no row is unknown and denied in chat, which covers
+# user MCP servers and the voice-only tools (rename_assistant, reset_voice, go_to_sleep).
+TOOL_MAP: dict[str, tuple[str, ...]] = {
+    "": ("mcp__mac__say", "mcp__mac__request_confirmation", "mcp__mac__notify",
+         "mcp__mac__switch_workspace", "mcp__mac__set_persona", "TodoWrite", "Task", "Agent"),
+    "files_read": ("Read", "NotebookRead", "Glob", "Grep", "LS", "mcp__mac__remember", "mcp__mac__forget",
+                   "mcp__mac__rewrite_memory"),
+    "files_write": ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell"),
+    "chrome": ("mcp__claude-in-chrome__*",),
+    "web": ("WebSearch", "WebFetch"),
+    "desktop": ("mcp__mac__ui_*", "mcp__mac__screenshot", "mcp__mac__open_app", "mcp__mac__frontmost"),
+    "send_file": ("mcp__mac__send_file",),
+    "outward_sends": ("mcp__mac__test_outward",),
+}
+# Bash commands that drive the screen or other apps (osascript UI scripting, `open`): + desktop.
+_DESKTOP_COMMANDS = frozenset({"osascript", "open", "screencapture", "cliclick", "shortcuts"})
+# Outward tools whose yes is their own rule, not an outward send (send_file: confirm_files).
+_OWN_CONFIRM = frozenset({MAC_SEND_FILE, MAC_SET_PERSONA})
+
+
+def map_rows(tool_name: str) -> list[str]:
+    """The TOOL_MAP rows (capability names, "" = none needed) that list `tool_name`."""
+    return [cap for cap, pats in TOOL_MAP.items() if any(fnmatch.fnmatchcase(tool_name, p) for p in pats)]
+
+
+def _classes(tool_name: str, d: GateDecision, commands: frozenset[str]) -> set[str] | None:
+    rows = map_rows(tool_name)
+    if len(rows) != 1:
+        return None
+    classes = {rows[0]} - {""}
+    if commands & _DESKTOP_COMMANDS:
+        classes.add("desktop")
+    if d.verdict == "outward" and tool_name not in _OWN_CONFIRM:
+        classes.add("outward_sends")  # a webmail send: chrome + outward_sends
+    return classes
+
+
+def tool_classes(tool_name: str, tool_input: dict[str, Any] | None,
+                 context: GateContext | None = None) -> set[str] | None:
+    """The capabilities a call needs (W9.1): its TOOL_MAP row, + desktop for a Bash call that runs
+    osascript or `open`, + outward_sends for any outward verdict. None: the tool is unknown (no
+    row), so a chat denies it. Uses the same parsing as `analyze`."""
+    ctx = context or GateContext()
+    d, commands = _analyze(tool_name, tool_input or {}, ctx)
+    return _classes(tool_name, d, commands)
+
+
+def _granted(ctx: GateContext) -> frozenset[str]:
+    caps = ctx.capabilities
+    try:
+        got = caps() if callable(caps) else caps
+        return frozenset(got or ())
+    except Exception:  # the live profile could not be read: fail closed
+        log.exception("gate: capabilities unavailable")
+        return frozenset()
+
+
+def _capability(tool_name: str, d: GateDecision, commands: frozenset[str],
+                ctx: GateContext) -> GateDecision | None:
+    classes = _classes(tool_name, d, commands)
+    if classes is None:
+        log.warning("gate: unknown tool %s denied in this chat", tool_name)
+        return GateDecision("sensitive_read", UNKNOWN_TOOL, "that tool is not available in this chat",
+                            target=tool_name)
+    granted = _granted(ctx)  # one read of the live profile per decision
+    missing = [c for c in CAPABILITIES if c in classes and c not in granted]
+    if not missing:
+        return None
+    cap = missing[0]  # `code` stays internal; the reason is plain words the model relays (UX5)
+    where = f"Mac \u25b8 WhatsApp \u25b8 {ctx.display_name}" if ctx.display_name else "Mac \u25b8 WhatsApp"
+    return GateDecision("sensitive_read", f"{CAPABILITY}:{cap}",
+                        f"this chat can't use {CAPABILITY_WORDS[cap]}. You can turn it on in {where}, "
+                        f'or say "Mac, allow {CAPABILITY_WORDS[cap]}"', target=cap)
+
+
+def _mac_set_persona(inp: dict[str, Any], ctx: GateContext) -> GateDecision:
+    """A bound yes for every valid new persona; the yes is tied to this exact text. An invalid
+    text is allowed through so the tool itself returns the error, without asking anyone."""
+    text, problem = check_persona(inp.get("text"))
+    if problem:
+        return ALLOW
+    digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+    # UX4: the target is the chat's name (display only; the digest in the code binds the yes)
+    return GateDecision("outward", f"set_persona:{digest}", "changes the instructions for this chat",
+                        target=ctx.display_name or "this chat", detail=text)
 
 
 def classify(tool_name: str, tool_input: dict[str, Any] | None,

@@ -146,7 +146,7 @@ def test_send_file_rules() -> None:
     assert analyze("mcp__mac__send_file", {"path": f"{HOME}/keys/server.pem"}, ctx).verdict == "sensitive_read"
     mem = GateContext(home=HOME, workspace=CHAT_WS, user="alice", memory_path=f"{WS}/memory.md")
     assert analyze("mcp__mac__send_file", {"path": f"{WS}/memory.md"}, mem).verdict == "sensitive_read"
-    shared = chat(shared_chat=True)
+    shared = chat(confirm_send_file=True)
     d = analyze("mcp__mac__send_file", {"path": f"{CHAT_WS}/report.pdf"}, shared)
     assert d.verdict == "outward" and d.target == "report.pdf"
 

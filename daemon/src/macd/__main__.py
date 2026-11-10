@@ -41,7 +41,7 @@ from macd.remote.livekit_bridge import (
     RemoteUnavailable,
     configured,
 )
-from macd.settings import Settings, wake_phrases_for
+from macd.settings import Settings, rename_refusal, wake_phrases_for
 from macd.speech.models import missing_models
 from macd.speech_queue import SpeechQueue
 
@@ -193,11 +193,14 @@ class Daemon:
                 self._spawn(self._notify(title, body, path), "notify")
 
             brain = RemoteBrain(self.cfg, token=lambda: voice_token(self.lifeline_line), epoch=self.client_epoch,
-                                on_notify=notify, chrome_status_cb=chrome_status)
+                                on_notify=notify, chrome_status_cb=chrome_status, on_rename=self._rename,
+                                on_reset_voice=self._reset_voice, on_go_to_sleep=self._go_to_sleep)
             self.remote_gate = brain.gate
             return brain
 
         return ClaudeBrain(self.cfg, gate, chrome_status_cb=chrome_status, on_notify=self._notify_app,
+                           on_rename=self._rename, on_reset_voice=self._reset_voice,
+                           on_go_to_sleep=self._go_to_sleep,
                            recent_user_text=lambda n=10: self.orch.recent_user_text(n) if self.orch else [])
 
     async def _stop_other(self) -> list[str]:
@@ -367,7 +370,6 @@ class Daemon:
             gate = self.remote_gate or gate  # remote mode: RemoteGate answers by question id (V1)
             self.orch = Orchestrator(self.cfg, brain=self.brain, gate=gate, speech=self.speech,
                                      eventlog=self.eventlog, metrics=self.metrics, earcon=earcon,
-                                     voice_reset=self._voice_reset, rename=self._rename,
                                      stop_other=self._stop_other)
             self.orch.set_voice(self.stack is not None, self.voice_reason)
             if self.stack is not None:
@@ -423,12 +425,34 @@ class Daemon:
         if self.stack is not None:
             await self.stack.tts.prewarm(list(PREWARM_PHRASES))
 
-    async def _rename(self, name: str) -> None:
-        """Spoken "call yourself Jarvis": name + wake phrases through the same settings path."""
-        if self.settings is not None:
-            res = await self.settings.set({"name": name, "wake.phrases": wake_phrases_for(name)})
-            if res["errors"]:
-                log.warning("rename to %r failed: %s", name, res["errors"])
+    async def _rename(self, name: str) -> str | None:
+        """The model's `mac.rename_assistant(name)` (AG15): the model decides that the user asked;
+        the tool has checked the name, and the wake phrases and settings path stay deterministic.
+        None when done, else the plain reason (the tool's error for the model)."""
+        if self.settings is None:
+            return "settings are not ready yet"
+        if refused := rename_refusal(name):  # all or nothing: never a name without its wake phrases
+            return refused
+        res = await self.settings.set({"name": name, "wake.phrases": wake_phrases_for(name)})
+        if res["errors"]:
+            log.warning("rename to %r failed: %s", name, res["errors"])
+            return "; ".join(f"{k}: {v}" for k, v in res["errors"].items())
+        return None
+
+    async def _reset_voice(self) -> str | None:
+        """The model's `mac.reset_voice()` (AG16): back to the default (Kokoro) voice."""
+        try:
+            await self._voice_reset()
+        except ValueError as e:
+            return str(e)
+        return None
+
+    async def _go_to_sleep(self) -> str | None:
+        """The model's `mac.go_to_sleep()` (AG20): OFF once the current reply has been spoken."""
+        if self.orch is None:
+            return "Mac is still starting up"
+        self.orch.sleep_after_turn()
+        return None
 
     async def _prewarm(self) -> None:
         await self.stack.warmup()  # one STT + TTS inference

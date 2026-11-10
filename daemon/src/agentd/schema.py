@@ -1,4 +1,4 @@
-"""The agentd API, version 1.0, as one schema module (docs/agentd-api.md is the source text).
+"""The agentd API, version 1.1, as one schema module (docs/agentd-api.md is the source text).
 
 Every request op, response payload, event and error code of the contract is a dataclass or an
 enum here, and `tests/agentd/test_schema.py` checks this module against the markdown file. Change
@@ -22,7 +22,7 @@ from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import cache
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
-API_VERSION = "1.0"
+API_VERSION = "1.1"
 MAX_LINE_BYTES = 1 << 20  # 1 MiB per line
 REPLAY_BUFFER_EVENTS = 2_000  # per conversation
 CLIENT_QUEUE_EVENTS = 10_000  # per connection, then slow_client
@@ -52,6 +52,12 @@ class ErrorCode(str, enum.Enum):
     BUSY = "busy"
     STALE_QUESTION = "stale_question"
     PAUSED = "paused"
+    PROFILE_NOT_FOUND = "profile_not_found"
+    PROFILE_EXISTS = "profile_exists"
+    PROFILE_CONFLICT = "profile_conflict"
+    NEVER_LISTED = "never_listed"
+    WORKSPACE_NOT_APPROVED = "workspace_not_approved"
+    PROFILES_UNAVAILABLE = "profiles_unavailable"
     GAP = "gap"
     SLOW_CLIENT = "slow_client"
     INTERNAL = "internal"
@@ -82,6 +88,7 @@ class QuestionKind(str, enum.Enum):
     ROUTE = "route"
     CATCH_UP = "catch_up"
     RESTART = "restart"
+    PROFILE = "profile"  # 1.1: add group / allow; a quoted yes or a 👍 only, 10 min
 
 
 class ReplyOutcome(str, enum.Enum):
@@ -167,6 +174,9 @@ class QuestionStatus:
     kind: QuestionKind
     text: str
     expires_at: float | None = None
+    question: str | None = None  # confirm only: the model's own question (ConfirmEvent.question)
+    target: str | None = None  # confirm only: re-posted prompts can show "To: <target>"
+    detail: str | None = None  # confirm only (set_persona): the full new text, below the prompt
 
 
 @dataclass(kw_only=True)
@@ -195,6 +205,48 @@ class Workspace:
     name: str
     approved: bool
     settings_changed: bool
+
+
+CAPABILITIES = ("files_read", "files_write", "chrome", "web", "desktop", "send_file", "outward_sends")
+# the one plain-words table (UX phase 2 review): every user-facing string names a capability by these
+CAPABILITY_WORDS = {"files_read": "reading files", "files_write": "writing files", "chrome": "Chrome",
+                    "web": "the web", "desktop": "the desktop", "send_file": "sending files",
+                    "outward_sends": "sending messages for you"}
+PERSONA_MAX_CHARS = 2000  # W9.1; agentd validates, prompts.py renders with the same limits
+PERSONA_MAX_LINES = 40
+
+
+@dataclass(kw_only=True)
+class Capabilities:
+    """Tool classes a chat may use (W9.1). A missing key is false (fails closed)."""
+
+    files_read: bool = False
+    files_write: bool = False
+    chrome: bool = False
+    web: bool = False
+    desktop: bool = False
+    send_file: bool = False
+    outward_sends: bool = False
+
+
+@dataclass(kw_only=True)
+class Profile:
+    """One chat's settings (api §4.6, ARCHITECTURE W9.1)."""
+
+    channel: str
+    chat_id: str
+    display_name: str
+    enabled: bool
+    persona: str
+    trigger: Literal["all", "prefix"]
+    prefix: str
+    shared: bool
+    capabilities: Capabilities
+    confirm_files: bool
+    rev: int
+    created_at: float
+    updated_at: float
+    default_workspace: str | None = None  # None: no folder (left out on the wire)
 
 
 # ----------------------------------------------------------------------------- ops (api §4)
@@ -387,7 +439,7 @@ class Pause(Op):
     OP: ClassVar[str] = "pause"
     conv: str
     value: bool
-    reason: Literal["loop", "user", "members_changed"] | None = None
+    reason: Literal["loop", "user", "members_changed", "never_listed"] | None = None
 
 
 # 4.5 workspaces
@@ -408,10 +460,66 @@ class WsRemove(Op):
     path: str
 
 
+# 4.6 profiles (1.1)
+@dataclass(kw_only=True)
+class ProfileList(Op):
+    OP: ClassVar[str] = "profile_list"
+
+
+@dataclass(kw_only=True)
+class ProfileCreate(Op):
+    """`fields`: any other profile field except `rev` and the times, validated by agentd."""
+
+    OP: ClassVar[str] = "profile_create"
+    channel: str
+    chat_id: str
+    display_name: str
+    owner_only: bool
+    enabled: bool | None = None
+    persona: str | None = None
+    trigger: Literal["all", "prefix"] | None = None
+    prefix: str | None = None
+    shared: bool | None = None
+    default_workspace: str | None = None
+    capabilities: dict[str, Any] | None = None
+    confirm_files: bool | None = None
+
+
+@dataclass(kw_only=True)
+class ProfileSet(Op):
+    OP: ClassVar[str] = "profile_set"
+    channel: str
+    chat_id: str
+    rev: int
+    patch: dict[str, Any]
+
+
+@dataclass(kw_only=True)
+class ProfileDelete(Op):
+    OP: ClassVar[str] = "profile_delete"
+    channel: str
+    chat_id: str
+
+
+@dataclass(kw_only=True)
+class ProfileCommand(Op):
+    """An owner command chatd parsed (W9.3). `add`: subject, chat_id, owner_only; `allow` and
+    `disallow`: capability."""
+
+    OP: ClassVar[str] = "profile_command"
+    conv: str
+    command: Literal["add", "allow", "disallow"]
+    subject: str | None = None
+    chat_id: str | None = None
+    owner_only: bool | None = None
+    capability: str | None = None
+
+
 OPS: dict[str, type[Op]] = {c.OP: c for c in (
     Hello, Ask, Steer, Interrupt, NewSession, Reset, Warm, Sleep, Handoff, Cancel, StopOther,
     Confirm, RevokeAll, QuestionPosted, Reply, SetContext, SetLanguage, SetName, VoiceSettings,
-    ConnectCheck, Subscribe, Ack, Status, Pause, WsList, WsApprove, WsRemove)}
+    ConnectCheck, Subscribe, Ack, Status, Pause, WsList, WsApprove, WsRemove,
+    ProfileList, ProfileCreate, ProfileSet, ProfileDelete, ProfileCommand)}
 
 
 # ----------------------------------------------------------------------------- response data
@@ -499,6 +607,23 @@ class WsApproveData:
 
 
 @dataclass(kw_only=True)
+class ProfileListData:
+    rev: int
+    profiles: list[Profile]
+
+
+@dataclass(kw_only=True)
+class ProfileData:  # profile_create, profile_set
+    profile: Profile
+
+
+@dataclass(kw_only=True)
+class ProfileCommandData:
+    question_id: str | None = None  # add, allow: the profile question that follows
+    applied: bool | None = None  # disallow
+
+
+@dataclass(kw_only=True)
 class GapData:
     """`data` of a `gap` error response."""
 
@@ -514,6 +639,8 @@ RESPONSE_DATA: dict[str, Any] = {
     "set_name": Empty, "voice_settings": Empty, "connect_check": ConnectCheckData,
     "subscribe": SubscribeData, "ack": Empty, "status": ConversationStatus | StatusAll,
     "pause": PauseData, "ws_list": WsListData, "ws_approve": WsApproveData, "ws_remove": Empty,
+    "profile_list": ProfileListData, "profile_create": ProfileData, "profile_set": ProfileData,
+    "profile_delete": Empty, "profile_command": ProfileCommandData,
 }
 
 
@@ -583,6 +710,8 @@ class ConfirmEvent(TurnEvent):
     question_id: str
     summary: str
     target: str
+    question: str | None = None  # the model's own question ("Delete the draft to Bob?"), AG10/AG18
+    detail: str | None = None  # set_persona only: the full new text; chatd shows it after a blank line
 
 
 @dataclass(kw_only=True)
@@ -659,14 +788,30 @@ EVENTS: dict[str, type[Event]] = {c.EV: c for c in (
     QuestionClosedEvent, AttachEvent, StatusEvent, DoneEvent, ErrorEvent, InterruptedEvent)}
 
 
+# connection-level notices: no conv, no seq, never replayed (api §4.6)
+@dataclass(kw_only=True)
+class ProfileChanged:
+    EV: ClassVar[str] = "profile_changed"
+    rev: int  # the store-wide profiles_rev
+    channel: str
+    chat_id: str
+    profile: Profile | None = None
+    deleted: bool | None = None
+
+
+NOTICES: dict[str, type[Any]] = {ProfileChanged.EV: ProfileChanged}
+
+
 # ----------------------------------------------------------------------------- policy (api §3)
 
 _VOICE_OPS = frozenset({"ask", "steer", "interrupt", "confirm", "revoke_all", "reset", "warm", "sleep",
                         "handoff", "set_context", "set_language", "set_name", "voice_settings",
                         "connect_check", "status", "subscribe", "stop_other"})
 _CHAT_OPS = frozenset({"ask", "steer", "interrupt", "reply", "question_posted", "new_session",
-                       "set_context", "status", "subscribe", "ack", "pause", "ws_list"})
-_APP_OPS = frozenset({"status", "cancel", "pause", "ws_list", "ws_approve", "ws_remove"})
+                       "set_context", "status", "subscribe", "ack", "pause", "ws_list", "profile_list",
+                       "profile_command"})
+_APP_OPS = frozenset({"status", "cancel", "pause", "ws_list", "ws_approve", "ws_remove", "profile_list",
+                      "profile_create", "profile_set", "profile_delete"})
 
 KIND_OPS: dict[ClientKind, frozenset[str]] = {
     ClientKind.VOICE: _VOICE_OPS | {"hello"},
@@ -869,3 +1014,15 @@ def decode_event(obj: dict[str, Any]) -> Event:
 
 def is_event(obj: dict[str, Any]) -> bool:
     return "ev" in obj
+
+
+def encode_notice(n: Any) -> dict[str, Any]:
+    return {"ev": n.EV, **to_json(n)}
+
+
+def decode_notice(obj: dict[str, Any]) -> Any:
+    name = obj.get("ev")
+    cls = NOTICES.get(name) if isinstance(name, str) else None
+    if cls is None:
+        raise SchemaError(f"unknown notice {name!r}")
+    return from_dict(cls, {k: v for k, v in obj.items() if k != "ev"})

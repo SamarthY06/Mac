@@ -14,6 +14,7 @@ change: RemoteBrain implements `contracts.Brain` and RemoteGate the orchestrator
   the question it answers (agentd rejects it with `stale_question` once that one is closed).
 - **Long ops** (B2): `handoff` and `connect_check` reply `{accepted}` at once; their results arrive
   as `status{handoff_done}` and `status{connect_check}` events, which these methods await.
+- **Liveness:** `alive` is agentd's pushed `status{alive}` (read once from `status` per connect).
 - **agentd unreachable:** `ask` ends the turn with ERROR(internal) and a plain line; the connection
   is retried with backoff (api §8), and `warm()` retries at once.
 """
@@ -25,7 +26,7 @@ import contextlib
 import json
 import logging
 import secrets
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,6 @@ OP_TIMEOUT_S = 5.0
 ASK_CONNECT_WAIT_S = 1.0  # an ask waits this long for a reconnect in progress, then fails plainly
 HANDOFF_WAIT_S = 65.0  # agentd bounds the handoff at 60 s
 CONNECT_CHECK_WAIT_S = 30.0  # agentd bounds the check at 25 s
-ALIVE_POLL_S = 60.0  # `alive` is also refreshed after every turn, warm and sleep
 _AGENTD_GENERIC_ERROR = "Something went wrong."  # agentd's stand-in for an empty brain message
 
 _ERROR_KINDS = {k.value: k for k in BrainErrorKind}
@@ -259,6 +259,9 @@ class RemoteBrain:
     def __init__(self, cfg: Config, *, token: Callable[[], str | None], sock_path: Path | None = None,
                  on_notify: Callable[[str, str, str | None], Any] | None = None,
                  chrome_status_cb: Callable[[bool], None] | None = None, epoch: str | None = None,
+                 on_rename: Callable[[str], Awaitable[Any]] | None = None,
+                 on_reset_voice: Callable[[], Awaitable[Any]] | None = None,
+                 on_go_to_sleep: Callable[[], Awaitable[Any]] | None = None,
                  client: str = CLIENT_NAME, backoff_s: tuple[float, ...] = BACKOFF_S) -> None:
         self.cfg = cfg
         self.epoch = epoch or secrets.token_hex(16)
@@ -272,6 +275,9 @@ class RemoteBrain:
         self._on_notify = on_notify
         self._chrome_cb = chrome_status_cb
         self._chrome: bool | None = None
+        self._on_rename = on_rename  # mac.rename_assistant in agentd's brain → macd settings (AG15)
+        self._on_reset_voice = on_reset_voice  # mac.reset_voice → macd's TTS (AG16)
+        self._on_go_to_sleep = on_go_to_sleep  # mac.go_to_sleep → OFF after the reply (AG20)
         self._alive = False
         self._link: AgentLink | None = None
         self._task: asyncio.Task[None] | None = None
@@ -362,12 +368,10 @@ class RemoteBrain:
             self._kick.set()  # retry the connection now (W6)
             return
         self._push_settings(link)
-        await self._call(s.Warm(conv=CONV), timeout=30.0)
-        await self._refresh_alive()
+        await self._call(s.Warm(conv=CONV), timeout=30.0)  # status{alive} precedes the answer
 
     async def sleep(self) -> None:
         await self._call(s.Sleep(conv=CONV))
-        await self._refresh_alive()
 
     async def handoff(self) -> bool:
         link = self._link
@@ -481,15 +485,16 @@ class RemoteBrain:
                 await asyncio.wait_for(self.connected.wait(), wait_s)
         return self._link
 
-    async def _refresh_alive(self) -> None:
-        data = await self._call(s.Status(conv=CONV))
-        if data is not None and "alive" in data:
-            self._alive = bool(data["alive"])
-
     def _spawn(self, coro: Any) -> None:
         t = asyncio.create_task(coro)
         self._bg.add(t)
-        t.add_done_callback(self._bg.discard)
+
+        def done(task: asyncio.Task[Any]) -> None:
+            self._bg.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                log.warning("remote brain callback failed: %r", task.exception())
+
+        t.add_done_callback(done)
 
     # -- connection ----------------------------------------------------------------------
     async def _run(self) -> None:
@@ -545,11 +550,7 @@ class RemoteBrain:
 
     async def _serve(self, link: AgentLink) -> None:
         try:
-            while not link.closed.is_set():
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(link.closed.wait(), ALIVE_POLL_S)
-                if not link.closed.is_set():
-                    self._spawn(self._refresh_alive())
+            await link.closed.wait()
         finally:
             if self._link is link:
                 self._link = None
@@ -589,6 +590,8 @@ class RemoteBrain:
         if ev.conv != CONV:
             return
         out = self._translate(ev)
+        if out is not None and out.kind is BrainEventKind.CONFIRM and isinstance(obj.get("question"), str):
+            out.data["question"] = obj["question"]  # the model's action question (AG10, AG18)
         if out is not None:
             self._out.put_nowait(out)
 
@@ -622,7 +625,6 @@ class RemoteBrain:
             data: dict[str, Any] = {"interrupted": bool(ev.data.interrupted), "duration_s": ev.data.duration_s}
             if ev.data.cost is not None:
                 data["cost_usd"] = ev.data.cost
-            self._spawn(self._refresh_alive())
             return BrainEvent(K.DONE, ev.turn, data=data)
         if isinstance(ev, s.ErrorEvent):
             if ev.turn is None:
@@ -630,7 +632,6 @@ class RemoteBrain:
                 return None
             self._open_turns.discard(ev.turn)
             self.gate._turn_ended(ev.turn)
-            self._spawn(self._refresh_alive())
             kind = _ERROR_KINDS.get(ev.kind.value, BrainErrorKind.INTERNAL)
             # agentd fills an empty brain message with a generic line; the orchestrator's one
             # table (errors.MESSAGES) says it better per kind.
@@ -659,8 +660,17 @@ class RemoteBrain:
                 while len(self._early_checks) > 8:
                     self._early_checks.pop(next(iter(self._early_checks)))
             return None
-        if "alive" in data:
-            self._alive = bool(data["alive"])
+        if "alive" in data:  # agentd pushes liveness changes; not a HUD status
+            self._alive = bool(data.pop("alive"))
+        rename = data.pop("rename", None)
+        if isinstance(rename, dict):
+            rename = rename.get("name")
+        if isinstance(rename, str) and rename.strip() and self._on_rename is not None:
+            self._spawn(self._on_rename(rename.strip()))
+        if data.pop("reset_voice", None) is not None and self._on_reset_voice is not None:
+            self._spawn(self._on_reset_voice())
+        if data.pop("go_to_sleep", None) is not None and self._on_go_to_sleep is not None:
+            self._spawn(self._on_go_to_sleep())
         notify = data.pop("notify", None)
         if isinstance(notify, dict) and self._on_notify is not None:
             try:

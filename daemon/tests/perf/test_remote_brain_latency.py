@@ -8,7 +8,7 @@ with path checks), this test drives voice turns through `RemoteBrain` and measur
 TEXT, SAY and TOOL_START. The baseline is the same script on an in-process FakeBrain.
 
 Gate: added p95 under 20 ms for each, and agentd's loop lag p99 under 10 ms during the run.
-`MAC_PERF_TURNS` (default 300) sets the number of voice turns; the numbers are printed (`-s`).
+Run it on its own: `uv run pytest -q -s -m perf`. `MAC_PERF_TURNS` (default 300) sets the number of voice turns; the numbers are printed (`-s`).
 
 This file is also the agentd/chat-client entry point: `python <this file> serve <root>` and
 `python <this file> chat <socket>`.
@@ -30,6 +30,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1] / "agentd"))
 
@@ -43,6 +45,8 @@ TURNS = int(os.environ.get("MAC_PERF_TURNS", "300"))
 BUDGET_MS = 20.0
 LAG_BUDGET_MS = 10.0
 KINDS = (K.TEXT, K.SAY, K.TOOL_START)
+
+pytestmark = pytest.mark.perf  # a benchmark: run alone, serially (`-m perf`), not in the fast suite
 
 
 def voice_script(_text: str) -> list[fb.Step]:

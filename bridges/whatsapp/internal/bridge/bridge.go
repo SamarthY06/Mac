@@ -1012,6 +1012,7 @@ func (b *Bridge) inbound(in *Inbound) {
 		"chat":          in.Chat,
 		"msg":           in.MsgID,
 		"sender_device": in.SenderDevice,
+		"from_me":       in.IsFromMe, // raw, so chatd can re-check owner-ness (N10)
 		"text":          in.Text,
 		"sent_at":       float64(in.Timestamp.UnixMilli()) / 1000,
 		"replayed":      replayed,

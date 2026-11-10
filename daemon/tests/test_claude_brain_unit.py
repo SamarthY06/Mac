@@ -460,7 +460,7 @@ async def test_memory_allowed_only_when_asked(make_brain, tmp_path: Path) -> Non
     out: dict[str, Any] = {}
 
     async def r(c: MockClient, p: str) -> None:
-        out[p] = await brain.tools.remember({"fact": "likes tea"})
+        out[p] = await brain.tools.remember({"fact": "likes tea", "explicit": True})
         c.push(result())
 
     brain = make_brain(r)
@@ -935,7 +935,7 @@ def test_persona_language_instruction(tmp_path: Path) -> None:
     assert "## Language" not in prompts.persona_prompt(cfg, memory_path=tmp_path / "m.md")
     cfg.tts.lang = "hi"
     text = prompts.persona_prompt(cfg, memory_path=tmp_path / "m.md")
-    assert "Speak Hindi" in text and "talks to you in English" in text
+    assert "Speak Hindi" in text and "talks to you in English" not in text  # AG12: no claim about the user
     cfg.tts.lang = "pt-br"
     assert "Brazilian Portuguese" in prompts.persona_prompt(cfg, memory_path=tmp_path / "m.md")
     assert prompts.language_name("cmn") == "Mandarin Chinese" and prompts.language_name("xx") == ""

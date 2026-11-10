@@ -18,9 +18,9 @@ K = s.QuestionKind
 NOW = 1000.0
 
 
-def q(kind: K, ref: str = "p1", options: int = 2) -> Question:
-    opts = [{"label": "Resume", "keys": ["resume", "yes"]}, {"label": "generally", "keys": ["general", "no"]}]
-    return Question("q1", kind, "?", NOW + 60, prompt_ref=ref, payload={"options": opts[:options]})
+def q(kind: K, ref: str = "p1", options: int = 2, yes: int | None = 0) -> Question:
+    opts = [{"label": "Resume", "keys": ["resume", "1"]}, {"label": "generally", "keys": ["general", "2"]}]
+    return Question("q1", kind, "?", NOW + 60, prompt_ref=ref, payload={"options": opts[:options], "yes": yes})
 
 
 def reply(**kw) -> s.Reply:
@@ -33,6 +33,22 @@ def reply(**kw) -> s.Reply:
                                        ("maybe", None)])
 def test_yes_no(text, want):
     assert yes_no(text) == want
+
+
+@pytest.mark.parametrize("text,want", [("Yes, go ahead", "yes"), ("yes send it", "yes"), ("sure, thanks", "yes"),
+                                       ("ok do it", "yes"), ("absolutely", "yes"), ("no not now", "no"),
+                                       ("not yet", "no"), ("yes, but to Ann", None), ("hmm", None),
+                                       ("no, send it to Bob", None)])
+def test_yes_no_widened_reuses_the_voice_rule(text, want):
+    """AG6: confirm, catch-up and restart take natural yeses (deterministic, macd.phrases)."""
+    assert yes_no(text, strict=False) == want
+
+
+def test_widened_yes_binds_confirm_but_never_folder_approval():
+    assert bind(q(K.CONFIRM), reply(text="Yes, go ahead"), NOW).outcome is s.ReplyOutcome.APPROVED
+    assert bind(q(K.CONFIRM), reply(text="sure, thanks"), NOW).outcome is s.ReplyOutcome.APPROVED
+    assert bind(q(K.RESTART), reply(text="ok do it"), NOW).outcome is s.ReplyOutcome.APPROVED
+    assert not bind(q(K.FOLDER_APPROVAL), reply(text="Yes, go ahead", quoted_ref="p1"), NOW).bound
 
 
 def test_confirm_outcomes():
@@ -60,13 +76,33 @@ def test_folder_approval_needs_quote_or_reaction():
 
 
 def test_route_catch_up_restart_outcomes():
-    b = bind(q(K.ROUTE), reply(text="do it in resume"), NOW)
+    b = bind(q(K.ROUTE), reply(text="Resume."), NOW)
     assert b.outcome is s.ReplyOutcome.ANSWERED and b.choice == 0
+    b = bind(q(K.ROUTE), reply(text="do it in resume"), NOW)  # P2-1: not the whole reply, so the router reads it
+    assert b.outcome is s.ReplyOutcome.ANSWERED and b.choice is None and b.steer_text == "do it in resume"
+    for text in ("yes, but in Notes", "no, use the general one", "1 and also 2"):
+        assert bind(q(K.ROUTE), reply(text=text), NOW).choice is None
     assert bind(q(K.ROUTE), reply(text="no"), NOW).choice == 1
-    assert not bind(q(K.ROUTE), reply(text="what's the weather"), NOW).bound
     assert bind(q(K.CATCH_UP), reply(text="yes"), NOW).choice == 0
     assert bind(q(K.RESTART), reply(text="no"), NOW).outcome is s.ReplyOutcome.DENIED
-    assert not bind(q(K.RESTART), reply(text="find more jobs"), NOW).bound
+    # AG4: free text closes route, catch-up and restart questions as an answer for the model
+    for kind in (K.ROUTE, K.CATCH_UP, K.RESTART):
+        b = bind(q(kind), reply(text="the job one"), NOW)
+        assert b.bound and b.outcome is s.ReplyOutcome.ANSWERED and b.choice is None
+        assert b.steer_text == "the job one"
+    assert not bind(q(K.CONFIRM, options=0), reply(reaction="\U0001F44D", reaction_on="x"), NOW).bound
+
+
+def test_route_yes_binds_to_what_the_question_asked():
+    """AG3: "Start fresh, or pick up the job search?" with yes meaning fresh (option 1)."""
+    assert bind(q(K.ROUTE, yes=1), reply(text="yes"), NOW).choice == 1
+    assert bind(q(K.ROUTE, yes=1), reply(text="no"), NOW).choice == 0
+    no_yes = q(K.ROUTE, yes=None)  # the model did not say: only a number or label binds
+    b = bind(no_yes, reply(text="yes"), NOW)
+    assert b.choice is None and b.steer_text == "yes"
+    assert bind(no_yes, reply(text="2"), NOW).choice == 1
+    assert bind(no_yes, reply(text=" General! "), NOW).choice == 1
+    assert bind(no_yes, reply(text="general please"), NOW).choice is None  # P2-1: free text for the router
 
 
 # ----------------------------------------------------------------------------- service
@@ -114,26 +150,20 @@ async def test_new_question_closes_old_with_skipped(agent):
     assert conv.question is q2 and conv.record.question.question_id == q2.question_id
 
 
-async def test_catch_up_question_for_old_replayed_message(agent):
+async def test_catch_up_is_the_models_call_with_the_time_it_was_sent(agent):
+    """AG5: no fixed 60-minute question; the model is told when the message was sent and decides."""
     c = await agent.client(CHAT_TOKEN, [CHAT])
     meta = {"replayed": True, "sent_at": time.time() - 7200, "msg_ref": "m1"}
     await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "find me 20 jobs", "meta": meta})
-    qe = await c.event("question")
-    assert qe["kind"] == "catch_up" and qe["text"].endswith('while I was asleep: "find me 20 jobs". Still want it?')
-    r = await c.call({"op": "reply", "conv": CHAT, "text": "yes"})
-    assert r["data"] == {"bound": True, "outcome": "answered"}
     await c.event("done")
-    assert agent.brain(CHAT).asks[0][1] == "find me 20 jobs"
-
-
-async def test_catch_up_no_ends_turn_without_brain(agent):
-    c = await agent.client(CHAT_TOKEN, [CHAT])
-    meta = {"replayed": True, "sent_at": time.time() - 7200}
-    await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "x", "meta": meta})
-    await c.event("question")
-    await c.call({"op": "reply", "conv": CHAT, "text": "no"})
-    assert (await c.event("done"))["data"]["interrupted"] is True
-    assert CHAT not in agent.brains
+    assert [e for e in c.drain() if e.get("ev") == "question"] == []
+    text = agent.brain(CHAT).asks[0][1]
+    assert text.startswith("[Note from Mac: the user sent this at ") and "2 h ago, while Mac was asleep" in text
+    assert text.endswith("]\n\nfind me 20 jobs")
+    await c.call({"op": "ask", "conv": CHAT, "turn": 2, "text": "and 5 more",
+                  "meta": {"replayed": True, "sent_at": time.time() - 30}})
+    await c.event("done")
+    assert agent.brain(CHAT).asks[-1][1] == "and 5 more"  # a fresh replay needs no note
 
 
 async def test_route_question_answer_picks_folder(agent):
@@ -145,15 +175,58 @@ async def test_route_question_answer_picks_folder(agent):
     c = await agent.client(CHAT_TOKEN, [CHAT])
     await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "write something"})
     qe = await c.event("question")
-    assert qe["kind"] == "route" and qe["text"] == "Should I do this in Blog, or just generally?"
-    # a steer while asking is kept for the brain; an unrelated reply does not bind
+    assert qe["kind"] == "route" and qe["text"] == "Should I do this in Blog? Say no to do it generally."
+    # a steer while asking is kept for the brain; a reaction on something else does not bind
     assert (await c.call({"op": "steer", "conv": CHAT, "text": "about agents"}))["data"] == {"accepted": True}
-    assert (await c.call({"op": "reply", "conv": CHAT, "text": "hmm"}))["data"] == {"bound": False}
+    assert (await c.call({"op": "reply", "conv": CHAT, "reaction": "\U0001F44D", "reaction_on": "x"})
+            )["data"] == {"bound": False}
     r = await c.call({"op": "reply", "conv": CHAT, "text": "in blog"})
     assert r["data"] == {"bound": True, "outcome": "answered"}
     await c.event("done")
     b = agent.brain(CHAT)
     assert b.spec.cwd == proj and b.asks[0][1] == "write something" and b.steers[0][1] == "about agents"
+
+
+async def test_free_text_route_answer_goes_back_to_the_model(agent):
+    """AG4: "the blog one" closes the route question at once; the model decides with it."""
+    proj = agent.paths.home / "Blog"
+    proj.mkdir()
+    agent.sessions = [SimpleNamespace(cwd=str(proj), last_modified=time.time() * 1000, session_id="b1",
+                                      custom_title="Post", summary="")]
+    agent.model.reply = '{"folder": "Blog", "session": "new", "confidence": 0.3, "ask": "Blog or not?"}'
+    c = await agent.client(CHAT_TOKEN, [CHAT])
+    await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "write something"})
+    qe = await c.event("question")
+    assert qe["text"] == "Blog or not? (1 Blog, 2 generally)"
+    r = await c.call({"op": "reply", "conv": CHAT, "text": "the one about my posts"})
+    assert r["data"] == {"bound": True, "outcome": "answered"}
+    assert (await c.event("question_closed"))["outcome"] == "answered"
+    await c.event("done")
+    assert agent.brain(CHAT).spec.cwd == proj
+    assert "They answered: 'the one about my posts'" in agent.model.calls[-1]
+
+
+async def test_free_text_restart_answer_is_a_new_ask_with_context(short_root):
+    """AG4: a restart question answered in words runs those words, with the old request as context."""
+    from agentd_kit import make_agent, stop_agent
+
+    a = await make_agent(short_root, scripts={CHAT: lambda t: slow(n=20, delay=0.05)})
+    c = await a.client(CHAT_TOKEN, [CHAT])
+    await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "find me 20 jobs"})
+    await c.event("say")
+    await stop_agent(a)
+    a = await make_agent(short_root, boot="b2", scripts={CHAT: lambda t: [fb.text("Found.")]})
+    try:
+        c = await a.client(CHAT_TOKEN, [CHAT])
+        st = (await c.call({"op": "status", "conv": CHAT}))["data"]
+        assert st["question"]["kind"] == "restart"
+        r = await c.call({"op": "reply", "conv": CHAT, "text": "just the remote ones please"})
+        assert r["data"] == {"bound": True, "outcome": "answered"}
+        await c.event("done")
+        text = a.brain(CHAT).asks[0][1]
+        assert 'working on "find me 20 jobs"' in text and text.endswith("\n\njust the remote ones please")
+    finally:
+        await stop_agent(a)
 
 
 async def test_interrupt_while_asking_closes_question(agent):

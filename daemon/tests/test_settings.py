@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from macd import config
-from macd.phrases import rename_request
 from macd.settings import PREVIEW_TEXT, Settings, validate, wake_phrases_for
 
 
@@ -159,14 +158,3 @@ def test_validate_and_helpers() -> None:
     with pytest.raises(ValueError):
         validate("name", "Mac!")
     assert wake_phrases_for(" Jarvis ") == ["hey jarvis", "ok jarvis"]
-
-
-@pytest.mark.parametrize(
-    ("t", "name"),
-    [("call yourself Jarvis", "Jarvis"), ("Hey Mac, change your name to Friday.", "Friday"),
-     ("please call yourself computer from now on", "Computer"), ("your name is now Ada", "Ada"),
-     ("rename yourself to HAL 9000", "Hal 9000"), ("call your mom", None), ("what's your name", None),
-     ("change the name of the file to notes", None), ("", None)],
-)
-def test_rename_request(t: str, name: str | None) -> None:
-    assert rename_request(t) == name

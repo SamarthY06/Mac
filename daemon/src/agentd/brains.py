@@ -57,12 +57,24 @@ class BrainSpec:
     chrome: bool = True
     name: str = "Mac"
     language: str = "en-us"
-    never_chat_names: tuple[str, ...] = ()
+    never_chat_names: tuple[str, ...] = ()  # chat profile only (AG7, V6: voice may name any chat)
+    # chat profile (W9): the live capability set (None = voice), the send_file yes, the persona
+    capabilities: Callable[[], frozenset[str]] | None = None
+    confirm_send_file: Callable[[], bool] | None = None  # live, like capabilities (read per send)
+    chat_persona: str = ""
+    display_name: str = ""
+    chat_shared: bool = False
+    on_set_persona: Callable[[str], Any] | None = None
+    on_alive: Callable[[bool], None] | None = None  # the brain process connected or went away
+    on_rename: Callable[[str], str | None] | None = None  # voice: the model renamed the assistant
+    on_reset_voice: Callable[[], str | None] | None = None  # voice: back to the standard voice
+    on_go_to_sleep: Callable[[], str | None] | None = None  # voice: the model ends the conversation
     extra: dict[str, Any] = field(default_factory=dict)
 
     def key(self) -> tuple[Any, ...]:
         """Changing any of these needs a new brain process."""
-        return (str(self.cwd), tuple(self.setting_sources), self.model, self.chrome)
+        return (str(self.cwd), tuple(self.setting_sources), self.model, self.chrome,
+                tuple(self.never_chat_names), self.chat_persona, self.display_name, self.chat_shared)
 
 
 BrainFactory = Callable[[BrainSpec], Brain]
@@ -99,6 +111,9 @@ CLAUDE_ARGS = ("cwd", "session_store", "memory_file", "recent_user_text", "steer
                "desktop_wait_s", "desktop_busy_reason", "confirm_timeout_s")
 
 
+CHAT_SAFETY_ARGS = ("capabilities", "confirm_send_file", "never_chat_names")
+
+
 def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
     """Real brains. `cfg` is macd's Config (paths, cli); `chat_cfg` the [chat_brain] BrainConfig."""
     from macd.brain import claude_brain as cb
@@ -119,15 +134,27 @@ def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
         kw: dict[str, Any] = {
             "cwd": spec.cwd, "session_store": spec.session_store, "memory_file": spec.memory_file,
             "recent_user_text": spec.recent_user_text, "setting_sources": list(spec.setting_sources),
-            "never_chat_names": list(spec.never_chat_names),
             # the transitional flock stays while local voice mode exists (W3.4); deleted with it
             "desktop_locks": [spec.desktop, *hooks.default_desktop_locks()]}
+        kw.update(spec.extra)  # N5: first, so nothing in it can replace a safety argument below
         if spec.profile is CHAT:
+            # safety arguments fail CLOSED: a brain that cannot take them is never built for chat
+            missing = [a for a in CHAT_SAFETY_ARGS if a not in params]
+            if missing or spec.capabilities is None or spec.confirm_send_file is None or not spec.never_chat_names:
+                raise RuntimeError(f"refusing to build a chat brain without {', '.join(missing) or 'its policy'}")
             kw.update(cb.CHAT_PROFILE)
-            kw["env_exempt_dir"] = spec.cwd
-        else:
+            kw.update(env_exempt_dir=spec.cwd, never_chat_names=list(spec.never_chat_names),
+                      capabilities=spec.capabilities, confirm_send_file=spec.confirm_send_file)
+            optional = {"chat_persona": spec.chat_persona, "display_name": spec.display_name,
+                        "chat_shared": spec.chat_shared, "on_set_persona": spec.on_set_persona}
+            kw.update({k: v for k, v in optional.items() if v is not None and k in params})
+        else:  # never the never-list: by voice any chat may be named, behind a spoken confirm (V6)
             kw.update(desktop_wait_s=cb.VOICE_DESKTOP_WAIT_S, confirm_timeout_s=spec.profile.confirm_window_s)
-        kw.update(spec.extra)
+            optional = {"on_rename": spec.on_rename, "on_reset_voice": spec.on_reset_voice,
+                        "on_go_to_sleep": spec.on_go_to_sleep}
+            kw.update({k: v for k, v in optional.items() if v is not None and k in params})
+        if spec.on_alive is not None and "on_alive" in params:  # push liveness when B's brain offers it
+            kw["on_alive"] = spec.on_alive
         return cb.ClaudeBrain(c, spec.gate, **kw)
 
     return make

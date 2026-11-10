@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentd import offload
 from agentd import schema as s
 from agentd.stores import JsonStore
 
@@ -329,7 +330,7 @@ class WorkspaceStore:
         await self._store.save(lambda: {"approved": self.approved, "declined": self.declined})
 
     async def scan(self, folder: Path) -> SettingsScan:
-        return await asyncio.to_thread(self._hasher, folder, self.home)
+        return await offload.run(self._hasher, folder, self.home)  # a process, not a thread (V7)
 
     async def trust(self, folder: Path) -> Trust:
         scan = await self.scan(folder)

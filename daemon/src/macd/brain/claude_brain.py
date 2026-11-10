@@ -33,7 +33,6 @@ import contextlib
 import inspect
 import logging
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -85,6 +84,7 @@ log = logging.getLogger(__name__)
 
 SAY_TOOL = "mcp__mac__say"
 _SILENT_TOOLS = {SAY_TOOL, CONFIRM_TOOL}
+_SWITCH_TOOL = "mcp__mac__switch_workspace"
 HANDOFF_TURN = -1  # turn id of the silent session-handoff query (never emitted)
 PROBE_TURN = -2  # turn id of the silent connect_check probe query (never emitted)
 TABS_TURN = -3  # turn id of the silent "close your own Chrome tabs" query (chat profile)
@@ -112,8 +112,6 @@ CONSOLIDATE_PROMPT = (
     "rewritten version of at most 4 KB: the same section headers, duplicates merged, stale items "
     "dropped, and every line ending in [kept] preserved verbatim. Current memory:\n```\n{memory}\n```"
 )
-_MEMORY_WORDS = re.compile(r"\b(remember|note that|make a note|save (this|that)|memori[sz]e|"
-                           r"don'?t forget|keep in mind)\b", re.IGNORECASE)
 _CHROME_SERVER = "claude-in-chrome"
 _CHROME = "mcp__claude-in-chrome__"
 LOCKED_NOTE = (
@@ -177,8 +175,8 @@ class StateJsonSessionStore:
 CHAT_PROFILE: dict[str, Any] = {
     "steer_only": True, "rotate_after_idle_min": None, "handoff_enabled": False,
     "on_resume_fallback": "status", "max_turn_s": 2700.0, "write_claude_md": False,
-    "whatsapp_ui_block": True, "send_file": True, "close_own_tabs": True,
-    "channel_note": prompts.CHAT_CHANNEL_NOTE, "desktop_wait_s": CHAT_DESKTOP_WAIT_S,
+    "whatsapp_ui_block": True, "send_file": True, "close_own_tabs": True, "switch_workspace": True,
+    "channel": "chat", "desktop_wait_s": CHAT_DESKTOP_WAIT_S,
     "desktop_busy_reason": REASON_DESKTOP_BUSY_CHAT, "confirm_timeout_s": 600.0,
 }
 
@@ -210,6 +208,7 @@ class _Turn:
     handoff: bool = False  # silent, memory-tools-only query (session handoff)
     probe: bool = False  # silent, tool-less connect_check query
     tabs: bool = False  # silent "close your own Chrome tabs" query (chat profile)
+    switch: tuple[str, str] | None = None  # (folder, mode) the model asked to move to (AG1)
     after: Callable[[], Any] | None = None  # deferred action once a handoff turn ends
     future: asyncio.Future[bool] | None = None
 
@@ -279,7 +278,12 @@ class ClaudeBrain:
                  env_exempt_dir: Path | None = None,
                  whatsapp_ui_block: bool = False,
                  never_chat_names: Sequence[str] = (),
-                 shared_chat: bool = False,
+                 confirm_send_file: bool | Callable[[], bool] = False,
+                 capabilities: frozenset[str] | Callable[[], frozenset[str]] | None = None,
+                 chat_persona: str = "",
+                 display_name: str = "",
+                 chat_shared: bool = False,
+                 channel: Literal["voice", "chat"] = "voice",
                  channel_note: str = "",
                  send_file: bool = False,
                  test_tools: bool = False,
@@ -287,7 +291,13 @@ class ClaudeBrain:
                  desktop_locks: Sequence[DesktopLock] | None = None,
                  desktop_wait_s: float = VOICE_DESKTOP_WAIT_S,
                  desktop_busy_reason: str = REASON_DESKTOP_BUSY_VOICE,
-                 confirm_timeout_s: float = 45.0) -> None:
+                 confirm_timeout_s: float = 45.0,
+                 switch_workspace: bool = False,
+                 on_rename: mac_tools.SettingCallback | None = None,
+                 on_reset_voice: mac_tools.SettingCallback | None = None,
+                 on_go_to_sleep: mac_tools.SettingCallback | None = None,
+                 on_alive: Callable[[bool], None] | None = None,
+                 on_set_persona: mac_tools.SettingCallback | None = None) -> None:
         self.cfg = cfg
         self.gate = gate
         self.chrome_status_cb = chrome_status_cb
@@ -307,7 +317,18 @@ class ClaudeBrain:
         self._max_turn_arg = max_turn_s
         self._write_claude_md = write_claude_md
         self._sources_arg = setting_sources
+        self._channel = channel
+        self._on_alive = on_alive  # True on every connect, False on every disconnect (idle, crash, close)
         self._channel_note = channel_note
+        self._chat_persona = chat_persona  # W9.4: rendered (escaped) by prompts after the safety rules
+        self._display_name = display_name
+        self._chat_shared = chat_shared
+        if channel == "chat" and (on_rename or on_reset_voice or on_go_to_sleep):
+            log.warning("brain: voice-only tools are never given to a chat brain; ignoring their callbacks")
+            on_rename = on_reset_voice = on_go_to_sleep = None
+        if channel != "chat":
+            on_set_persona = None  # set_persona exists only in chat profiles (W9.4)
+        self._never_chat_names = tuple(never_chat_names)
         self._close_own_tabs = close_own_tabs
         self._ingest_all_tabs = whatsapp_ui_block  # keep tab hosts fresh for the M1 block
         self._fork_next = False  # the next connect resumes `_resume_next` as a fork
@@ -369,14 +390,17 @@ class ClaudeBrain:
                               on_notify=on_notify, workspace=self.cwd, memory_path=self.memory_path,
                               results_dir=self.results_dir, confirm_timeout_s=confirm_timeout_s,
                               memory=self._memory, on_attach=self._on_attach if send_file else None,
-                              test_tools=test_tools)
+                              test_tools=test_tools, on_rename=on_rename, on_reset_voice=on_reset_voice,
+                              on_go_to_sleep=on_go_to_sleep, on_set_persona=on_set_persona,
+                              on_switch_workspace=self._on_switch_workspace if switch_workspace else None)
         self.hook.context = GateContext(
             workspace=str(self.cwd), element_label=self.tools.registry.label,
             chrome_ref_label=self.tools.chrome_refs.label, chrome_tab_host=self.tools.chrome_tabs.host,
             current_app=self._current_app, whatsapp_ui_block=whatsapp_ui_block,
             never_chat_names=tuple(never_chat_names),
             env_exempt_dir=str(env_exempt_dir) if env_exempt_dir is not None else None,
-            memory_path=str(self.memory_path), shared_chat=shared_chat)
+            memory_path=str(self.memory_path), confirm_send_file=confirm_send_file,
+            capabilities=capabilities, display_name=display_name)
 
     # ------------------------------------------------------------------ Brain protocol
     async def start(self) -> None:
@@ -582,6 +606,7 @@ class ClaudeBrain:
             log.critical("brain owner task died (%s); restarting it", t.exception() if not t.cancelled() else "cancelled")
             if self._client is not None:
                 self._orphans.append((self._client, self._reader))  # F2: reaped by the new owner
+                self._report_alive(False)
             self._client, self._reader, self._active = None, None, None
             self._gen += 1
             self._spawn_owner()
@@ -665,7 +690,9 @@ class ClaudeBrain:
         return bool(a and a.turn_id == turn_id and a.draining)
 
     def _memory_check(self, tool: str, args: dict[str, Any]) -> tuple[bool, str]:
-        """Capability check for memory writes: (allowed, "explicit"|"grounded"|"handoff"|reason)."""
+        """Capability check for memory writes: (allowed, "grounded"|"handoff"|reason). Deterministic
+        anti-injection guard: a fact must come from what the user said. Whether they ASKED to keep it
+        is the model's call (remember's `explicit` argument, AG14)."""
         a = self._active
         if a is None or a.draining:
             return False, "no active turn"
@@ -673,8 +700,6 @@ class ClaudeBrain:
             return (True, "handoff") if a.handoff else (False, "only during a session handoff")
         if a.handoff and str(args.get("kind", "")).lower() == "context":
             return True, "handoff"
-        if any(_MEMORY_WORDS.search(t) for t in a.texts):
-            return True, "explicit"
         text = str(args.get("fact") or args.get("text") or "")
         recent: str | list[str] = self._recent_user_text() if self._recent_user_text else a.texts
         if memory.grounded(text, "\n".join(recent) if isinstance(recent, list) else recent):
@@ -689,6 +714,8 @@ class ClaudeBrain:
             return "Session handoff: only mcp__mac__remember / forget / rewrite_memory may be called."
         if a is not None and a.tabs and tool not in _TABS_TOOLS:
             return "Tab cleanup: only tabs_context_mcp and tabs_close_mcp may be called."
+        if a is not None and a.switch is not None:
+            return "A move to another folder is pending: stop now and call no more tools."
         return None
 
     def _on_say(self, text: str) -> None:
@@ -696,13 +723,42 @@ class ClaudeBrain:
         if turn and not self.is_cancelled(turn):
             self._emit(BrainEventKind.SAY, turn, text=text)
 
-    def _on_confirm(self, summary: str, target: str) -> None:
+    def _on_confirm(self, summary: str, target: str, question: str = "", detail: str = "") -> None:
         self._release_desktop()  # W3.4: never hold the screen while a human decides
         turn = self._current_turn()
         if turn and not self.is_cancelled(turn):
-            self._emit(BrainEventKind.CONFIRM, turn, text=summary, data={"target": target})
+            # AG10: text = the model's summary; data.question = its checked question ("" = none given)
+            data = {"target": target, "question": question}
+            if detail:
+                data["detail"] = detail  # set_persona: the full new text the yes applies to (W9.4)
+            self._emit(BrainEventKind.CONFIRM, turn, text=summary, data=data)
 
-    def _on_attach(self, attach_id: str, path: str, caption: str) -> str | None:
+    def clear_switch(self, turn_id: int | None = None) -> bool:
+        """agentd refused the model's switch_workspace: tools are allowed again in this turn.
+        Call it before steering the refusal in. `turn_id` (None = the running turn) must match.
+        True when a pending switch was cleared."""
+        a = self._active
+        if a is None or a.switch is None or (turn_id is not None and a.turn_id != turn_id):
+            return False
+        a.switch = None
+        return True
+
+    def _on_switch_workspace(self, folder: str, mode: str) -> str | None:
+        """AG1: the running model says this request belongs elsewhere. agentd validates the folder
+        and session and owns the move (it stops this turn and re-runs it); the brain only reports
+        it and refuses every further tool call of the turn."""
+        a = self._active
+        if a is None or a.turn_id <= 0 or self.is_cancelled(a.turn_id):
+            return "The request was stopped."
+        if a.switch is not None:
+            return "A switch was already requested; stop now."
+        a.switch = (folder, mode)
+        work = [n for n in a.tools.values() if n not in _SILENT_TOOLS and n != _SWITCH_TOOL]
+        self._emit(BrainEventKind.STATUS, a.turn_id, data={"switch_workspace": {
+            "folder": folder, "mode": mode, "tools_run": len(work)}})
+        return None
+
+    def _on_attach(self, attach_id: str, path: str) -> str | None:
         """mac.send_file → ATTACH. The real path is re-checked (a symlink swapped in after the
         hook's check must not leak a secret)."""
         turn = self._current_turn()
@@ -711,7 +767,7 @@ class ClaudeBrain:
         d = analyze(MAC_SEND_FILE, {"path": path}, self.hook.context)
         if d.always_denied:
             return f"Not sent: {d.reason}."
-        self._emit(BrainEventKind.ATTACH, turn, data={"attach_id": attach_id, "path": path, "caption": caption})
+        self._emit(BrainEventKind.ATTACH, turn, data={"attach_id": attach_id, "path": path})
         return None
 
     def _on_hook_decision(self, d: HookDecision) -> None:
@@ -788,7 +844,11 @@ class ClaudeBrain:
         env = {"ANTHROPIC_API_KEY": api_key} if api_key else {}
         persona = prompts.persona_prompt(self.cfg, browser_available=self.chrome_connected is not False,
                                          memory_path=self.memory_path, results_dir=self.results_dir,
-                                         channel_note=self._channel_note)
+                                         channel=self._channel, channel_note=self._channel_note,
+                                         never_chat_names=self._never_chat_names,
+                                         tools={t.name for t in self.tools.tools()},
+                                         chat_persona=self._chat_persona, display_name=self._display_name,
+                                         shared=self._chat_shared)
         opts = ClaudeAgentOptions(
             system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
             permission_mode="bypassPermissions",
@@ -884,6 +944,7 @@ class ClaudeBrain:
             self._turns_this_session = 0
             self._idle_at = self._clock()
             log.info("brain connected (gen %d, resume=%s)", self._gen, attempt)
+            self._report_alive(True)
             return None
         return err
 
@@ -901,7 +962,17 @@ class ClaudeBrain:
         reader, client = self._reader, self._client
         self._reader, self._client = None, None
         self._gen += 1  # anything still queued from the old reader is stale
+        if client is not None:
+            self._report_alive(False)
         await self._close_client(client, reader)
+
+    def _report_alive(self, alive: bool) -> None:
+        if self._on_alive is None:
+            return
+        try:
+            self._on_alive(alive)
+        except Exception:
+            log.exception("on_alive callback failed")
 
     async def _close_client(self, client: Any, reader: asyncio.Task[None] | None) -> None:
         if reader is not None:

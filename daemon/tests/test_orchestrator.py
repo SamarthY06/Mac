@@ -35,8 +35,8 @@ def pause(seconds: float = LONG) -> Step:
     return Step(BrainEventKind.STATUS, text="working", delay=seconds)
 
 
-def confirm(summary: str, target: str = "") -> Step:
-    return Step(BrainEventKind.CONFIRM, text=summary, data={"target": target})
+def confirm(summary: str, target: str = "", question: str = "Send it?") -> Step:
+    return Step(BrainEventKind.CONFIRM, text=summary, data={"target": target, "question": question})
 
 
 @dataclass
@@ -150,18 +150,6 @@ def test_classify_confirmation(t: str, verdict: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("t", "corr"),
-    [("Actually, make it Friday", "make it Friday"), ("no, I meant Bob", "I meant Bob"),
-     ("No I meant the other one", "I meant the other one"), ("instead, use the second result", "use the second result"),
-     # N13: these are NOT corrections (would cancel a running turn)
-     ("wait for the page to load", None), ("no, that's right", None), ("no that's fine", None),
-     ("actually never mind", None), ("now open mail", None), ("no", None), ("no bob", None)],
-)
-def test_correction_text(t: str, corr: str | None) -> None:
-    assert P.correction_text(t) == corr
-
-
-@pytest.mark.parametrize(
     ("t", "off"),
     [("go to sleep", True), ("Turn off.", True), ("okay stop listening", True), ("turn off the lights", False),
      ("sleep", False), ("turn it off", False)],
@@ -180,13 +168,11 @@ def test_is_followup_intent(t: str, ok: bool) -> None:
     assert P.is_followup_intent(t) is ok
 
 
-@pytest.mark.parametrize(
-    ("t", "ok"),
-    [("use your default voice", True), ("Hey, go back to your default voice please", True), ("reset your voice", True),
-     ("use your normal voice", True), ("use a different voice", False), ("what's your voice", False), ("", False)],
-)
-def test_is_voice_reset_request(t: str, ok: bool) -> None:
-    assert P.is_voice_reset_request(t) is ok
+def test_followup_word_list_is_english_only() -> None:
+    """AG19: the short-intent list can't judge "oui", so another language lets one word through."""
+    assert P.is_english("en-us") and P.is_english("en-GB") and not P.is_english("fr-fr")
+    assert P.is_followup_intent("oui") is False and P.is_followup_intent("oui", english=False) is True
+    assert P.is_followup_intent("", english=False) is False
 
 
 # ----------------------------------------------------------------------------- memory / handoff
@@ -275,31 +261,15 @@ async def test_real_fake_brain_handoff_counts(rig: Rig) -> None:
     assert rig.brain.handoffs == 1 and rig.brain.resets == 1
 
 
-async def test_spoken_rename(rig: Rig) -> None:
-    names: list[str] = []
-
-    async def rename(name: str) -> None:
-        names.append(name)
-
-    rig.orch.rename = rename
-    rig.mic.say("call yourself Jarvis", woke=True)
-    await wait_until(lambda: names == ["Jarvis"])
-    await asyncio.sleep(0.05)
-    assert rig.brain.asks == [] and rig.events[-1]["kind"] == "rename"
-
-
-async def test_spoken_voice_reset(rig: Rig) -> None:
-    calls: list[int] = []
-
-    async def reset() -> dict:
-        calls.append(1)
-        return {}
-
-    rig.orch.voice_reset = reset
-    rig.mic.say("use your default voice", woke=True)
-    await wait_until(lambda: calls == [1])
-    await asyncio.sleep(0.05)
-    assert rig.brain.asks == [] and rig.events[-1]["kind"] == "voice_reset"
+@pytest.mark.parametrize("said", ["I'll call you back later", "I will call you tomorrow", "call yourself Jarvis",
+                                  "use your default voice"])
+async def test_rename_and_voice_reset_go_to_the_model(rig: Rig, said: str) -> None:
+    """AG15/AG16 regression: no regex renames Mac or resets its voice ("I'll call you back later"
+    once renamed it "Back Later"). Everything is an ordinary turn; the model calls
+    mac.rename_assistant / mac.reset_voice when the user really asked."""
+    rig.mic.say(said, woke=True)
+    await wait_until(lambda: rig.brain.asks == [(1, said)])
+    assert not any(e.get("kind") in ("rename", "voice_reset") for e in rig.events)
 
 
 @pytest.mark.parametrize(
@@ -315,24 +285,25 @@ def test_humanize_target(target: str, core: str, phrase: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("summary", "target", "line"),
-    [("I'll send the report to Bob", "", "I'll send the report to Bob. Send it?"),
-     ("I'll tell Priya I'm late", "WhatsApp: Priya", "I'll tell Priya I'm late in WhatsApp. Send it?"),
-     ("I'll message Priya on WhatsApp", "WhatsApp:AXButton Send", "I'll message Priya on WhatsApp. Send it?"),
-     ("Post the update", "linkedin.com", "Post the update on linkedin.com. Post it?"),
-     ("Delete the three old drafts.", "Mail: Delete", "Delete the three old drafts in Mail. Delete it?"),
-     ("Order two large pizzas for tonight", "dominos.com", "Order two large pizzas for tonight on dominos.com. Go ahead and pay?"),
-     ("Run the deploy script", "", "Run the deploy script. Go ahead?"),
-     ("Shall I archive it?", "", "Shall I archive it. Go ahead?"),
-     ('Send the Timetable WhatsApp group a message saying "Test message from Mac, please ignore."', "\u200eWhatsApp:AXButton \u200eSend",
+    ("summary", "target", "question", "line"),
+    [("I'll send the report to Bob", "", "Send it?", "I'll send the report to Bob. Send it?"),
+     ("I'll tell Priya I'm late", "WhatsApp: Priya", "Send it?", "I'll tell Priya I'm late in WhatsApp. Send it?"),
+     ("I'll message Priya on WhatsApp", "WhatsApp:AXButton Send", "send it?",
+      "I'll message Priya on WhatsApp. send it?"),
+     ("Post the update", "linkedin.com", "Post it?", "Post the update on linkedin.com. Post it?"),
+     # AG18: the model's question, never a keyword guess ("email" used to make this "Send it?")
+     ("Delete the draft email to Bob", "Mail: Delete", "Delete it?", "Delete the draft email to Bob. Delete it?"),
+     ("Book a table at Dishoom for two", "dishoom.com", "Book it?", "Book a table at Dishoom for two on dishoom.com. Book it?"),
+     # the fallback when the model gave none (its tool already enforces the question's shape)
+     ("Run the deploy script", "", None, "Run the deploy script. Shall I go ahead?"),
+     ("Run the deploy script", "", " \u200b", "Run the deploy script. Shall I go ahead?"),
+     ('Send the Timetable WhatsApp group a message saying "Test message from Mac, please ignore."',
+      "\u200eWhatsApp:AXButton \u200eSend", "Send it?",
       'Send the Timetable WhatsApp group a message saying "Test message from Mac, please ignore". Send it?'),
-     (("Send Bob the quarterly numbers for the northern region saying that we are on track and asking whether he wants "
-       "the detailed breakdown before Friday's meeting"), "Mail: Send",
-      "Send Bob the quarterly numbers for the northern region in Mail. Send it?"),
-     ("", "WhatsApp: Send", "I'm about to take an action in WhatsApp. Go ahead?")],
+     ("", "WhatsApp: Send", None, "I'm about to take an action in WhatsApp. Shall I go ahead?")],
 )
-def test_confirmation_line(summary: str, target: str, line: str) -> None:
-    assert P.confirmation_line(summary, target) == line
+def test_confirmation_line(summary: str, target: str, question: str | None, line: str) -> None:
+    assert P.confirmation_line(summary, target, question) == line
 
 
 @pytest.mark.parametrize(
@@ -347,6 +318,7 @@ def test_dedash(t: str, out: str) -> None:
 def test_no_dashes_in_spoken_phrases() -> None:
     assert all("—" not in p and "–" not in p for p in P.PREWARM_PHRASES)
     assert "—" not in P.confirmation_line("Send it — to Bob", "") and "—" not in P.confirmation_line("x", "Slack: Send")
+    assert "—" not in P.confirmation_line("x", "", "Send — it?")
 
 
 async def test_spoken_text_has_no_dashes(rig: Rig) -> None:
@@ -442,6 +414,18 @@ async def test_short_question_filler_is_sure(rig: Rig) -> None:
     rig.mic.say("what time is it", woke=True)
     await wait_until(lambda: "Noon." in rig.spoken)
     assert rig.spoken[0] == P.FILLER_SHORT_QUESTION
+
+
+async def test_no_english_filler_in_another_language(rig: Rig) -> None:
+    """AG19: an English "Sure." in a French voice is worse than the slow-start tick."""
+    rig.orch.cfg.tts.lang = "fr-fr"
+    rig.scripts["quelle heure est-il"] = [text("Midi. ")]
+    rig.mic.say("quelle heure est-il", woke=True)
+    await wait_until(lambda: "Midi." in rig.spoken)
+    assert rig.spoken == ["Midi."]
+    await wait_until(lambda: rig.orch.state == State.FOLLOWUP)
+    rig.mic.say("merci", window=WindowReason.FOLLOWUP)  # one word in the follow-up window is a turn, not a fragment
+    await wait_until(lambda: rig.brain.asks[-1][1] == "merci")
 
 
 async def test_followup_without_wake_word(rig: Rig) -> None:
@@ -555,20 +539,17 @@ async def test_continuation_steers_without_ack(rig: Rig) -> None:
     assert P.STEER_ACK not in rig.spoken
 
 
-async def test_correction_interrupts_and_redirects(rig: Rig) -> None:
+@pytest.mark.parametrize("said", ["actually, make it Friday", "no rush, also check the weather",
+                                  "actually also add Bob", "no, that's right"])
+async def test_mid_turn_corrections_are_steers(rig: Rig, said: str) -> None:
+    """AG17: a lead-in ("actually", "no", "no rush") no longer cancels and restarts the turn (which
+    lost the original task); it is steered in and the model decides to redirect or add."""
     tid = await start_turn(rig, "book the meeting for Thursday")
-    rig.scripts["actually, make it Friday"] = [text("Booked Friday. ")]
-    rig.mic.say("actually, make it Friday", woke=True)
-    await wait_until(lambda: len(rig.brain.asks) == 2)
-    assert rig.brain.interrupts == [tid] and rig.brain.asks[1] == (tid + 1, "actually, make it Friday")
-    await wait_until(lambda: "Booked Friday." in rig.spoken)
-
-
-async def test_agreement_is_a_steer_not_a_correction(rig: Rig) -> None:
-    tid = await start_turn(rig, "book the meeting for Thursday")
-    rig.mic.say("no, that's right", woke=True)
-    await wait_until(lambda: rig.brain.steers == [(tid, "no, that's right")])
-    assert rig.brain.interrupts == []
+    rig.mic.say(said, woke=True)
+    await wait_until(lambda: rig.brain.steers == [(tid, said)])
+    await wait_until(lambda: P.STEER_ACK in rig.spoken)
+    assert rig.brain.interrupts == [] and len(rig.brain.asks) == 1
+    assert rig.orch.turn is not None and rig.orch.turn.id == tid
 
 
 # ----------------------------------------------------------------------------- confirmation
@@ -798,8 +779,10 @@ async def test_stalled_output_cannot_stick_confirming(rig: Rig, monkeypatch: pyt
 async def test_trailing_done_after_interrupt_is_ignored(rig: Rig) -> None:
     """MINOR-3: a DONE for a turn the orchestrator already closed must not touch the new turn."""
     tid = await start_turn(rig, "first task")
-    rig.scripts["actually, do the second task"] = [pause()]
-    rig.mic.say("actually, do the second task", woke=True)
+    rig.mic.say("stop", woke=True)
+    await wait_until(lambda: rig.brain.interrupts == [tid])
+    rig.scripts["do the second task"] = [pause()]
+    rig.mic.say("do the second task", woke=True)
     await wait_until(lambda: len(rig.brain.asks) == 2)
     rig.inject(BrainEventKind.DONE, tid, data={"interrupted": True})
     rig.inject(BrainEventKind.TEXT, tid, text="late text.\n")
@@ -913,6 +896,34 @@ async def test_spoken_off_request(rig: Rig) -> None:
     await wait_until(lambda: rig.orch.state == State.OFF)
     await wait_until(lambda: rig.brain.sleeps >= 1)  # after the (instant) handoff
     assert rig.brain.asks == [] and rig.brain.handoffs == 1
+
+
+async def test_model_go_to_sleep_waits_for_the_goodbye(rig: Rig) -> None:
+    """AG20: mac.go_to_sleep() lands mid-turn; Mac finishes speaking its goodbye, then goes OFF."""
+    await start_turn(rig, "that's all for today", [text("Okay, talk later. "), pause(0.2), text("Bye. ")])
+    rig.orch.sleep_after_turn()
+    await asyncio.sleep(0.05)
+    assert rig.orch.state != State.OFF and not rig.mic.muted
+    await wait_until(lambda: rig.orch.state == State.OFF)
+    assert "Okay, talk later." in rig.spoken and "Bye." in rig.spoken and rig.brain.interrupts == []
+    assert rig.mic.muted and rig.orch.status()["off"] is True
+    await wait_until(lambda: rig.brain.sleeps >= 1)
+
+
+async def test_model_go_to_sleep_when_idle_is_immediate(rig: Rig) -> None:
+    rig.orch.sleep_after_turn()
+    assert rig.orch.state == State.OFF and rig.mic.muted
+
+
+async def test_model_go_to_sleep_is_dropped_when_the_turn_is_stopped(rig: Rig) -> None:
+    """The user cut in ("stop"): they are still talking to Mac, so the pending sleep is void."""
+    await start_turn(rig, "that's all for today", [text("Okay. "), pause()])
+    rig.orch.sleep_after_turn()
+    rig.mic.say("stop", woke=True)
+    await wait_until(lambda: rig.orch.turn is None)
+    await start_turn(rig, "what time is it", [text("Noon. ")])
+    await wait_until(lambda: rig.orch.turn is None and "Noon." in rig.spoken)
+    assert rig.orch.state != State.OFF and not rig.orch.off
 
 
 async def test_restored_off_is_kept_at_start() -> None:
