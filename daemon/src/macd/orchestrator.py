@@ -79,6 +79,10 @@ class Segmenter(Protocol):
 # ----------------------------------------------------------------------------- turn
 
 
+HOLD_S = 1.5  # answer text is held this long before it is spoken (step lines are dropped)
+HOLD_MAX_SENTENCES = 2
+
+
 @dataclass(eq=False)
 class Turn:
     id: int
@@ -104,6 +108,9 @@ class Turn:
     last_heartbeat: float = 0.0
     heartbeats: int = 0
     narrated: dict[str, float] = field(default_factory=dict)  # line → when it was last spoken
+    held: list[str] = field(default_factory=list)  # answer text held until we know it isn't a step line
+    held_t: float | None = None
+    releasing: bool = False  # this text block is the answer: stream it
     assistant: list[str] = field(default_factory=list)
 
     @property
@@ -752,14 +759,20 @@ class Orchestrator:
             turn.first_text_t = time.monotonic()
             self.metrics.observe_since("brain_first_text", turn.asked_t or turn.started)
         if k == BrainEventKind.TEXT:
+            if ev.data.get("tool_follows"):  # the text so far was a step line: HUD only, never spoken
+                self._drop_held(turn)
+                return
             for s in turn.segmenter.feed(ev.text):
-                turn.assistant.append(s)
-                self._speak(turn, s, "answer")
+                self._hold(turn, s)
         elif k == BrainEventKind.SAY:
             self._flush_segmenter(turn)
-            turn.assistant.append(ev.text)
-            self._speak(turn, ev.text, "say")
+            if ev.text.rstrip().endswith("?"):  # a real question for the user is spoken
+                turn.assistant.append(ev.text)
+                self._speak(turn, ev.text, "say")
+            else:
+                self._activity("narration", turn.id, text=ev.text)
         elif k == BrainEventKind.TOOL_START:
+            self._drop_held(turn)
             turn.current_tool = ev.tool_name
             turn.current_narration = ev.data.get("narration") or self.describe_tool(ev.tool_name, ev.tool_input)
             self.eventlog.emit("tool_start", turn_id=turn.id, tool=ev.tool_name, tool_use_id=ev.tool_use_id,
@@ -787,10 +800,46 @@ class Orchestrator:
     def _on_status(self, ev: BrainEvent, turn: Turn | None) -> None:
         self._activity("status", turn.id if turn else (ev.turn_id or None), text=ev.text, **_jsonable(ev.data))
 
-    def _flush_segmenter(self, turn: Turn) -> None:
-        for s in turn.segmenter.flush():
+    def _hold(self, turn: Turn, s: str) -> None:
+        """Hold answer text until we know it is the answer (not a step line before a tool call).
+        Released when the turn ends, or once it is clearly an answer (2+ sentences or 1.5 s)."""
+        turn.held.append(s)
+        now = time.monotonic()
+        if turn.held_t is None:
+            turn.held_t = now
+            turn.tasks.spawn(self._release_later(turn, turn.held_t), "hold")
+        if turn.releasing or len(turn.held) >= HOLD_MAX_SENTENCES or now - turn.held_t >= HOLD_S:
+            self._release_held(turn)
+
+    async def _release_later(self, turn: Turn, t0: float) -> None:
+        await asyncio.sleep(HOLD_S)
+        if self.turn is turn and turn.held_t == t0:
+            self._release_held(turn)
+
+    def _release_held(self, turn: Turn) -> None:
+        turn.releasing = True
+        held, turn.held = turn.held, []
+        for s in held:
             turn.assistant.append(s)
             self._speak(turn, s, "answer")
+
+    def _drop_held(self, turn: Turn) -> None:
+        if turn.releasing:  # an answer already being spoken: finish its last sentence
+            for s in turn.segmenter.flush():
+                turn.assistant.append(s)
+                self._speak(turn, s, "answer")
+            dropped = []
+        else:
+            dropped = [*turn.held, *turn.segmenter.flush()]
+        turn.held, turn.held_t, turn.releasing = [], None, False
+        if dropped:
+            self._activity("narration", turn.id, text=" ".join(dropped))
+
+    def _flush_segmenter(self, turn: Turn) -> None:
+        for s in turn.segmenter.flush():
+            turn.held.append(s)
+        self._release_held(turn)
+        turn.held_t, turn.releasing = None, False
 
     def _on_error(self, turn: Turn, ev: BrainEvent) -> None:
         if turn.brain_done:

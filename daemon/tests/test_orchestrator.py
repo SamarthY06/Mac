@@ -423,7 +423,7 @@ async def test_wake_ask_answer_in_order_with_say(rig: Rig) -> None:
     rig.scripts["what's the weather"] = [text("It is sunny. Also warm"), say("Checking the forecast."), text(" Bye now.")]
     rig.mic.say("what's the weather", woke=True)
     await wait_until(lambda: rig.orch.state == State.FOLLOWUP, msg="followup")
-    assert rig.spoken == [P.FILLER_SHORT_QUESTION, "It is sunny.", "Also warm.", "Checking the forecast.", "Bye now."]
+    assert rig.spoken == [P.FILLER_SHORT_QUESTION, "It is sunny.", "Also warm.", "Bye now."]  # a non-question say is HUD-only
     assert rig.mic.reasons()[-1] == WindowReason.FOLLOWUP
     await wait_until(lambda: rig.orch.state == State.IDLE, timeout=2, msg="idle after followup")
     assert rig.states()[:3] == ["idle", "listening", "thinking"]
@@ -1054,3 +1054,21 @@ async def test_listener_crash_is_supervised() -> None:
 def test_state_json_isolated_from_home(tmp_path) -> None:
     assert str(config.STATE_PATH).startswith(str(tmp_path))
     json.dumps(config.read_state())
+
+
+async def test_step_lines_before_tools_are_not_spoken(rig: Rig) -> None:
+    rig.scripts["send it to the team"] = [text("Note's done, opening WhatsApp now."), *tool("open_app", {"name": "WhatsApp"}),
+                                          text("Typing the message into the compose field."), *tool("ui_type", {"text": "hi"}),
+                                          text("Sent.")]
+    rig.mic.say("send it to the team", woke=True)
+    await wait_until(lambda: rig.orch.state == State.FOLLOWUP, msg="followup")
+    assert "Sent." in rig.spoken
+    assert not any("WhatsApp now" in x or "compose" in x for x in rig.spoken)
+    narr = [e["text"] for e in rig.events if e["event"] == "activity" and e["kind"] == "narration"]
+    assert any("opening WhatsApp" in t for t in narr)  # shown on the HUD instead
+
+
+async def test_question_say_is_spoken(rig: Rig) -> None:
+    rig.scripts["book it"] = [say("Which day works, Monday or Tuesday?"), pause()]
+    rig.mic.say("book it", woke=True)
+    await wait_until(lambda: "Which day works, Monday or Tuesday?" in rig.spoken, msg="question")

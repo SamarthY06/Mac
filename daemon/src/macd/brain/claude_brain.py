@@ -1027,8 +1027,11 @@ class ClaudeBrain:
         if etype == "message_start":
             a.saw_delta = False
         elif etype == "content_block_start":
-            if (ev.get("content_block") or {}).get("type") == "text" and a.emitted_text:
+            btype = (ev.get("content_block") or {}).get("type")
+            if btype == "text" and a.emitted_text:
                 self._emit(BrainEventKind.TEXT, a.turn_id, text="\n", data={"block_start": True})
+            elif btype == "tool_use":  # the text before this was a step line, not the answer
+                self._emit(BrainEventKind.TEXT, a.turn_id, text="", data={"tool_follows": True})
         elif etype == "content_block_delta":
             delta = ev.get("delta") or {}
             if delta.get("type") == "text_delta" and delta.get("text"):
