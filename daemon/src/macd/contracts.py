@@ -131,6 +131,7 @@ class BrainEventKind(str, enum.Enum):
     SAY = "say"  # model called mcp__mac__say(text): speak now
     CONFIRM = "confirm"  # model called request_confirmation(summary): await human yes/no
     STATUS = "status"  # informational (e.g. chrome connected / session id)
+    ATTACH = "attach"  # mac.send_file: data = {"attach_id", "path", "caption"} (chat profile only)
     DONE = "done"  # turn finished (ResultMessage)
     ERROR = "error"  # classified error, see BrainError
 
