@@ -494,3 +494,43 @@ def test_chat_note_has_no_dashes() -> None:
     assert "—" not in prompts.CHAT_CHANNEL_NOTE and "–" not in prompts.CHAT_CHANNEL_NOTE
     for reason in (cb.REASON_DESKTOP_BUSY_CHAT, cb.REASON_DESKTOP_BUSY_VOICE):
         assert "—" not in reason and "–" not in reason
+
+
+# ----------------------------------------------------------------------------- rate-limit reset_at
+
+
+async def test_rate_limit_error_carries_reset_at(make) -> None:
+    from claude_agent_sdk import RateLimitEvent, RateLimitInfo
+
+    def r(c: MockClient, p: str) -> None:
+        if p == "first":
+            c.push(RateLimitEvent(RateLimitInfo(status="rejected", resets_at=1_900_000_000), "u", "s"),
+                   result(is_error=True, result="usage limit reached", api_error_status=429))
+        else:
+            c.push(result(is_error=True, result="Claude AI usage limit reached|1900003600",
+                          api_error_status=429))
+
+    brain = make(r)
+    await brain.start()
+    await brain.ask(1, "first")
+    (err,) = [e for e in await collect(brain) if e.kind == K.ERROR]
+    assert err.error_kind is not None and err.error_kind.value == "rate_limit"
+    assert err.data["reset_at"] == 1_900_000_000.0 and isinstance(err.data["reset_at"], float)
+    brain._rate_reset_at = None  # unknown from the event: falls back to the epoch in the text
+    await brain.ask(2, "second")
+    (err2,) = [e for e in await collect(brain) if e.kind == K.ERROR]
+    assert err2.data["reset_at"] == 1_900_003_600.0
+    await brain.close()
+
+
+async def test_error_without_known_reset_has_no_reset_at(make) -> None:
+    def r(c: MockClient, p: str) -> None:
+        c.push(result(is_error=True, result="usage limit reached", api_error_status=429))
+
+    brain = make(r)
+    await brain.start()
+    await brain.ask(1, "x")
+    (err,) = [e for e in await collect(brain) if e.kind == K.ERROR]
+    await brain.close()
+    assert err.error_kind is not None and err.error_kind.value == "rate_limit"
+    assert "reset_at" not in err.data

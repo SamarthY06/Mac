@@ -424,7 +424,7 @@ class ClaudeBrain:
             msg = (last.message if last and kind in (BrainErrorKind.AUTH, BrainErrorKind.RATE_LIMIT)
                    else f"I'm having trouble reaching Claude. I'll try again in about {wait} seconds.")
             self._emit(BrainEventKind.ERROR, turn_id, text=msg, is_error=True, error_kind=kind,
-                       data={"circuit_open": True, "retry_in_s": wait})
+                       data=self._error_data(last, {"circuit_open": True, "retry_in_s": wait}))
             return
         self._put(_Cmd("ask", turn_id, text))
 
@@ -719,6 +719,17 @@ class ClaudeBrain:
             self._emit(BrainEventKind.STATUS, d.turn_id,
                        data={"gate": {"tool": d.tool_name, "verdict": d.verdict, "code": d.code,
                                       "allowed": False}})
+
+    def _error_data(self, err: errors.ClassifiedError | None, data: dict[str, Any]) -> dict[str, Any]:
+        """ERROR data, plus ``reset_at`` (wall-clock epoch seconds) for a rate limit whose reset
+        time is known: from the CLI's rate_limit_event, else an epoch in the error text."""
+        if err is None or err.kind is not BrainErrorKind.RATE_LIMIT:
+            return data
+        reset_at: float | None = float(self._rate_reset_at) if self._rate_reset_at else None
+        if reset_at is None:
+            m = errors._EPOCH.search(f"{err.detail} {err.message}")
+            reset_at = float(m.group(1)) if m else None
+        return {**data, "reset_at": reset_at} if reset_at else data
 
     def stderr_tail(self, n: int = 40) -> str:
         return "\n".join(list(self._stderr)[-n:])
@@ -1023,7 +1034,7 @@ class ClaudeBrain:
             return
         if err is not None:
             self._emit(BrainEventKind.ERROR, cmd.turn_id, text=err.message, is_error=True,
-                       error_kind=err.kind, data=err.as_data())
+                       error_kind=err.kind, data=self._error_data(err, err.as_data()))
             return
         now = self._clock()
         self._active = _Turn(cmd.turn_id, now + self._max_turn_s(), texts=[cmd.text])
@@ -1188,7 +1199,7 @@ class ClaudeBrain:
                 self._emit(BrainEventKind.DONE, a.turn_id, data={"interrupted": True})
             elif not a.timed_out:
                 self._emit(BrainEventKind.ERROR, a.turn_id, text=err.message, is_error=True,
-                           error_kind=err.kind, data=err.as_data())
+                           error_kind=err.kind, data=self._error_data(err, err.as_data()))
         if reconnect:
             await self._park_session()
         await self._next_pending()
@@ -1418,7 +1429,7 @@ class ClaudeBrain:
                         "usage limit", resets_at=self._rate_reset_at).message, err.detail)
                 self._record_failure(err)
                 self._emit(BrainEventKind.ERROR, a.turn_id, text=err.message, is_error=True,
-                           error_kind=err.kind, data={**data, **err.as_data()})
+                           error_kind=err.kind, data=self._error_data(err, {**data, **err.as_data()}))
             else:
                 self._record_success()
                 self._emit(BrainEventKind.DONE, a.turn_id, data=data)
