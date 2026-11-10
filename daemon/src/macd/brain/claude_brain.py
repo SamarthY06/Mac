@@ -87,13 +87,6 @@ _SILENT_TOOLS = {SAY_TOOL, CONFIRM_TOOL}
 _SWITCH_TOOL = "mcp__mac__switch_workspace"
 HANDOFF_TURN = -1  # turn id of the silent session-handoff query (never emitted)
 PROBE_TURN = -2  # turn id of the silent connect_check probe query (never emitted)
-TABS_TURN = -3  # turn id of the silent "close your own Chrome tabs" query (chat profile)
-TABS_TIMEOUT_S = 30.0
-TABS_PROMPT = (
-    "[Internal, not shown to the user.] The task is finished. Close every tab in your own Chrome "
-    "tab group with mcp__claude-in-chrome__tabs_close_mcp (list them with tabs_context_mcp; don't "
-    "create a group if you have none). Never close other tabs. Call no other tools; reply with no text.")
-_TABS_TOOLS = {"mcp__claude-in-chrome__tabs_context_mcp", "mcp__claude-in-chrome__tabs_close_mcp"}
 STEER_REPLY_TIMEOUT_S = 15.0
 PROBE_PROMPT = "Reply with exactly the word OK and nothing else. Do not use any tools."
 CONNECT_CHECK_TIMEOUT_S = 25.0
@@ -175,7 +168,7 @@ class StateJsonSessionStore:
 CHAT_PROFILE: dict[str, Any] = {
     "steer_only": True, "rotate_after_idle_min": None, "handoff_enabled": False,
     "on_resume_fallback": "status", "max_turn_s": 2700.0, "write_claude_md": False,
-    "whatsapp_ui_block": True, "send_file": True, "close_own_tabs": True, "switch_workspace": True,
+    "whatsapp_ui_block": True, "send_file": True, "switch_workspace": True,
     "channel": "chat", "desktop_wait_s": CHAT_DESKTOP_WAIT_S,
     "desktop_busy_reason": REASON_DESKTOP_BUSY_CHAT, "confirm_timeout_s": 600.0,
 }
@@ -207,7 +200,6 @@ class _Turn:
     queries: int = 1
     handoff: bool = False  # silent, memory-tools-only query (session handoff)
     probe: bool = False  # silent, tool-less connect_check query
-    tabs: bool = False  # silent "close your own Chrome tabs" query (chat profile)
     switch: tuple[str, str] | None = None  # (folder, mode) the model asked to move to (AG1)
     after: Callable[[], Any] | None = None  # deferred action once a handoff turn ends
     future: asyncio.Future[bool] | None = None
@@ -288,7 +280,6 @@ class ClaudeBrain:
                  channel_note: str = "",
                  send_file: bool = False,
                  test_tools: bool = False,
-                 close_own_tabs: bool = False,
                  desktop_locks: Sequence[DesktopLock] | None = None,
                  desktop_wait_s: float = VOICE_DESKTOP_WAIT_S,
                  desktop_busy_reason: str = REASON_DESKTOP_BUSY_VOICE,
@@ -333,13 +324,11 @@ class ClaudeBrain:
         if channel != "chat":
             on_set_persona = None  # set_persona exists only in chat profiles (W9.4)
         self._never_chat_names = tuple(never_chat_names)
-        self._close_own_tabs = close_own_tabs
         self._ingest_all_tabs = whatsapp_ui_block  # keep tab hosts fresh for the M1 block
         self._fork_next = False  # the next connect resumes `_resume_next` as a fork
         self._fork_live = False  # connected to a fork whose new session id is not known yet
         self._fallback_from: str | None = None  # F9: the session a failed resume dropped
         self._connected_sources: list[str] | None = None
-        self._tabs_dirty = False  # a chat turn used Chrome: close its own tab group after it
         self._chrome_running = chrome_running
         self._frontmost = frontmost
         self._clock = clock
@@ -716,8 +705,6 @@ class ClaudeBrain:
             return "Connection check: no tools; just reply OK."
         if a is not None and a.handoff and tool not in MEMORY_TOOLS:
             return "Session handoff: only mcp__mac__remember / forget / rewrite_memory may be called."
-        if a is not None and a.tabs and tool not in _TABS_TOOLS:
-            return "Tab cleanup: only tabs_context_mcp and tabs_close_mcp may be called."
         if a is not None and a.switch is not None:
             return "A move to another folder is pending: stop now and call no more tools."
         return None
@@ -1302,24 +1289,11 @@ class ClaudeBrain:
             await self._on_ask(self._pending.popleft())
         if self._active is None:
             self._idle_at = self._clock()
-            if self._tabs_dirty and self._client is not None and not self._closing:
-                await self._start_tab_cleanup()
-            elif self._sleep_requested and self._client is not None:
+            if self._sleep_requested and self._client is not None:
                 await self._on_sleep(_Cmd("sleep"))
             elif self._client is not None and self.chrome_connected is False and self._chrome_recheck_due():
                 log.info("brain: Chrome appeared; reconnecting at idle to re-probe the extension")
                 await self._park_session()
-
-    async def _start_tab_cleanup(self) -> None:
-        """P0.1 case (a): a chat turn closes its own Chrome tab group once it is done. A silent
-        query limited to the two tab tools; a new ask interrupts it like a handoff."""
-        self._tabs_dirty = False
-        self._active = _Turn(TABS_TURN, self._clock() + TABS_TIMEOUT_S, tabs=True)
-        log.info("brain: closing this session's Chrome tabs")
-        try:
-            await self._client.query(TABS_PROMPT)
-        except Exception as e:  # noqa: BLE001
-            await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
 
     # ------------------------------------------------------------------ messages
     async def _on_msg(self, cmd: _Cmd) -> None:
@@ -1433,8 +1407,6 @@ class ClaudeBrain:
                 inp = block.input or {}
                 if block.name == f"{_CHROME}navigate":
                     self.tools.chrome_tabs.note_navigate(inp.get("tabId"), str(inp.get("url", "")))
-                if self._close_own_tabs and a.turn_id > 0 and block.name.startswith(_CHROME):
-                    self._tabs_dirty = True
                 if block.name in _SILENT_TOOLS:
                     continue
                 self._emit(BrainEventKind.TOOL_START, a.turn_id, tool_name=block.name,
@@ -1486,9 +1458,6 @@ class ClaudeBrain:
     async def _finish_turn(self, a: _Turn, msg: ResultMessage) -> None:
         self._active = None
         self._cancelled.discard(a.turn_id)
-        if a.tabs:
-            await self._next_pending()
-            return
         if a.handoff:
             await self._end_handoff(a, ok=not a.draining)
             await self._next_pending()

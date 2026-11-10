@@ -1,6 +1,6 @@
 """ClaudeBrain profile arguments (WhatsApp ARCHITECTURE W3.1): M3 session store, F9 session
 policy, F12 steer_only, F11 shared memory, mac.send_file ATTACH, desktop lease teardown, the
-chat tab cleanup, fork resumes and the setting-sources re-check. Mocked SDK client."""
+no hidden tab cleanup, fork resumes and the setting-sources re-check. Mocked SDK client."""
 
 from __future__ import annotations
 
@@ -369,66 +369,16 @@ async def test_two_brains_share_the_desktop_one_at_a_time(make, tmp_path: Path) 
     await voice.close()
 
 
-# ----------------------------------------------------------------------------- tab cleanup
+# ----------------------------------------------------------------------------- Chrome tabs
 
 
-def _chrome_turn(answer: str = "Done.") -> Any:
+async def test_chat_turn_runs_no_hidden_tab_cleanup(make) -> None:
+    """Claude closes (or keeps) its own tabs itself; Mac runs no extra query after a Chrome turn."""
     def r(c: MockClient, p: str) -> None:
-        if p == cb.TABS_PROMPT:
-            c.push(assistant(ToolUseBlock("tc1", "mcp__claude-in-chrome__tabs_close_mcp", {"tabId": 5})),
-                   result())
-        else:
-            c.push(init(), assistant(ToolUseBlock("n1", "mcp__claude-in-chrome__navigate",
-                                                  {"url": "https://example.com", "tabId": 5})),
-                   delta(answer), result())
-    return r
-
-
-async def test_chat_turn_closes_its_own_tabs_silently(make) -> None:
-    brain = make(_chrome_turn(), chat=True)
-    await brain.start()
-    await brain.ask(1, "check example.com")
-    evs = await collect(brain)
-    for _ in range(100):
-        if brain._active is None and len(MockClient.instances[0].queries) == 2:
-            break
-        await asyncio.sleep(0.01)
-    assert MockClient.instances[0].queries == ["check example.com", cb.TABS_PROMPT]
-    await brain.ask(2, "next")
-    evs2 = await collect(brain)
-    await brain.close()
-    assert all(e.turn_id in (1, 2) for e in evs + evs2)  # the cleanup emits nothing
-    assert [e.kind for e in evs2].count(K.DONE) == 1
-
-
-async def test_tab_cleanup_allows_only_tab_tools(make) -> None:
-    seen: dict[str, Any] = {}
-
-    def r(c: MockClient, p: str) -> Any:
-        if p != cb.TABS_PROMPT:
-            return _chrome_turn()(c, p)
-
-        async def cleanup() -> None:
-            seen["bash"] = await brain.hook(pre("Bash", {"command": "ls"}), "b")
-            seen["close"] = await brain.hook(pre("mcp__claude-in-chrome__tabs_close_mcp", {"tabId": 5}), "c")
-            c.push(result())
-        return cleanup()
-
+        c.push(init(), assistant(ToolUseBlock("n1", "mcp__claude-in-chrome__navigate",
+                                              {"url": "https://example.com", "tabId": 5})),
+               delta("Done."), result())
     brain = make(r, chat=True)
-    await brain.start()
-    await brain.ask(1, "go")
-    await collect(brain)
-    for _ in range(100):
-        if "close" in seen:
-            break
-        await asyncio.sleep(0.01)
-    await brain.close()
-    assert seen["bash"]["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert seen["close"] == {}
-
-
-async def test_voice_never_runs_a_tab_cleanup(make) -> None:
-    brain = make(_chrome_turn())
     await brain.start()
     await brain.ask(1, "check example.com")
     await collect(brain)

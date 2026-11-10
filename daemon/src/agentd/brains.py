@@ -107,7 +107,7 @@ def fake_factory(make: Callable[[BrainSpec], Brain] | None = None) -> BrainFacto
 CLAUDE_ARGS = ("cwd", "session_store", "memory_file", "recent_user_text", "steer_only",
                "rotate_after_idle_min", "handoff_enabled", "on_resume_fallback", "max_turn_s",
                "write_claude_md", "setting_sources", "env_exempt_dir", "whatsapp_ui_block",
-               "never_chat_names", "channel_note", "send_file", "close_own_tabs", "desktop_locks",
+               "never_chat_names", "channel_note", "send_file", "desktop_locks",
                "desktop_wait_s", "desktop_busy_reason", "confirm_timeout_s")
 
 

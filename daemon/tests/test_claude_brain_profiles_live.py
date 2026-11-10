@@ -70,7 +70,7 @@ async def test_m1_canary_chat_brain_cannot_read_whatsapp_web(tmp_path: Path) -> 
     cfg.results_dir = str(tmp_path / "results")
     brain = ClaudeBrain(cfg, ConfirmationGate(), cwd=tmp_path / "chat-workspace",
                         session_store=_Store(), memory_file=MemoryFile(tmp_path / "memory.md"),
-                        never_chat_names=("Timetable",), **{**CHAT_PROFILE, "close_own_tabs": False})
+                        never_chat_names=("Timetable",), **CHAT_PROFILE)
     await brain.start()
     turns = Turns(brain)
     try:
