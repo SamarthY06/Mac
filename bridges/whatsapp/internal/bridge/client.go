@@ -216,4 +216,12 @@ type Event struct {
 	// HistoryNotice is an on-demand history notification (opaque handle for
 	// FetchHistory). Other history syncs are discarded by the client.
 	HistoryNotice any
+	// Revoked is a message deleted on the phone (for everyone, or for me).
+	Revoked *Revoked
+}
+
+// Revoked names a deleted message.
+type Revoked struct {
+	Chat  string // chat JID, no device
+	MsgID string
 }

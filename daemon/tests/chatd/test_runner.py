@@ -32,7 +32,7 @@ from agentd import schema as s
 from agentd.service import RESTART_TEXT
 from chatd import format as fmt
 from chatd.agent_client import AgentClient, AgentFatal, dev_token, read_lifeline_token
-from chatd.channels.base import Cap, ChatChanged
+from chatd.channels.base import Cap, ChatChanged, ContextMessage, MessageRef
 from chatd.channels.fake import FakeChannel
 from chatd.channels.registry import ChannelContext, SeenIds
 from chatd.context import Ring, resolve_mentions
@@ -1198,6 +1198,35 @@ async def test_an_ask_with_an_empty_ring_requests_history(group: World) -> None:
     await group.r.settle()
     first = group.r.rings[CHAT_ID].messages()[0]
     assert (first.msg_ref, first.earlier) == ("h1", True)
+
+
+async def test_a_deleted_message_leaves_the_ring_for_good(group: World) -> None:
+    """Deleted on WhatsApp: never in a later ask's context, and a late history page can't bring it back."""
+    calls = spy(group.r)
+    await group.ch.inject_context("keep this", chat_id=CHAT_ID, msg_id="c1")
+    await group.ch.inject_context("delete me", chat_id=CHAT_ID, msg_id="c2")
+    await group.r.settle()
+    await group.r._context_sink(ContextMessage(channel="fake", chat_id=CHAT_ID, ref=MessageRef(CHAT_ID, "c2"),
+                                               deleted=True))
+    await group.ch.inject_context("delete me", chat_id=CHAT_ID, msg_id="c2", history=True)
+    await group.done(await group.say("Mac, hi"))
+    ask = next(a for op, a in calls if op == "ask")
+    assert [m.msg_ref for m in ask["context"].messages] == ["c1"]
+
+
+async def test_new_chat_starts_with_no_earlier_messages(group: World) -> None:
+    """"new chat" drops the ring (Mac's old replies included) and fetches no history to refill it."""
+    calls = spy(group.r)
+    await group.ch.inject_context("old talk", chat_id=CHAT_ID, msg_id="c1")
+    await group.done(await group.say("Mac, hi"))
+    await group.say("Mac new chat")
+    await until(lambda: any(op == "new_session" for op, _ in calls))
+    await group.r.settle()
+    n_hist = len(group.ch.history_requests)
+    await group.done(await group.say("Mac, hello"))
+    ask = [a for op, a in calls if op == "ask"][-1]
+    assert ask.get("context") is None or not ask["context"].messages
+    assert len(group.ch.history_requests) == n_hist
 
 
 async def test_an_answer_that_tags_is_a_new_message_and_joins_the_ring(group: World) -> None:

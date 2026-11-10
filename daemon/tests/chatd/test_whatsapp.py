@@ -750,6 +750,16 @@ async def test_context_event_rechecked_in_the_adapter(harness: WaHarness) -> Non
     await a.close()
 
 
+async def test_revoked_reaches_on_context_as_deleted(harness: WaHarness) -> None:
+    rig = await harness.rig()
+    a = adapter(rig)
+    await a.set_allowed(rig.ctx.chats, {PREP})
+    await emit(harness, rig, {"ev": "revoked", "chat": "120363000000000077@g.us", "msg": "x1"})  # not allowed
+    await emit(harness, rig, {"ev": "revoked", "chat": PREP, "msg": "c9"})
+    assert [(c.chat_id, c.ref.message_id, c.deleted, c.text) for c in rig.contexts] == [(PREP, "c9", True, "")]
+    await a.close()
+
+
 async def test_set_allow_context_must_be_inside_allow(harness: WaHarness) -> None:
     rig = await harness.rig()
     a = adapter(rig)

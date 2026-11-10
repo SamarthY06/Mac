@@ -1004,7 +1004,22 @@ func (b *Bridge) onEvent(e Event) {
 		b.inbound(e.Message)
 	case e.HistoryNotice != nil:
 		b.historyNotice(e.HistoryNotice)
+	case e.Revoked != nil:
+		b.revoked(e.Revoked)
 	}
+}
+
+// revoked tells chatd that a message of an allowed chat was deleted, so it
+// leaves the context Mac sends to the model. Never for a denied chat.
+func (b *Bridge) revoked(r *Revoked) {
+	b.mu.Lock()
+	ok := b.allow[r.Chat] && !b.deny[r.Chat]
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	b.w.event("revoked", map[string]any{"chat": r.Chat, "msg": r.MsgID})
+	b.log.Printf("revoked msg=%s", r.MsgID)
 }
 
 func (b *Bridge) chatChanged(chat string) {

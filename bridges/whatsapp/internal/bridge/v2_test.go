@@ -305,3 +305,17 @@ func TestHistoryRefusedUnderDryRun(t *testing.T) {
 		t.Fatal("history sent under dry run")
 	}
 }
+
+func TestRevokedOnlyForAllowedChats(t *testing.T) {
+	f := newFake()
+	h := start(t, f, ctxFlags...)
+	h.hello()
+	f.fire(Event{Revoked: &Revoked{Chat: never, MsgID: "T1"}})
+	f.fire(Event{Revoked: &Revoked{Chat: "120363000000000077@g.us", MsgID: "X1"}}) // not allowed
+	f.fire(Event{Revoked: &Revoked{Chat: group, MsgID: "G1"}})
+	ev := h.event("revoked")
+	if ev["chat"] != group || ev["msg"] != "G1" || len(ev) != 3 { // ev, chat, msg
+		t.Fatalf("revoked = %v", ev)
+	}
+	h.noEvent("revoked", 100*time.Millisecond)
+}

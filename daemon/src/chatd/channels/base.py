@@ -104,6 +104,7 @@ class ContextMessage:
     quoted_msg: str = ""
     replayed: bool = False
     history: bool = False
+    deleted: bool = False  # the message was deleted on WhatsApp: it leaves the ring
 
 
 @dataclass(frozen=True)

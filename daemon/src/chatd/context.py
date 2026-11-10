@@ -31,16 +31,18 @@ def clip(text: str, limit: int) -> str:
 
 class Ring:
     def __init__(self, max_messages: int = s.CONTEXT_MAX_MESSAGES, max_chars: int = s.CONTEXT_MAX_CHARS,
-                 max_text: int = s.CONTEXT_MAX_TEXT) -> None:
+                 max_text: int = s.CONTEXT_MAX_TEXT, *, fresh: bool = False) -> None:
         self.max_messages, self.max_chars, self.max_text = max_messages, max_chars, max_text
+        self.fresh = fresh  # started by "new chat": no history fetch refills it
         self._items: list[s.ContextMessage] = []  # time order
+        self._deleted: set[str] = set()  # deleted on WhatsApp: never added back (a late history page)
 
     def __len__(self) -> int:
         return len(self._items)
 
     def add(self, msg_ref: str, *, sender: str = "", owner: bool = False, mac: bool = False, at: float = 0.0,
             text: str = "", media: dict[str, Any] | None = None, earlier: bool = False) -> None:
-        if not msg_ref or any(m.msg_ref == msg_ref for m in self._items):
+        if not msg_ref or msg_ref in self._deleted or any(m.msg_ref == msg_ref for m in self._items):
             return
         cm = s.ContextMessage(msg_ref=msg_ref, sender=sender, owner=owner, mac=mac, at=at,
                               text=clip(text, self.max_text) or None,
@@ -54,6 +56,12 @@ class Ring:
     def add_context(self, cm: ContextMessage) -> None:
         self.add(cm.ref.message_id, sender=cm.sender_name or cm.sender, owner=cm.from_owner, at=cm.at,
                  text=cm.text, media=cm.media, earlier=cm.history)
+
+    def remove(self, msg_ref: str) -> None:
+        if len(self._deleted) >= 1000:  # bounded: the oldest ids have long left WhatsApp's history
+            self._deleted.clear()
+        self._deleted.add(msg_ref)
+        self._items = [m for m in self._items if m.msg_ref != msg_ref]
 
     def chars(self) -> int:
         return sum(len(m.text or "") for m in self._items)

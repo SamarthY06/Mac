@@ -430,7 +430,9 @@ class ChatRunner:
     async def _on_context(self, cm: ContextMessage) -> None:
         """Context is data only: it enters the ring and nothing else (W10.1). Never the parser,
         reply, steer or ask."""
-        if cm.chat_id in self.profiles:  # the adapter emits context only for its context set
+        if cm.deleted:  # deleted on WhatsApp: never sent to the model again
+            self.rings.setdefault(cm.chat_id, Ring()).remove(cm.ref.message_id)
+        elif cm.chat_id in self.profiles:  # the adapter emits context only for its context set
             self.rings.setdefault(cm.chat_id, Ring()).add_context(cm)
 
     async def _refresh_members(self, chat_id: str) -> None:
@@ -455,7 +457,8 @@ class ChatRunner:
         """After the first accepted ask with an empty ring, ask the phone for 30 earlier messages;
         they arrive later as history context (W10.3). The adapter and bridge own the bounds (context
         set, once an hour, budget) and answer False when they refuse."""
-        if self.rings.get(st.chat_id):
+        ring = self.rings.get(st.chat_id)
+        if ring is not None and (len(ring) or ring.fresh):
             return
         try:
             await self.adapter.request_history(st.chat_id, msg.ref, cx.HISTORY_COUNT)
@@ -1102,6 +1105,7 @@ class ChatRunner:
                 await self._send(st, None, fmt.STOP_FIRST, reply_to=mid)
                 return True
             await self.client.call("new_session", conv=conv, folder=arg or None)
+            self.rings[st.chat_id] = Ring(fresh=True)  # a fresh start carries no earlier messages
             await self._send(st, None, fmt.FRESH_IN.format(folder=arg) if arg else fmt.FRESH, reply_to=mid)
         elif cmd == "status":
             data: s.ConversationStatus = await self.client.call("status", conv=conv)

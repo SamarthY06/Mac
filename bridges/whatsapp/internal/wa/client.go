@@ -540,7 +540,17 @@ func (c *Client) onWAEvent(evt any) {
 			}
 			return
 		}
+		if pm := v.Message.GetProtocolMessage(); pm != nil && pm.GetType() == waE2E.ProtocolMessage_REVOKE {
+			if id := pm.GetKey().GetID(); id != "" {
+				c.emit(bridge.Event{Revoked: &bridge.Revoked{Chat: v.Info.Chat.ToNonAD().String(), MsgID: id}})
+			}
+			return
+		}
 		c.emit(bridge.Event{Message: c.convert(v)})
+	case *events.DeleteForMe:
+		if v.MessageID != "" {
+			c.emit(bridge.Event{Revoked: &bridge.Revoked{Chat: v.ChatJID.ToNonAD().String(), MsgID: v.MessageID}})
+		}
 	}
 }
 

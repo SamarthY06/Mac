@@ -478,6 +478,11 @@ class WhatsAppChannel:
             await self._message(ev)
         elif name == "context":
             await self._context_event(ev)
+        elif name == "revoked":
+            chat, mid = str(ev.get("chat", "")), str(ev.get("msg", ""))
+            if chat and mid and self.ctx.allowed(chat) and (cb := self._on_context) is not None:
+                log.debug("whatsapp: %s deleted", mid)
+                await cb(ContextMessage(channel=self.name, chat_id=chat, ref=MessageRef(chat, mid), deleted=True))
         elif name == "connected":
             if isinstance(ev.get("device"), int):
                 self._own_device = ev["device"]
