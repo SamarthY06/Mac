@@ -50,6 +50,9 @@ class ConversationRecord:
     fresh_next: bool = False  # new_session: the next ask starts a new session
     fresh_folder: str | None = None  # new_session{folder}: a folder name or path for the next ask
     voice_migrated: bool = False  # M3: the one-time copy of state.json["brain"] was made
+    # V1 (W10.2): per session id, the ask.context msg_refs already framed into it (last 200);
+    # "" holds a brand-new session's until its id arrives
+    framed: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

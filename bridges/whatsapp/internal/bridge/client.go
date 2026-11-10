@@ -2,6 +2,9 @@ package bridge
 
 import (
 	"context"
+	"errors"
+	"io"
+	"os"
 	"time"
 )
 
@@ -31,8 +34,14 @@ type Client interface {
 	ListChats(ctx context.Context) ([]ChatInfo, error)
 	GetChat(ctx context.Context, chat string) (ChatInfo, error)
 
-	SendText(ctx context.Context, chat, text string, reply *ReplyRef) (msgID string, err error)
-	Edit(ctx context.Context, chat, msgID, text string) error
+	// Members lists a chat's current participants (GetGroupInfo; the self
+	// chat lists only the owner). Names: contact name, else push name.
+	Members(ctx context.Context, chat string) ([]Member, error)
+
+	// SendText and Edit set ContextInfo.MentionedJID to mentions (already
+	// checked by the bridge against the participants and the text).
+	SendText(ctx context.Context, chat, text string, reply *ReplyRef, mentions []string) (msgID string, err error)
+	Edit(ctx context.Context, chat, msgID, text string, mentions []string) error
 	// React reacts to msgID sent by sender (a user JID). emoji "" removes it.
 	React(ctx context.Context, chat, sender, msgID, emoji string) error
 	SendMedia(ctx context.Context, m MediaOut) (msgID string, err error)
@@ -42,6 +51,17 @@ type Client interface {
 	// Download fetches inbound media. Only ever called for images and
 	// documents of messages that passed the inbound filter.
 	Download(ctx context.Context, m *MediaIn) ([]byte, error)
+	// DownloadToFile streams media into f, which refuses writes past its cap
+	// (quoted media: the limit is on the bytes actually read).
+	DownloadToFile(ctx context.Context, m *MediaIn, f *CappedFile) error
+
+	// RequestHistory sends an on-demand history request for the messages
+	// before `before` to the owner's phone (a peer message). The answer
+	// arrives later as an Event.HistoryNotice.
+	RequestHistory(ctx context.Context, before MsgMeta, count int) error
+	// FetchHistory downloads and parses an on-demand history blob. It never
+	// downloads media.
+	FetchHistory(ctx context.Context, notice any) ([]*Inbound, error)
 
 	// SetHandler installs the event sink. Called once, before Connect.
 	SetHandler(func(Event))
@@ -71,6 +91,51 @@ type ChatInfo struct {
 	Members   int    `json:"members"`
 	OwnerOnly bool   `json:"owner_only"`
 	IsSelf    bool   `json:"is_self"`
+}
+
+// Member is one participant of a chat. Number is the user part of JID, the
+// form an @-mention takes in the text.
+type Member struct {
+	JID    string `json:"jid"`
+	Number string `json:"number"`
+	Name   string `json:"name"`
+}
+
+// MsgMeta identifies a message for a history request.
+type MsgMeta struct {
+	Chat   string
+	ID     string
+	FromMe bool
+	At     time.Time
+}
+
+// ErrTooLarge is returned by CappedFile once its cap is passed.
+var ErrTooLarge = errors.New("media over the size cap")
+
+// CappedFile is an *os.File that refuses to grow past Cap bytes, so a
+// download is cut off on the bytes it actually writes (a retry that seeks
+// back to 0 starts over).
+type CappedFile struct {
+	*os.File
+	Cap int64
+}
+
+func (f *CappedFile) Write(p []byte) (int, error) {
+	pos, err := f.File.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	if pos+int64(len(p)) > f.Cap {
+		return 0, ErrTooLarge
+	}
+	return f.File.Write(p)
+}
+
+func (f *CappedFile) WriteAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) > f.Cap {
+		return 0, ErrTooLarge
+	}
+	return f.File.WriteAt(p, off)
 }
 
 // ReplyRef is a resolved quote target.
@@ -106,6 +171,7 @@ type Inbound struct {
 	SenderUser   string // sender JID without device, e.g. 123@s.whatsapp.net or 456@lid
 	SenderAlt    string // alternate address of the sender (PN <-> LID), may be empty
 	SenderDevice int
+	SenderName   string // contact name, else push name; never logged
 	IsFromMe     bool
 	Timestamp    time.Time
 	Replayed     bool
@@ -120,12 +186,15 @@ type Inbound struct {
 	Media    *MediaIn
 }
 
-// Quoted is the context of a reply.
+// Quoted is the context of a reply, as parsed from ContextInfo.
 type Quoted struct {
-	MsgID       string `json:"msg"`
-	Text        string `json:"text"`
-	Participant string `json:"-"`
-	FromOwner   bool   `json:"from_owner"`
+	MsgID       string
+	Text        string
+	Participant string   // author (user JID, no device); "" when unknown
+	SenderName  string   // contact or push name of the author, when known
+	RemoteJID   string   // ContextInfo.RemoteJID: set when the quote is from another chat
+	Links       []string // URLs of the quoted text and its link preview
+	Media       *MediaIn // image/document/voice/... of the quoted message
 }
 
 // Reaction is an inbound reaction.
@@ -144,4 +213,7 @@ type Event struct {
 	SyncStart   bool   // offline sync began
 	SyncDone    bool   // offline sync finished
 	StoreError  string // detail
+	// HistoryNotice is an on-demand history notification (opaque handle for
+	// FetchHistory). Other history syncs are discarded by the client.
+	HistoryNotice any
 }

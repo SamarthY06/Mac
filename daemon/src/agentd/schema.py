@@ -22,7 +22,7 @@ from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import cache
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
-API_VERSION = "1.1"
+API_VERSION = "1.2"
 MAX_LINE_BYTES = 1 << 20  # 1 MiB per line
 REPLAY_BUFFER_EVENTS = 2_000  # per conversation
 CLIENT_QUEUE_EVENTS = 10_000  # per connection, then slow_client
@@ -139,6 +139,57 @@ class AskMeta:
     msg_ref: str = ""
 
 
+# ask.context (1.2, W10): untrusted chat content, validated and framed by agentd, never trimmed
+CONTEXT_MAX_MESSAGES = 50
+CONTEXT_MAX_CHARS = 8_000  # all message texts together
+CONTEXT_MAX_TEXT = 1_000  # one message text
+CONTEXT_MAX_MEMBERS = 256
+CONTEXT_MAX_LINKS = 10
+FRAMED_REFS_PER_SESSION = 200  # V1: msg_refs already framed into one session
+
+
+@dataclass(kw_only=True)
+class ContextMedia:
+    kind: str
+    name: str | None = None
+    path: str | None = None  # quoted only: realpath inside the chat media dir
+
+
+@dataclass(kw_only=True)
+class ContextMessage:
+    msg_ref: str
+    sender: str
+    owner: bool
+    mac: bool
+    at: float
+    text: str | None = None
+    media: ContextMedia | None = None
+    earlier: bool | None = None  # on-demand history (W10.3)
+
+
+@dataclass(kw_only=True)
+class QuotedMessage:
+    sender: str
+    owner: bool
+    mac: bool
+    at: float
+    text: str | None = None
+    links: list[str] = field(default_factory=list)
+    media: ContextMedia | None = None
+
+
+@dataclass(kw_only=True)
+class OtherChatQuote:
+    kind: Literal["other_chat"]  # a quote from another chat: no content (V3)
+
+
+@dataclass(kw_only=True)
+class AskContext:
+    members: list[str] | None = None
+    messages: list[ContextMessage] | None = None
+    quoted: QuotedMessage | OtherChatQuote | None = None
+
+
 @dataclass(kw_only=True)
 class InterruptedTurn:
     conv: str
@@ -207,11 +258,12 @@ class Workspace:
     settings_changed: bool
 
 
-CAPABILITIES = ("files_read", "files_write", "chrome", "web", "desktop", "send_file", "outward_sends")
+CAPABILITIES = ("files_read", "files_write", "chrome", "web", "desktop", "send_file", "outward_sends",
+                "read_chat")
 # the one plain-words table (UX phase 2 review): every user-facing string names a capability by these
 CAPABILITY_WORDS = {"files_read": "reading files", "files_write": "writing files", "chrome": "Chrome",
                     "web": "the web", "desktop": "the desktop", "send_file": "sending files",
-                    "outward_sends": "sending messages for you"}
+                    "outward_sends": "sending messages for you", "read_chat": "reading group messages"}
 PERSONA_MAX_CHARS = 2000  # W9.1; agentd validates, prompts.py renders with the same limits
 PERSONA_MAX_LINES = 40
 
@@ -227,6 +279,7 @@ class Capabilities:
     desktop: bool = False
     send_file: bool = False
     outward_sends: bool = False
+    read_chat: bool = False  # v3.5 (W10.6): no tool; the group's recent messages and members as context
 
 
 @dataclass(kw_only=True)
@@ -276,6 +329,7 @@ class Ask(Op):
     text: str
     attachments: list[AskAttachment] | None = None
     meta: AskMeta | None = None
+    context: AskContext | None = None  # chat only (1.2)
 
 
 @dataclass(kw_only=True)

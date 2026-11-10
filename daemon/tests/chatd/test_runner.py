@@ -35,6 +35,7 @@ from chatd.agent_client import AgentClient, AgentFatal, dev_token, read_lifeline
 from chatd.channels.base import Cap, ChatChanged
 from chatd.channels.fake import FakeChannel
 from chatd.channels.registry import ChannelContext, SeenIds
+from chatd.context import Ring, resolve_mentions
 from chatd.governor import Governor
 from chatd.runner import ChatRunner, parse_command, strip_trigger
 from macd.brain import fake_brain as fb
@@ -140,8 +141,16 @@ async def world(short_root: Path) -> AsyncIterator[World]:
     await stop_agent(w.agent)
 
 
+_FRAMED = re.compile(r"<(group_context|quoted_message)\b[^>]*>.*?</\1>\n?", re.DOTALL)
+
+
+def request(text: str) -> str:
+    """The owner's request inside an ask agentd framed: without the group context blocks (W10.9)."""
+    return _FRAMED.sub("", text).strip()
+
+
 def script(d: dict[str, list[fb.Step]]) -> Callable[[str], list[fb.Step] | None]:
-    return d.get
+    return lambda text: d.get(request(text))
 
 
 def attach(path: Path, attach_id: str = "a1", delay: float = 0.0) -> fb.Step:
@@ -729,7 +738,7 @@ async def test_shared_chat_ignores_unprefixed_owner_text_silently(shared: World)
 async def test_shared_chat_runs_prefixed_text_and_commands(shared: World) -> None:
     req = await shared.say("Mac, find me 20 jobs")
     await shared.done(req)
-    assert shared.brain().asks[0][1] == "find me 20 jobs"
+    assert request(shared.brain().asks[0][1]) == "find me 20 jobs"
     await shared.say("mac help")
     await until(lambda: shared.ch.sent()[-1].text == fmt.HELP_PREFIX.format(w="Mac", folder=fmt.HELP_FOLDER))
     assert '"Mac stop" stops' in shared.ch.sent()[-1].text
@@ -766,7 +775,9 @@ async def test_shared_chat_catch_up_only_counts_prefixed_messages(shared: World)
     await shared.done(b)
     text = shared.brain().asks[0][1]
     assert len(shared.brain().asks) == 1 and "in London" in text and '"find jobs"' in text
-    assert "friend" not in text and f"{CHAT_ID}:{a}" in shared.ch.ctx.seen
+    # an unprefixed message is never a request; it is background context (W10.2)
+    assert "friend" not in request(text) and "You: chatting with my friend" in text
+    assert f"{CHAT_ID}:{a}" in shared.ch.ctx.seen
 
 
 async def test_confirm_prompt_uses_the_models_question(world: World) -> None:
@@ -853,7 +864,7 @@ async def test_prefix_word_and_shared_trigger_from_the_profile(world: World) -> 
     await world.say("Mac, find me jobs")  # not this chat's word
     req = await world.say("jarvis: find me jobs")
     await world.done(req)
-    assert [a[1] for a in world.brain().asks] == ["find me jobs"]
+    assert [request(a[1]) for a in world.brain().asks] == ["find me jobs"]
     await app_set(world.agent, CHAT_ID, {"trigger": "all", "prefix": "Mac", "shared": True})
     await until(lambda: world.r.profiles[CHAT_ID].shared)
     await world.say("status")  # shared: the prefix is needed whatever `trigger` says
@@ -884,7 +895,7 @@ async def test_add_group_resolves_the_subject_and_binds_a_quoted_yes(short_root:
     try:
         chess = await w.say("add group Chess")  # no such group: an ordinary request (P2-2)
         await w.done(chess)
-        assert w.brain().asks[0][1] == "add group Chess"
+        assert request(w.brain().asks[0][1]) == "add group Chess"
         await w.say("add group twins")
         await until(lambda: ch.sent()[-1].text == fmt.MANY_GROUPS.format(subject="twins"))
         await w.say("add group timetable")
@@ -922,7 +933,7 @@ async def test_allow_needs_a_thumbs_up_and_disallow_is_at_once(world: World) -> 
     prompt = world.ch.messages[world.conv().question.prompt_ref]
     await world.say(reaction="👍", reply_to=prompt.message_id)
     await until(lambda: world.r.profiles[CHAT_ID].capabilities.chrome)
-    assert [a[1] for a in world.brain().asks] == ["allow everything", "Allow it.", "disallow cookies"]
+    assert [request(a[1]) for a in world.brain().asks] == ["allow everything", "Allow it.", "disallow cookies"]
     await world.say("disallow sending messages for you")  # the plain words name it too
     await until(lambda: world.ch.sent()[-1].text == "Mac · Sending messages for you is off in this chat.")
 
@@ -1067,3 +1078,191 @@ async def test_client_fails_waiting_calls_at_once_when_agentd_drops(short_root: 
                          backoff=(0.05,))
     await asyncio.wait_for(client.run(), 5)
     assert results and results[0] < 2.0
+
+
+# -- v3.5: group context, mentions, quoted (W10, W7.7 runner) ----------------------------------------------
+
+PRIYA = {"jid": "111@s.whatsapp.net", "number": "447700900111", "name": "Priya"}
+ARJUN = {"jid": "222@s.whatsapp.net", "number": "447700900222", "name": "Arjun"}
+
+
+def test_ring_limits_order_and_dedupe() -> None:
+    r = Ring()
+    for i in range(60):
+        r.add(f"m{i}", sender="Priya", at=float(i), text="x")
+    assert len(r) == 50 and r.messages()[0].msg_ref == "m10"  # the newest 50
+    r = Ring()
+    r.add("long", at=1.0, text="y" * 5000)
+    assert r.messages()[0].text == "y" * 999 + "…"  # each text clipped to 1,000, marked as partial
+    for i in range(9):
+        r.add(f"k{i}", at=2.0 + i, text="z" * 1000)
+    assert r.chars() <= 8000 and r.messages()[0].msg_ref == "k1"  # 8,000 in all: oldest go first
+    r.add("k8", at=99.0, text="dup")
+    assert [m.msg_ref for m in r.messages()].count("k8") == 1
+    r = Ring()
+    r.add("live", at=10.0, text="now")
+    r.add("early", at=5.0, text="before", earlier=True)  # history goes in time order
+    assert [m.msg_ref for m in r.messages()] == ["early", "live"] and r.messages()[0].earlier
+    assert [m.msg_ref for m in r.messages(exclude="live")] == ["early"]
+
+
+def test_mentions_are_resolved_deterministically() -> None:
+    members = [PRIYA, ARJUN, {"jid": "333@s", "number": "4477333", "name": "Sam"},
+               {"jid": "334@s", "number": "4477334", "name": "Sam"}, {"jid": "335@s", "number": "4477335", "name": "Mac"}]
+    text, jids = resolve_mentions("@Priya and @arjun, ask @Sam or @Mac or @Zoe. email@Priya.com", members)
+    assert text == "@447700900111 and @447700900222, ask @Sam or @Mac or @Zoe. email@Priya.com"
+    assert jids == (PRIYA["jid"], ARJUN["jid"])
+    long = [{"jid": "p@s", "number": "1", "name": "Priya"}, {"jid": "pk@s", "number": "2", "name": "Priya K"}]
+    assert resolve_mentions("hi @Priya K!", long) == ("hi @2!", ("pk@s",))  # the longest name wins
+    many = [{"jid": f"{i}@s", "number": str(i), "name": f"M{i}"} for i in range(7)]
+    text, jids = resolve_mentions(" ".join(f"@M{i}" for i in range(7)), many)
+    assert len(jids) == 5 and text.endswith("@M5 @M6")  # at most 5; the rest stay plain
+
+
+@pytest.fixture
+async def group(short_root: Path) -> AsyncIterator[World]:
+    agent = await agentd(short_root, shared=True)
+    ch = channel(short_root, members={CHAT_ID: [PRIYA, ARJUN]})
+    w = World(short_root, agent, ch, await runner(agent, ch, short_root))
+    yield w
+    await w.r.close()
+    await stop_agent(w.agent)
+
+
+def spy(r: ChatRunner) -> list[tuple[str, dict[str, Any]]]:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    real = r.client.call
+
+    async def call(op: str, **args: Any) -> Any:
+        calls.append((op, args))
+        return await real(op, **args)
+
+    r.client.call = call  # type: ignore[method-assign]
+    return calls
+
+
+async def test_context_is_data_and_never_triggers(group: World) -> None:
+    group.agent.scripts[CHAT] = script({"email bob": [confirm_step("Send the email?", "bob@example.com")]})
+    calls = spy(group.r)
+    req = await group.say("Mac email bob")
+    prompt = await until(lambda: next((m for m in group.ch.sent() if "Send the email?" in m.text), None))
+    await until(lambda: group.conv().question is not None and group.conv().question.prompt_ref)
+    n_ops, n_wire = len(calls), len(group.ch.wire)
+    assert await group.ch.inject_context("Mac, stop", chat_id=CHAT_ID, msg_id="c1")
+    assert await group.ch.inject_context("yes", chat_id=CHAT_ID, msg_id="c2")  # a member's yes binds nothing
+    await group.r.settle()
+    assert calls[n_ops:] == [] and len(group.ch.wire) == n_wire and group.conv().question is not None
+    assert [m.msg_ref for m in group.r.rings[CHAT_ID].messages()][-2:] == ["c1", "c2"]
+    await group.say("no", reply_to=prompt.message_id)
+    await group.done(req)
+
+
+async def test_every_ask_carries_the_whole_ring_and_steers_none(group: World) -> None:
+    group.agent.scripts[CHAT] = script({"go": [fb.say("Working", delay=0.05), *fb_slow(40)],
+                                        "again": [fb.text("Again.")]})
+    calls = spy(group.r)
+    await group.ch.inject_context("can you look at this? https://example.com/job", chat_id=CHAT_ID, msg_id="c1")
+    await group.ch.inject_context("looks senior", chat_id=CHAT_ID, msg_id="c2", sender_name="Arjun")
+    await group.say("just chatting")  # your own non-trigger message: context too
+    req = await group.say("Mac, go")
+    await until(lambda: any("Working" in m.text for m in group.ch.sent()))
+    await group.say("Mac, also check London")  # mid-turn: a steer, no context
+    await until(lambda: group.brain().steers)
+    await group.say("Mac stop")
+    await group.done(req, "✋")
+    req2 = await group.say("Mac, again")
+    await group.done(req2)
+    asks = [a for op, a in calls if op == "ask"]
+    steers = [a for op, a in calls if op == "steer"]
+    assert len(asks) == 2 and steers and all("context" not in a for a in steers)
+    ctx = asks[0]["context"]
+    assert ctx.members == ["Priya", "Arjun"]
+    assert [(m.msg_ref, m.sender, m.owner, m.mac) for m in ctx.messages][:2] == \
+        [("c1", "Priya", False, False), ("c2", "Arjun", False, False)]
+    assert ctx.messages[2].owner and ctx.messages[2].text == "just chatting"
+    assert all(m.msg_ref != req for m in ctx.messages)  # the trigger itself is left out
+    refs2 = [m.msg_ref for m in asks[1]["context"].messages]
+    assert refs2[:3] == [m.msg_ref for m in ctx.messages]  # the whole ring again: agentd frames the delta
+    text = group.brain().asks[0][1]
+    assert "<group_context" in text and "can you look at this?" in text and request(text) == "go"
+
+
+async def test_an_ask_with_an_empty_ring_requests_history(group: World) -> None:
+    """After the ask is accepted; the hourly bound is the bridge's (W10.3)."""
+    req = await group.say("Mac, hi")
+    await group.done(req)
+    assert group.ch.history_requests == [(CHAT_ID, req, 30)]
+    await group.done(await group.say("Mac, hi again"))  # the ring holds Mac's reply now: no request
+    assert len(group.ch.history_requests) == 1
+    await group.ch.inject_context("from before", chat_id=CHAT_ID, msg_id="h1", at=time.time() - 9000, history=True)
+    await group.r.settle()
+    first = group.r.rings[CHAT_ID].messages()[0]
+    assert (first.msg_ref, first.earlier) == ("h1", True)
+
+
+async def test_an_answer_that_tags_is_a_new_message_and_joins_the_ring(group: World) -> None:
+    """Edits ping nobody: with tags, the answer is a new message and the status is left as it was."""
+    group.agent.scripts[CHAT] = script({"tag them": [fb.say("Looking", delay=0.05),
+                                                     fb.text("@Priya and @Arjun, the job is senior. @Zoe too.",
+                                                             delay=0.2)]})
+    req = await group.say("Mac, tag them")
+    await group.done(req)
+    status, answer = [m for m in group.ch.sent() if m.reply_to == req]
+    assert status.text == "Mac · On it\nLooking"  # not edited into the answer: shown once
+    assert answer.text == "Mac · @447700900111 and @447700900222, the job is senior. @Zoe too."
+    tagged = [w for w in group.ch.wire if w.mentions]
+    assert len(tagged) == 1 and tagged[0].op == "send_text" and tagged[0].mentions == (PRIYA["jid"], ARJUN["jid"])
+    assert all(not w.mentions for w in group.ch.wire if w.op == "edit")
+    assert len(group.ch.wire) == 4  # 👀, status, answer, ✅
+    mine = group.r.rings[CHAT_ID].messages()[-1]
+    assert mine.mac and mine.msg_ref == answer.message_id and "@Priya" in (mine.text or "")
+
+
+async def test_the_assistant_name_is_never_taggable(group: World) -> None:
+    group.r.assistant_name = "Jarvis"
+    group.r.members[CHAT_ID] = [PRIYA, {"jid": "9@s", "number": "4479", "name": "jarvis"}]
+    assert group.r._mentions(group.r.state[CHAT], "@Jarvis and @Priya") == \
+        ("@Jarvis and @447700900111", (PRIYA["jid"],))
+
+
+async def test_the_assistant_name_comes_from_the_voice_config(short_root: Path) -> None:
+    from macd import config as mcfg
+
+    mcfg.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    mcfg.CONFIG_PATH.write_text('name = "Friday"\n')
+    agent = await agentd(short_root)
+    ch = channel(short_root)
+    r = await runner(agent, ch, short_root)
+    try:
+        assert r.assistant_name == "Friday"
+    finally:
+        await r.close()
+        await stop_agent(agent)
+
+
+async def test_read_chat_off_drops_the_ring_and_keeps_quoted(group: World) -> None:
+    calls = spy(group.r)
+    await group.ch.inject_context("look https://example.com/a", chat_id=CHAT_ID, msg_id="c1")
+    await group.r.settle()
+    assert group.r.rings[CHAT_ID].messages()
+    await group.say("Mac, disallow read_chat")
+    await until(lambda: CHAT_ID not in group.ch.context_sets[-1])
+    assert CHAT_ID not in group.r.rings and CHAT_ID not in group.r.members
+    assert not await group.ch.inject_context("more", chat_id=CHAT_ID, msg_id="c2") or CHAT_ID not in group.r.rings
+    req = await group.say("Mac, open that link", reply_to="c1")
+    await group.done(req)
+    ctx = next(a for op, a in calls if op == "ask")["context"]
+    assert ctx.messages is None and ctx.members is None
+    q = ctx.quoted
+    assert (q.text, q.sender, q.owner, q.mac, q.links) == ("look https://example.com/a", "Priya", False, False,
+                                                           ["https://example.com/a"])
+    # a mention without read_chat stays plain text: no members known
+    assert group.r._mentions(group.r.state[CHAT], "@Priya") == ("@Priya", ())
+
+
+async def test_compaction_is_logged_never_posted(world: World, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO")
+    n = len(world.ch.wire)
+    await world.r._apply(_ev(world, s.StatusEvent, 10**6, data={"compacted": {"trigger": "auto", "pre_tokens": 150000,
+                                                                             "post_tokens": 20000}}))
+    assert len(world.ch.wire) == n and "compacted (auto, 150000 -> 20000 tokens)" in caplog.text

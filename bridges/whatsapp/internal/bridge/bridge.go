@@ -1,4 +1,4 @@
-// Package bridge implements the wa-bridge stdio protocol, version 1
+// Package bridge implements the wa-bridge stdio protocol, version 2
 // (docs/whatsapp/bridge-protocol.md) on top of an abstract WhatsApp Client.
 package bridge
 
@@ -33,6 +33,14 @@ const (
 	downloadTimeout = 2 * time.Minute  // inbound media, outside the request path
 	editWindow      = 15 * time.Minute // protocol §3 edit
 	maxMedia        = 100 << 20        // protocol §3 send_media, also the inbound cap
+	maxQuotedMedia  = 25 << 20         // protocol §4 quoted.media, on bytes read
+	maxContextText  = 4000             // protocol §4 context.text, in characters
+	maxLinks        = 10               // protocol §4 quoted.links
+	maxMentions     = 5                // protocol §3.1
+	maxHistory      = 50               // protocol §3 history count
+	historyEvery    = time.Hour        // at most one history request per chat
+	historyWait     = 60 * time.Second // an open request expires
+	membersTTL      = 10 * time.Minute // members cache, also cleared on chat changes
 	editReactCap    = 60               // fixed per-minute cap for edit + react
 	drainWait       = 1 * time.Second  // in-flight wait at exit (EOF must exit < 2 s)
 )
@@ -110,9 +118,13 @@ type Bridge struct {
 	mu        sync.Mutex
 	helloDone bool
 	allow     map[string]bool
+	context   map[string]bool // ⊆ allow
 	deny      map[string]bool
 	trusted   map[int]bool
-	used      int // counted outbound actions
+	members   map[string]membersEntry
+	histOpen  map[string]time.Time // chat -> deadline of the open history request
+	histLast  map[string]time.Time // chat -> last history request
+	used      int                  // counted outbound actions
 	exhausted bool
 	sendWin   window
 	editWin   window
@@ -129,14 +141,18 @@ type Bridge struct {
 func newBridge(cfg Config, c Client, w *writer, log *Logger, now func() time.Time) *Bridge {
 	b := &Bridge{
 		cfg: cfg, client: c, w: w, log: log, now: now,
-		exit:    make(chan int, 1),
-		allow:   set(cfg.Allow),
-		deny:    set(cfg.Deny),
-		trusted: map[int]bool{},
-		sendWin: window{limit: cfg.MaxPerMin},
-		editWin: window{limit: editReactCap},
-		senders: newSenderCache(),
-		dropped: map[string]int{},
+		exit:     make(chan int, 1),
+		allow:    set(cfg.Allow),
+		context:  set(cfg.Context),
+		deny:     set(cfg.Deny),
+		members:  map[string]membersEntry{},
+		histOpen: map[string]time.Time{},
+		histLast: map[string]time.Time{},
+		trusted:  map[int]bool{},
+		sendWin:  window{limit: cfg.MaxPerMin},
+		editWin:  window{limit: editReactCap},
+		senders:  newSenderCache(),
+		dropped:  map[string]int{},
 	}
 	for _, d := range cfg.TrustedDevices {
 		b.trusted[d] = true
@@ -287,6 +303,10 @@ type request struct {
 	Mime     string    `json:"mime"`
 	State    string    `json:"state"`
 	Allow    *[]string `json:"allow"`
+	Context  *[]string `json:"context"`
+	Mentions []string  `json:"mentions"`
+	Before   string    `json:"before_msg"`
+	Count    int       `json:"count"`
 	ReplyTo  *struct {
 		Msg    string `json:"msg"`
 		FromMe bool   `json:"from_me"`
@@ -378,6 +398,8 @@ func init() {
 		"presence":      (*Bridge).presence,
 		"chat_presence": (*Bridge).chatPresence,
 		"set_allow":     (*Bridge).setAllow,
+		"members":       (*Bridge).membersOp,
+		"history":       (*Bridge).history,
 		"status":        (*Bridge).status,
 		"logout":        (*Bridge).logout,
 	}
@@ -398,6 +420,7 @@ func (b *Bridge) hello(id int64, r *request) {
 		"bridge_version": BridgeVersion,
 		"linked":         b.client.Linked(),
 		"allow":          sorted(b.allow),
+		"context":        sorted(b.context),
 		"deny":           append([]string{}, b.cfg.Deny...),
 		"dry_run":        b.cfg.DryRun,
 		"test":           b.cfg.Test,
@@ -459,11 +482,28 @@ func (b *Bridge) setAllow(id int64, r *request) {
 			return
 		}
 	}
-	b.allow = next
-	out := sorted(b.allow)
+	ctxSet := map[string]bool{}
+	if r.Context != nil {
+		for _, j := range *r.Context {
+			if !next[j] {
+				b.mu.Unlock()
+				b.fail(id, "bad_args", "context must be a subset of allow")
+				return
+			}
+			ctxSet[j] = true
+		}
+	} else {
+		for j := range b.context { // omitted: keep the current set minus chats no longer allowed
+			if next[j] {
+				ctxSet[j] = true
+			}
+		}
+	}
+	b.allow, b.context = next, ctxSet
+	out, ctxOut := sorted(b.allow), sorted(b.context)
 	b.mu.Unlock()
-	b.log.Printf("allow set: %d chats", len(out))
-	b.ok(id, map[string]any{"allow": out})
+	b.log.Printf("allow set: %d chats, %d context", len(out), len(ctxOut))
+	b.ok(id, map[string]any{"allow": out, "context": ctxOut})
 }
 
 func sorted(m map[string]bool) []string {
@@ -482,6 +522,7 @@ type bucket int
 const (
 	bucketSend bucket = iota // send_text, send_media: --max-per-min
 	bucketEdit               // edit, react: fixed 60/min
+	bucketNone               // history: budget only, no per-minute window
 )
 
 // gate runs checks 1-5 for a counted outbound action, with extra validation
@@ -495,9 +536,10 @@ func (b *Bridge) gate(id int64, chat string, bk bucket, extra func() (string, st
 	if code == "" {
 		now := b.now()
 		b.used++
-		if bk == bucketSend {
+		switch bk {
+		case bucketSend:
 			b.sendWin.add(now)
-		} else {
+		case bucketEdit:
 			b.editWin.add(now)
 		}
 	}
@@ -607,22 +649,24 @@ func (b *Bridge) sendText(id int64, r *request) {
 	if !b.gate(id, r.Chat, bucketSend, extra) {
 		return
 	}
-	chat, text := r.Chat, *r.Text
+	chat, text, asked := r.Chat, *r.Text, r.Mentions
 	if b.cfg.DryRun {
 		msg := b.dryID(chat)
-		b.log.Printf("send_text dry id=%d msg=%s len=%d", id, msg, len(text))
-		b.ok(id, map[string]any{"msg": msg})
+		kept := b.checkMentions(context.Background(), chat, text, asked, false)
+		b.log.Printf("send_text dry id=%d msg=%s len=%d mentions=%d", id, msg, len(text), len(kept))
+		b.ok(id, map[string]any{"msg": msg, "mentioned": kept})
 		return
 	}
 	b.async(func(ctx context.Context) {
-		msg, err := b.client.SendText(ctx, chat, text, reply)
+		kept := b.checkMentions(ctx, chat, text, asked, true)
+		msg, err := b.client.SendText(ctx, chat, text, reply, kept)
 		if err != nil {
 			b.netErr(id, "send_text", err)
 			return
 		}
 		b.recordSent(msg, chat)
-		b.log.Printf("send_text id=%d msg=%s len=%d", id, msg, len(text))
-		b.ok(id, map[string]any{"msg": msg})
+		b.log.Printf("send_text id=%d msg=%s len=%d mentions=%d", id, msg, len(text), len(kept))
+		b.ok(id, map[string]any{"msg": msg, "mentioned": kept})
 	})
 }
 
@@ -644,19 +688,21 @@ func (b *Bridge) edit(id int64, r *request) {
 	if !b.gate(id, r.Chat, bucketEdit, extra) {
 		return
 	}
-	chat, msg, text := r.Chat, r.Msg, *r.Text
+	chat, msg, text, asked := r.Chat, r.Msg, *r.Text, r.Mentions
 	if b.cfg.DryRun {
-		b.log.Printf("edit dry id=%d msg=%s len=%d", id, msg, len(text))
-		b.ok(id, nil)
+		kept := b.checkMentions(context.Background(), chat, text, asked, false)
+		b.log.Printf("edit dry id=%d msg=%s len=%d mentions=%d", id, msg, len(text), len(kept))
+		b.ok(id, map[string]any{"mentioned": kept})
 		return
 	}
 	b.async(func(ctx context.Context) {
-		if err := b.client.Edit(ctx, chat, msg, text); err != nil {
+		kept := b.checkMentions(ctx, chat, text, asked, true)
+		if err := b.client.Edit(ctx, chat, msg, text, kept); err != nil {
 			b.netErr(id, "edit", err)
 			return
 		}
-		b.log.Printf("edit id=%d msg=%s len=%d", id, msg, len(text))
-		b.ok(id, nil)
+		b.log.Printf("edit id=%d msg=%s len=%d mentions=%d", id, msg, len(text), len(kept))
+		b.ok(id, map[string]any{"mentioned": kept})
 	})
 }
 
@@ -956,11 +1002,14 @@ func (b *Bridge) onEvent(e Event) {
 		b.chatChanged(e.ChatChanged)
 	case e.Message != nil:
 		b.inbound(e.Message)
+	case e.HistoryNotice != nil:
+		b.historyNotice(e.HistoryNotice)
 	}
 }
 
 func (b *Bridge) chatChanged(chat string) {
 	b.mu.Lock()
+	delete(b.members, chat) // membership may have changed: re-read before the next mention
 	ok := b.allow[chat] && !b.deny[chat]
 	b.mu.Unlock()
 	if !ok {
@@ -982,23 +1031,25 @@ func (b *Bridge) chatChanged(chat string) {
 // unsupportedKinds are never downloaded (protocol §4).
 var unsupportedKinds = map[string]bool{"voice": true, "audio": true, "video": true, "sticker": true}
 
-// inbound runs the §5 filter, then (only on pass) downloads images and
-// documents and emits the message event.
+// inbound runs the §5 filter. A trigger candidate becomes a `message` event
+// (images and documents downloaded); a non-owner message in a context chat
+// becomes a `context` event (nothing downloaded); the rest is dropped.
 func (b *Bridge) inbound(in *Inbound) {
 	b.mu.Lock()
 	if b.allow[in.Chat] && !b.deny[in.Chat] && in.MsgID != "" && in.SenderUser != "" {
-		b.senders.put(in.Chat, in.MsgID, in.SenderUser)
+		b.senders.put(MsgMeta{Chat: in.Chat, ID: in.MsgID, FromMe: in.IsFromMe, At: in.Timestamp}, in.SenderUser)
 	}
-	st := filterState{
-		allow: b.allow, deny: b.deny, trusted: b.trusted,
-		self: b.identity, sent: b.sent.has, now: b.now(),
-	}
-	reason := filter(in, st)
-	if reason != "" {
+	st := b.filterStateLocked()
+	reason, asContext := filter(in, st)
+	if reason != "" && !asContext {
 		b.dropped[reason]++
 	}
 	replayed := in.Replayed || b.syncing
 	b.mu.Unlock()
+	if asContext {
+		b.emitContext(in, st.self, replayed, false)
+		return
+	}
 	if reason != "" {
 		if reason == dropDenied || reason == dropNotAllowed {
 			b.log.Printf("dropped{%s}", reason)
@@ -1020,9 +1071,7 @@ func (b *Bridge) inbound(in *Inbound) {
 		"unsupported":   "",
 	}
 	if in.Quoted != nil {
-		q := *in.Quoted
-		q.FromOwner = isSelf(q.Participant, st.self) || (q.Participant == "" && b.sentHas(q.MsgID))
-		ev["quoted"] = q
+		ev["quoted"] = b.quoted(in, st.self)
 	}
 	if in.Reaction != nil {
 		ev["reaction"] = in.Reaction
@@ -1039,6 +1088,154 @@ func (b *Bridge) inbound(in *Inbound) {
 	}
 	b.w.event("message", ev)
 	b.log.Printf("message msg=%s device=%d len=%d media=%s replayed=%v", in.MsgID, in.SenderDevice, len(in.Text), kind, replayed)
+}
+
+func (b *Bridge) filterStateLocked() filterState {
+	return filterState{
+		allow: b.allow, context: b.context, deny: b.deny, trustAll: b.cfg.TrustedAll, trusted: b.trusted,
+		self: b.identity, sent: b.sent.has, now: b.now(),
+	}
+}
+
+// emitContext sends a `context` event: data for chatd's ring, never a
+// trigger. Media is described by kind (and a document's name), never fetched.
+func (b *Bridge) emitContext(in *Inbound, self Identity, replayed, history bool) {
+	text := in.Text
+	if r := []rune(text); len(r) > maxContextText {
+		text = string(r[:maxContextText])
+	}
+	ev := map[string]any{
+		"chat":        in.Chat,
+		"msg":         in.MsgID,
+		"sender":      in.SenderUser,
+		"sender_name": in.SenderName,
+		"from_owner":  in.IsFromMe && isSelf(in.SenderUser, self),
+		"at":          float64(in.Timestamp.UnixMilli()) / 1000,
+		"text":        text,
+		"replayed":    replayed,
+		"history":     history,
+	}
+	if m := in.Media; m != nil {
+		media := map[string]any{"kind": m.Kind}
+		if m.Kind == "document" && m.FileName != "" {
+			media["name"] = m.FileName
+		}
+		ev["media"] = media
+	}
+	if in.Quoted != nil {
+		ev["quoted_msg"] = in.Quoted.MsgID
+	}
+	b.w.event("context", ev)
+	b.log.Printf("context msg=%s len=%d history=%v", in.MsgID, len(in.Text), history)
+}
+
+// quoted builds the extended `quoted` of a trigger (protocol §4). Only a quote
+// of the same, non-denied chat carries content; anything else is other_chat.
+func (b *Bridge) quoted(in *Inbound, self Identity) map[string]any {
+	q := in.Quoted
+	b.mu.Lock()
+	foreign := (q.RemoteJID != "" && q.RemoteJID != in.Chat) || b.deny[in.Chat] || b.deny[q.RemoteJID]
+	byUs := b.sent.has(q.MsgID)
+	meta, known := b.senders.meta(in.Chat, q.MsgID)
+	b.mu.Unlock()
+	if foreign {
+		b.log.Printf("quote from another chat msg=%s", in.MsgID)
+		return map[string]any{"msg": q.MsgID, "kind": "other_chat"}
+	}
+	out := map[string]any{
+		"msg":         q.MsgID,
+		"sender":      q.Participant,
+		"sender_name": q.SenderName,
+		"from_owner":  isSelf(q.Participant, self) || (q.Participant == "" && byUs),
+		"from_mac":    byUs,
+		"at":          0.0,
+		"text":        q.Text,
+		"links":       extractLinks(q.Text, q.Links),
+	}
+	if known && !meta.At.IsZero() {
+		out["at"] = float64(meta.At.UnixMilli()) / 1000
+	}
+	if m := q.Media; m != nil {
+		media := map[string]any{"kind": m.Kind}
+		if m.Kind == "image" || m.Kind == "document" {
+			media["name"], media["mime"], media["size"] = m.FileName, m.Mime, m.Size
+			if path, size := b.downloadQuoted(in.MsgID, m); path != "" {
+				media["path"], media["size"] = path, size
+			}
+		}
+		out["media"] = media
+	}
+	return out
+}
+
+var linkRe = regexp.MustCompile(`https?://[^\s<>"'\x60]+`)
+
+// extractLinks returns the http(s) URLs of text plus extra (a link preview's
+// URLs), de-duplicated, at most maxLinks.
+func extractLinks(text string, extra []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, u := range append(linkRe.FindAllString(text, -1), extra...) {
+		u = strings.TrimRight(u, ".,;:!?)]}")
+		low := strings.ToLower(u)
+		if (!strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://")) || seen[u] || len(u) > 2048 {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+		if len(out) == maxLinks {
+			break
+		}
+	}
+	return out
+}
+
+// downloadQuoted fetches a quoted image or document because the owner's
+// trigger quoted it. The cap applies to the bytes actually written; over it,
+// the partial file is deleted and no path is returned. The result is checked
+// with realpath to lie inside the media dir.
+func (b *Bridge) downloadQuoted(msgID string, m *MediaIn) (string, int64) {
+	if m.Handle == nil || m.Size > maxQuotedMedia {
+		b.log.Printf("quoted media skipped msg=%s size=%d", msgID, m.Size)
+		return "", 0
+	}
+	name := unsafeName.ReplaceAllString(m.FileName, "_")
+	if name == "" || name == "." || name == ".." {
+		name = m.Kind
+	}
+	if len(name) > 100 {
+		name = name[len(name)-100:]
+	}
+	path := filepath.Join(b.cfg.MediaDir, "q-"+unsafeName.ReplaceAllString(msgID, "_")+"-"+name)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		b.log.Printf("quoted media open failed msg=%s", msgID)
+		return "", 0
+	}
+	// The encrypted body is the file plus padding and a 10-byte MAC.
+	cf := &CappedFile{File: f, Cap: maxQuotedMedia + 64}
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	defer cancel()
+	err = b.client.DownloadToFile(ctx, m, cf)
+	var size int64
+	if st, serr := f.Stat(); serr == nil {
+		size = st.Size()
+	}
+	f.Close()
+	if err != nil || size > maxQuotedMedia {
+		_ = os.Remove(path)
+		b.log.Printf("quoted media dropped msg=%s size=%d too_large=%v", msgID, size, errors.Is(err, ErrTooLarge) || size > maxQuotedMedia)
+		return "", 0
+	}
+	real, err1 := filepath.EvalSymlinks(path)
+	dir, err2 := filepath.EvalSymlinks(b.cfg.MediaDir)
+	if err1 != nil || err2 != nil || filepath.Dir(real) != dir {
+		_ = os.Remove(path)
+		b.log.Printf("quoted media outside the media dir msg=%s", msgID)
+		return "", 0
+	}
+	b.log.Printf("quoted media saved msg=%s kind=%s size=%d", msgID, m.Kind, size)
+	return real, size
 }
 
 func (b *Bridge) sentHas(id string) bool {
@@ -1088,4 +1285,243 @@ func (b *Bridge) download(in *Inbound) map[string]any {
 	att["size"] = int64(len(data))
 	b.log.Printf("media saved msg=%s kind=%s size=%d", in.MsgID, m.Kind, len(data))
 	return att
+}
+
+// ---- members, mentions and history (protocol 2) -----------------------------
+
+type membersEntry struct {
+	list []Member
+	at   time.Time
+}
+
+// chatMembers returns the chat's participants from the cache, or (fetch)
+// from WhatsApp. The cache is dropped on every membership change.
+func (b *Bridge) chatMembers(ctx context.Context, chat string, fetch bool) ([]Member, error) {
+	b.mu.Lock()
+	e, ok := b.members[chat]
+	fresh := ok && b.now().Sub(e.at) < membersTTL
+	b.mu.Unlock()
+	if fresh {
+		return e.list, nil
+	}
+	if !fetch {
+		return nil, errors.New("members not cached")
+	}
+	list, err := b.client.Members(ctx, chat)
+	if err != nil {
+		return nil, err
+	}
+	if list == nil {
+		list = []Member{}
+	}
+	b.mu.Lock()
+	b.members[chat] = membersEntry{list: list, at: b.now()}
+	b.mu.Unlock()
+	return list, nil
+}
+
+// checkMentions keeps the JIDs that are current participants of chat and whose
+// @<number> is in the text, at most maxMentions (protocol §3.1).
+func (b *Bridge) checkMentions(ctx context.Context, chat, text string, jids []string, fetch bool) []string {
+	kept := []string{}
+	if len(jids) == 0 {
+		return kept
+	}
+	list, err := b.chatMembers(ctx, chat, fetch)
+	if err != nil {
+		b.log.Printf("mentions dropped: no member list (%d asked)", len(jids))
+		return kept
+	}
+	byJID := make(map[string]Member, len(list))
+	for _, m := range list {
+		byJID[m.JID] = m
+	}
+	seen := map[string]bool{}
+	for _, j := range jids {
+		m, ok := byJID[j]
+		if !ok || seen[j] || !mentionIn(text, m.Number) {
+			continue
+		}
+		seen[j] = true
+		kept = append(kept, j)
+		if len(kept) == maxMentions {
+			break
+		}
+	}
+	return kept
+}
+
+// mentionIn reports whether text holds "@<number>" not followed by a digit.
+func mentionIn(text, number string) bool {
+	if number == "" {
+		return false
+	}
+	tok := "@" + number
+	for i := 0; ; {
+		k := strings.Index(text[i:], tok)
+		if k < 0 {
+			return false
+		}
+		end := i + k + len(tok)
+		if end == len(text) || text[end] < '0' || text[end] > '9' {
+			return true
+		}
+		i = end
+	}
+}
+
+func (b *Bridge) membersOp(id int64, r *request) {
+	if r.Chat == "" {
+		b.fail(id, "bad_args", "chat is required")
+		return
+	}
+	b.mu.Lock()
+	var code, msg string
+	switch {
+	case b.deny[r.Chat]:
+		code, msg = "denied", "that chat is on the never-list"
+	case !b.allow[r.Chat]:
+		code, msg = "not_allowed", "that chat is not allowlisted"
+	default:
+		code, msg = b.linkLocked()
+	}
+	b.mu.Unlock()
+	if code != "" {
+		b.fail(id, code, msg)
+		return
+	}
+	chat := r.Chat
+	b.async(func(ctx context.Context) {
+		list, err := b.chatMembers(ctx, chat, true)
+		if err != nil {
+			b.netErr(id, "members", err)
+			return
+		}
+		b.log.Printf("members id=%d n=%d", id, len(list)) // names never logged
+		b.ok(id, map[string]any{"members": list})
+	})
+}
+
+// history asks the owner's phone for up to count messages before before_msg
+// in a context chat (W10.3). Every result is context only.
+func (b *Bridge) history(id int64, r *request) {
+	if r.Chat == "" || r.Before == "" || r.Count < 1 || r.Count > maxHistory {
+		b.fail(id, "bad_args", "chat, before_msg and count (1-50) are required")
+		return
+	}
+	if b.cfg.DryRun {
+		b.fail(id, "bad_args", "history is off under --dry-run")
+		return
+	}
+	var before MsgMeta
+	extra := func() (string, string) { // runs under b.mu
+		if !b.context[r.Chat] {
+			return "not_allowed", "history is only for context chats"
+		}
+		m, ok := b.senders.meta(r.Chat, r.Before)
+		if !ok {
+			return "not_found", "unknown before_msg"
+		}
+		if last, ok := b.histLast[r.Chat]; ok && b.now().Sub(last) < historyEvery {
+			return "rate", "history was requested for this chat within the hour"
+		}
+		before = m
+		return "", ""
+	}
+	if !b.gate(id, r.Chat, bucketNone, extra) {
+		return
+	}
+	chat, count := r.Chat, r.Count
+	b.mu.Lock()
+	now := b.now()
+	b.histLast[chat], b.histOpen[chat] = now, now.Add(historyWait)
+	b.mu.Unlock()
+	b.async(func(ctx context.Context) {
+		if err := b.client.RequestHistory(ctx, before, count); err != nil {
+			b.mu.Lock()
+			delete(b.histOpen, chat)
+			b.mu.Unlock()
+			b.netErr(id, "history", err)
+			return
+		}
+		b.log.Printf("history id=%d count=%d", id, count)
+		b.ok(id, map[string]any{"requested": true})
+	})
+}
+
+// historyNotice handles an on-demand history blob: processed only while a
+// request is open, only for that chat while it is still a context chat, and
+// every message becomes context with history=true, whatever its sender.
+func (b *Bridge) historyNotice(notice any) {
+	b.mu.Lock()
+	now := b.now()
+	open := 0
+	for c, deadline := range b.histOpen {
+		if now.After(deadline) {
+			delete(b.histOpen, c)
+		} else {
+			open++
+		}
+	}
+	if open == 0 {
+		b.dropped["history_unrequested"]++
+	}
+	b.mu.Unlock()
+	if open == 0 {
+		b.log.Printf("dropped{history_unrequested}")
+		return
+	}
+	b.inflight.Add(1)
+	b.goSafe(func() {
+		defer b.inflight.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+		defer cancel()
+		msgs, err := b.client.FetchHistory(ctx, notice)
+		if err != nil {
+			b.log.Printf("history fetch failed: %v", err)
+			return
+		}
+		emitted, done := 0, map[string]bool{}
+		for _, in := range msgs {
+			b.mu.Lock()
+			deadline, ok := b.histOpen[in.Chat]
+			ok = ok && !b.now().After(deadline) && b.context[in.Chat]
+			st := b.filterStateLocked()
+			reason, _ := filter(in, st)
+			b.mu.Unlock()
+			if !ok {
+				b.countDrop("history_other_chat")
+				continue
+			}
+			// Rules 1, 4 and 5 still apply; owner-ness does not make a trigger.
+			if (reason != "" && reason != dropNotOwner && reason != dropUntrusted) || in.Reaction != nil {
+				b.countDrop("history_" + reason)
+				continue
+			}
+			in.Media = mediaKindOnly(in.Media)
+			b.emitContext(in, st.self, false, true)
+			emitted++
+			done[in.Chat] = true
+		}
+		b.mu.Lock()
+		for c := range done {
+			delete(b.histOpen, c)
+		}
+		b.mu.Unlock()
+		b.log.Printf("history processed n=%d emitted=%d", len(msgs), emitted)
+	})
+}
+
+func (b *Bridge) countDrop(reason string) {
+	b.mu.Lock()
+	b.dropped[reason]++
+	b.mu.Unlock()
+}
+
+// mediaKindOnly keeps what a context event may say about media.
+func mediaKindOnly(m *MediaIn) *MediaIn {
+	if m == nil {
+		return nil
+	}
+	return &MediaIn{Kind: m.Kind, FileName: m.FileName}
 }

@@ -77,7 +77,7 @@ async def test_hello_reply_and_kind_from_token_not_payload(agent):
     r = await c.hello(VOICE_TOKEN, [V], kind="app", client_kind="app")
     assert r["ok"]
     d = r["data"]
-    assert d["api"] == "1.1" and d["kind"] == "voice" and d["boot"] == agent.svc.boot
+    assert d["api"] == "1.2" and d["kind"] == "voice" and d["boot"] == agent.svc.boot
     assert d["conversations"] == [V] and d["interrupted"] == []
     s.decode_response(r, "hello")
     # the voice token still may not use an app op
@@ -95,9 +95,9 @@ async def test_unknown_token_and_test_kind_are_unauthorized(agent):
 
 async def test_version_mismatch_plain_message_and_close(agent):
     c = await Client.open(agent.sock)
-    r = await c.hello(VOICE_TOKEN, [V], api="1.0")
+    r = await c.hello(VOICE_TOKEN, [V], api="1.1")
     assert r["code"] == "version_mismatch"
-    assert r["error"] == ("agentd speaks API 1.1 but this client speaks 1.0. "
+    assert r["error"] == ("agentd speaks API 1.2 but this client speaks 1.1. "
                           "Restart Mac to update all parts together.")
     await asyncio.wait_for(c.closed.wait(), 2)
 

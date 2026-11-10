@@ -17,7 +17,9 @@ Tests drive it through `DIR/c.sock` (one JSON object per line, one reply per lin
     {"cmd": "emit", "event": {...}}          raw event, unfiltered (tests the adapter's own re-checks)
     {"cmd": "chat_changed", "chat", "subject", "members", "owner_only"}
     {"cmd": "offline"} | {"cmd": "reconnect"} | {"cmd": "scan"} | {"cmd": "exit", "code": n}
-    {"cmd": "stats"}  -> {"writes": [...], "dropped": {...}, "allow", "deny", "argv", "downloads"}
+    {"cmd": "history_blob", "messages": [{chat, msg, text, ...}]}   an on-demand history answer
+    {"cmd": "stats"}  -> {"writes": [...], "dropped": {...}, "allow", "context", "deny", "argv", "downloads"}
+fake.json may also hold "members": {chat: [{jid, number, name}]} (the members op and mentions).
 
 and `DIR/fake.json`, read at every start: {"linked": true, "exit_codes": [1, 1], "protocol": "1",
 "delay": {"send_text": 0.3}, "hang": ["status"], "chats": [...]}. Each start appends a line to
@@ -38,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROTOCOL = "1"
+PROTOCOL = "2"
 OWN_JID, OWN_LID, OWN_DEVICE = "447700900000@s.whatsapp.net", "100000000000001@lid", 7
 EDIT_WINDOW_S = 15 * 60
 MAX_AGE_S = 7 * 86400
@@ -61,15 +63,18 @@ def parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--media-dir", required=True)
     p.add_argument("--allow", default="")
     p.add_argument("--deny", default="")
-    p.add_argument("--trusted-devices", default="0")
+    p.add_argument("--context", default="")
+    p.add_argument("--trusted-devices", default="all")
     p.add_argument("--max-per-min", type=int, default=20)
     p.add_argument("--budget", type=int, default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--test", action="store_true")
     a = p.parse_args(argv)
-    a.allow, a.deny = jids(a.allow), jids(a.deny)
-    a.trusted = [int(x) for x in a.trusted_devices.split(",") if x.strip()]
-    if set(a.allow) & set(a.deny) or not a.trusted or a.max_per_min < 1:
+    a.allow, a.deny, a.context = jids(a.allow), jids(a.deny), jids(a.context)
+    a.trust_all = a.trusted_devices.strip() == "all"
+    a.trusted = [] if a.trust_all else [int(x) for x in a.trusted_devices.split(",") if x.strip()]
+    if (set(a.allow) & set(a.deny) or not set(a.context) <= set(a.allow) or not (a.trust_all or a.trusted)
+            or a.max_per_min < 1):
         raise ValueError("bad flags")
     if a.test and a.budget is None:
         raise ValueError("--test requires --budget")
@@ -84,7 +89,10 @@ def log(msg: str) -> None:
 class Fake:
     def __init__(self, a: argparse.Namespace, cfg: dict[str, Any], start_no: int) -> None:
         self.a, self.cfg, self.start_no = a, cfg, start_no
-        self.allow, self.deny = set(a.allow), set(a.deny)
+        self.allow, self.deny, self.context = set(a.allow), set(a.deny), set(a.context)
+        self.hist_open: dict[str, float] = {}  # chat -> deadline of an open history request
+        self.hist_last: dict[str, float] = {}
+        self.known: dict[str, float] = {}  # message id -> time (history before_msg)
         self.linked = bool(cfg.get("linked", True))
         self.connected = False
         self.pairing = False
@@ -152,7 +160,7 @@ class Fake:
             self.exit(2)
         self.hello = True
         d: dict[str, Any] = {"protocol": PROTOCOL, "bridge_version": "fake", "linked": self.linked,
-                             "allow": sorted(self.allow), "deny": list(self.a.deny), "dry_run": self.a.dry_run,
+                             "allow": sorted(self.allow), "context": sorted(self.context), "deny": list(self.a.deny), "dry_run": self.a.dry_run,
                              "test": self.a.test}
         if self.linked:
             d.update(jid=OWN_JID, lid=OWN_LID, device=OWN_DEVICE)
@@ -208,8 +216,9 @@ class Fake:
             return
         if self.check_out(rid, chat, new=True):
             mid = self.new_id()
-            self.write(op="send_text", chat=chat, msg=mid, len=len(text), reply_to=r.get("reply_to"))
-            self.ok(rid, {"msg": mid})
+            kept = self.mentioned(chat, text, r.get("mentions"))
+            self.write(op="send_text", chat=chat, msg=mid, len=len(text), reply_to=r.get("reply_to"), mentions=kept)
+            self.ok(rid, {"msg": mid, "mentioned": kept})
 
     async def op_edit(self, rid: Any, r: dict[str, Any]) -> None:
         chat, msg, text = r.get("chat", ""), r.get("msg", ""), r.get("text")
@@ -221,8 +230,9 @@ class Fake:
         elif time.time() - self.sent[msg] > EDIT_WINDOW_S:
             self.fail(rid, "edit_window", "too old to edit")
         elif self.check_out(rid, chat, new=False):
-            self.write(op="edit", chat=chat, msg=msg, len=len(text))
-            self.ok(rid)
+            kept = self.mentioned(chat, text, r.get("mentions"))
+            self.write(op="edit", chat=chat, msg=msg, len=len(text), mentions=kept)
+            self.ok(rid, {"mentioned": kept})
 
     async def op_react(self, rid: Any, r: dict[str, Any]) -> None:
         chat, msg, emoji = r.get("chat", ""), r.get("msg", ""), r.get("emoji")
@@ -270,15 +280,54 @@ class Fake:
         if self.a.test:
             self.fail(rid, "test_mode", "set_allow is disabled under --test")
             return
-        allow = r.get("allow")
-        if not isinstance(allow, list):
+        allow, context = r.get("allow"), r.get("context")
+        if not isinstance(allow, list) or (context is not None and not isinstance(context, list)):
             self.fail(rid, "bad_args", "allow is required")
             return
         if set(allow) & self.deny:
             self.fail(rid, "denied", "a JID is on the never-list")
             return
+        if context is not None and not set(context) <= set(allow):
+            self.fail(rid, "bad_args", "context must be a subset of allow")
+            return
         self.allow = set(allow)
-        self.ok(rid, {"allow": sorted(self.allow)})
+        self.context = set(context) if context is not None else self.context & self.allow
+        self.ok(rid, {"allow": sorted(self.allow), "context": sorted(self.context)})
+
+    def members_of(self, chat: str) -> list[dict[str, Any]]:
+        return list(self.cfg.get("members", {}).get(chat, []))
+
+    async def op_members(self, rid: Any, r: dict[str, Any]) -> None:
+        chat = r.get("chat", "")
+        if chat in self.deny:
+            self.fail(rid, "denied", "the chat is on the never-list")
+        elif chat not in self.allow:
+            self.fail(rid, "not_allowed", "the chat is not allowlisted")
+        else:
+            self.ok(rid, {"members": self.members_of(chat)})
+
+    def mentioned(self, chat: str, text: str, asked: Any) -> list[str]:
+        kept: list[str] = []
+        for m in self.members_of(chat):
+            if isinstance(asked, list) and m["jid"] in asked and f"@{m['number']}" in text and len(kept) < 5:
+                kept.append(m["jid"])
+        return kept
+
+    async def op_history(self, rid: Any, r: dict[str, Any]) -> None:
+        chat, before, count = r.get("chat", ""), r.get("before_msg", ""), r.get("count")
+        now = time.time()
+        if not chat or not before or not isinstance(count, int) or not 1 <= count <= 50 or self.a.dry_run:
+            self.fail(rid, "bad_args", "chat, before_msg and count (1-50) are required; off under --dry-run")
+        elif chat not in self.context:
+            self.fail(rid, "not_allowed", "history is only for context chats")
+        elif before not in self.known:
+            self.fail(rid, "not_found", "unknown before_msg")
+        elif now - self.hist_last.get(chat, -1e18) < 3600:
+            self.fail(rid, "rate", "once per chat per hour")
+        elif self.check_out(rid, chat, new=False):
+            self.hist_last[chat], self.hist_open[chat] = now, now + 60
+            self.write(op="history", chat=chat, before=before, count=count)
+            self.ok(rid, {"requested": True})
 
     async def op_status(self, rid: Any, r: dict[str, Any]) -> None:
         d: dict[str, Any] = {"linked": self.linked, "connected": self.connected,
@@ -314,35 +363,41 @@ class Fake:
 
     # -- control (tests) ---------------------------------------------------------------------------------
     def inbound(self, c: dict[str, Any]) -> dict[str, Any]:
+        """The W10.1 split: dropped, `context` (a member, or an untrusted owner device, in a
+        context chat) or `message` (the owner on a trusted device)."""
         chat, msg, text = c.get("chat", ""), c.get("msg", ""), c.get("text", "")
         device = int(c.get("sender_device", 0))
+        owner = bool(c.get("from_me", True))
         now = float(c.get("now") or time.time())  # the test's clock, never the wall clock
         ts = float(c.get("ts") or now)
-        why = ""
+        why, context = "", False
         if chat in self.deny:
             why = "denied"
         elif chat not in self.allow:
             why = "not_allowed"
-        elif not c.get("from_me", True):
-            why = "not_owner"
-        elif device not in self.a.trusted:
-            why = "untrusted_device"
-        elif device == OWN_DEVICE or msg in self.sent or text.startswith(PREFIX):
-            why = "echo"
         elif c.get("broadcast") or now - ts > MAX_AGE_S:
             why = "old_or_broadcast"
-        if why:
+        elif (owner and device == OWN_DEVICE) or msg in self.sent or text.startswith(PREFIX):
+            why = "echo"
+        elif not owner or (not self.a.trust_all and device not in self.a.trusted):
+            why = "not_owner" if not owner else "untrusted_device"
+            context = chat in self.context and not c.get("reaction")
+        if why and not context:
             self.dropped[why] = self.dropped.get(why, 0) + 1
             log(f"dropped{{{why}}}" + ("" if why in ("denied", "not_allowed") else f" msg={msg}"))
             return {"ok": True, "emitted": False, "reason": why}
-        ev: dict[str, Any] = {"ev": "message", "chat": chat, "msg": msg, "sender_device": device, "from_me": True, "text": text,
-                              "sent_at": ts, "replayed": bool(c.get("replayed")), "attachments": [],
+        self.known[msg] = ts
+        media = c.get("media") or {}
+        if context:
+            self.emit_context(c, chat, msg, text, ts, owner, history=False)
+            return {"ok": True, "emitted": True, "context": True}
+        ev: dict[str, Any] = {"ev": "message", "chat": chat, "msg": msg, "sender_device": device, "from_me": True,
+                              "text": text, "sent_at": ts, "replayed": bool(c.get("replayed")), "attachments": [],
                               "unsupported": ""}
         if c.get("quoted"):
             ev["quoted"] = c["quoted"]
         if c.get("reaction"):
             ev["reaction"], ev["text"] = c["reaction"], ""
-        media = c.get("media") or {}
         if media.get("kind") in UNSUPPORTED:
             ev["unsupported"] = media["kind"]  # never downloaded
         elif media.get("kind") in ("image", "document"):
@@ -357,10 +412,42 @@ class Fake:
         log(f"message msg={msg} device={device} len={len(text)} media={media.get('kind', '')}")
         return {"ok": True, "emitted": True}
 
+    def emit_context(self, c: dict[str, Any], chat: str, msg: str, text: str, ts: float, owner: bool,
+                     history: bool) -> None:
+        media = c.get("media") or {}
+        ev: dict[str, Any] = {"ev": "context", "chat": chat, "msg": msg, "sender": c.get("sender", "222@s.whatsapp.net"),
+                              "sender_name": c.get("sender_name", ""), "from_owner": owner, "at": ts,
+                              "text": text[:4000], "replayed": bool(c.get("replayed")), "history": history}
+        if media.get("kind"):  # kind (and a document's name) only; never downloaded
+            ev["media"] = {"kind": media["kind"], **({"name": media["name"]} if media.get("name") else {})}
+        if c.get("quote_of"):
+            ev["quoted_msg"] = c["quote_of"]
+        self.out(ev)
+        log(f"context msg={msg} len={len(text)} history={history}")
+
+    def history_blob(self, c: dict[str, Any]) -> dict[str, Any]:
+        """An on-demand answer: processed only while a request is open for its chat; every
+        message is context with history=true, whatever its sender."""
+        now = time.time()
+        emitted = 0
+        for m in c.get("messages", []):
+            chat = m.get("chat", "")
+            if self.hist_open.get(chat, 0) < now or chat not in self.context or chat in self.deny:
+                self.dropped["history_other_chat"] = self.dropped.get("history_other_chat", 0) + 1
+                continue
+            self.emit_context(m, chat, m.get("msg", ""), m.get("text", ""), float(m.get("ts") or now),
+                              bool(m.get("from_me", False)), history=True)
+            emitted += 1
+        for chat in {m.get("chat") for m in c.get("messages", [])}:
+            self.hist_open.pop(chat, None)
+        return {"ok": True, "emitted": emitted}
+
     def control(self, c: dict[str, Any]) -> dict[str, Any]:
         cmd = c.get("cmd")
         if cmd == "inbound":
             return self.inbound(c)
+        if cmd == "history_blob":
+            return self.history_blob(c)
         if cmd == "emit":
             self.out(c["event"])
         elif cmd == "chat_changed":
@@ -381,7 +468,7 @@ class Fake:
             self.exit(int(c.get("code", 0)))
         elif cmd == "stats":
             return {"ok": True, "writes": self.writes, "dropped": self.dropped, "allow": sorted(self.allow),
-                    "deny": sorted(self.deny), "argv": sys.argv[1:], "downloads": self.downloads, "ops": self.ops,
+                    "deny": sorted(self.deny), "context": sorted(self.context), "argv": sys.argv[1:], "downloads": self.downloads, "ops": self.ops,
                     "used": self.used}
         return {"ok": True}
 

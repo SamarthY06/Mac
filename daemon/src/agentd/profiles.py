@@ -64,7 +64,14 @@ CREATE TABLE profiles (
 """
 
 # ordered (version, sql) steps; a step's statements are separated by ";"
-MIGRATIONS: list[tuple[int, str]] = [(1, _SCHEMA_V1)]
+# v2 (v3.5, W10.6): `read_chat` is new and, like every capability, on by default (the user's
+# all-on decision); rows whose capabilities are not a readable object are left as they are
+_V2_READ_CHAT = """
+UPDATE profiles SET capabilities = json_set(capabilities, '$.read_chat', json('true'))
+ WHERE json_valid(capabilities) AND json_type(capabilities) = 'object'
+   AND json_type(capabilities, '$.read_chat') IS NULL
+"""
+MIGRATIONS: list[tuple[int, str]] = [(1, _SCHEMA_V1), (2, _V2_READ_CHAT)]
 
 _COLUMNS = ("channel", "chat_id", "display_name", "enabled", "persona", "trigger", "prefix", "shared",
             "default_workspace", "capabilities", "confirm_files", "rev", "created_at", "updated_at")

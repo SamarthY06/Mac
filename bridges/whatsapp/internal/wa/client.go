@@ -266,20 +266,28 @@ func parseChat(chat string) (types.JID, error) {
 	return j.ToNonAD(), nil
 }
 
-func (c *Client) SendText(ctx context.Context, chat, text string, reply *bridge.ReplyRef) (string, error) {
+func (c *Client) SendText(ctx context.Context, chat, text string, reply *bridge.ReplyRef, mentions []string) (string, error) {
 	jid, err := parseChat(chat)
 	if err != nil {
 		return "", err
 	}
-	msg := &waE2E.Message{Conversation: proto.String(text)}
-	if reply != nil {
-		msg = &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-			Text:        proto.String(text),
-			ContextInfo: c.quoteContext(reply),
-		}}
-	}
-	resp, err := c.wa().SendMessage(ctx, jid, msg)
+	resp, err := c.wa().SendMessage(ctx, jid, textMessage(text, c.quoteContext(reply), mentions))
 	return resp.ID, err
+}
+
+// textMessage is a plain Conversation, or an ExtendedTextMessage when it
+// quotes or mentions.
+func textMessage(text string, ci *waE2E.ContextInfo, mentions []string) *waE2E.Message {
+	if len(mentions) > 0 {
+		if ci == nil {
+			ci = &waE2E.ContextInfo{}
+		}
+		ci.MentionedJID = append([]string{}, mentions...)
+	}
+	if ci == nil {
+		return &waE2E.Message{Conversation: proto.String(text)}
+	}
+	return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(text), ContextInfo: ci}}
 }
 
 func (c *Client) quoteContext(reply *bridge.ReplyRef) *waE2E.ContextInfo {
@@ -298,14 +306,114 @@ func (c *Client) quoteContext(reply *bridge.ReplyRef) *waE2E.ContextInfo {
 	}
 }
 
-func (c *Client) Edit(ctx context.Context, chat, msgID, text string) error {
+func (c *Client) Edit(ctx context.Context, chat, msgID, text string, mentions []string) error {
 	jid, err := parseChat(chat)
 	if err != nil {
 		return err
 	}
 	cli := c.wa()
-	_, err = cli.SendMessage(ctx, jid, cli.BuildEdit(jid, msgID, &waE2E.Message{Conversation: proto.String(text)}))
+	_, err = cli.SendMessage(ctx, jid, cli.BuildEdit(jid, msgID, textMessage(text, nil, mentions)))
 	return err
+}
+
+// Members lists a group's participants with display names (contact name,
+// else push name). The self chat has only the owner.
+func (c *Client) Members(ctx context.Context, chat string) ([]bridge.Member, error) {
+	jid, err := parseChat(chat)
+	if err != nil {
+		return nil, err
+	}
+	if jid.Server != types.GroupServer {
+		pn, _ := c.self()
+		return []bridge.Member{{JID: pn.String(), Number: pn.User}}, nil
+	}
+	g, err := c.wa().GetGroupInfo(ctx, jid)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]bridge.Member, 0, len(g.Participants))
+	for _, p := range g.Participants {
+		name := c.nameOf(ctx, p.JID, "")
+		if name == "" && !p.PhoneNumber.IsEmpty() {
+			name = c.nameOf(ctx, p.PhoneNumber, "")
+		}
+		out = append(out, bridge.Member{JID: p.JID.ToNonAD().String(), Number: p.JID.User, Name: name})
+	}
+	return out, nil
+}
+
+// nameOf is the contact name for a user, else its push name, else fallback.
+func (c *Client) nameOf(ctx context.Context, j types.JID, fallback string) string {
+	if j.IsEmpty() {
+		return fallback
+	}
+	contacts := c.wa().Store.Contacts
+	if contacts == nil { // no paired device yet
+		return fallback
+	}
+	ci, err := contacts.GetContact(ctx, j.ToNonAD())
+	if err != nil || !ci.Found {
+		return fallback
+	}
+	for _, n := range []string{ci.FullName, ci.FirstName, ci.PushName} {
+		if n != "" {
+			return n
+		}
+	}
+	return fallback
+}
+
+// DownloadToFile streams quoted media into f; f refuses bytes past its cap.
+func (c *Client) DownloadToFile(ctx context.Context, m *bridge.MediaIn, f *bridge.CappedFile) error {
+	dm, ok := m.Handle.(whatsmeow.DownloadableMessage)
+	if !ok {
+		return errors.New("not downloadable")
+	}
+	return c.wa().DownloadToFile(ctx, dm, f)
+}
+
+// RequestHistory asks the owner's phone for messages before `before`.
+func (c *Client) RequestHistory(ctx context.Context, before bridge.MsgMeta, count int) error {
+	jid, err := parseChat(before.Chat)
+	if err != nil {
+		return err
+	}
+	cli := c.wa()
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: jid, IsFromMe: before.FromMe},
+		ID:            before.ID,
+		Timestamp:     before.At,
+	}
+	_, err = cli.SendPeerMessage(ctx, cli.BuildHistorySyncRequest(info, count))
+	return err
+}
+
+// FetchHistory downloads an on-demand history blob and parses every message.
+// Media in it is never downloaded (convert reads no media).
+func (c *Client) FetchHistory(ctx context.Context, notice any) ([]*bridge.Inbound, error) {
+	n, ok := notice.(*waE2E.HistorySyncNotification)
+	if !ok {
+		return nil, errors.New("not a history notification")
+	}
+	hs, err := c.wa().DownloadHistorySync(ctx, n, false)
+	if err != nil {
+		return nil, err
+	}
+	var out []*bridge.Inbound
+	for _, conv := range hs.GetConversations() {
+		chat, err := types.ParseJID(conv.GetID())
+		if err != nil {
+			continue
+		}
+		for _, hm := range conv.GetMessages() {
+			evt, err := c.wa().ParseWebMessage(chat, hm.GetMessage())
+			if err != nil {
+				continue
+			}
+			out = append(out, c.convert(evt))
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) React(ctx context.Context, chat, sender, msgID, emoji string) error {
@@ -423,6 +531,15 @@ func (c *Client) onWAEvent(evt any) {
 	case *events.GroupInfo:
 		c.emit(bridge.Event{ChatChanged: v.JID.ToNonAD().String()})
 	case *events.Message:
+		// History sync notifications are not downloaded (ManualHistorySyncDownload);
+		// only on-demand answers go to the bridge, which processes them only
+		// while it has an open request.
+		if n := v.Message.GetProtocolMessage().GetHistorySyncNotification(); n != nil {
+			if n.GetSyncType() == waE2E.HistorySyncType_ON_DEMAND && c.isSelf(v.Info.Sender) {
+				c.emit(bridge.Event{HistoryNotice: n})
+			}
+			return
+		}
 		c.emit(bridge.Event{Message: c.convert(v)})
 	}
 }
@@ -454,6 +571,7 @@ func (c *Client) convert(v *events.Message) *bridge.Inbound {
 		MsgID:        info.ID,
 		SenderUser:   info.Sender.ToNonAD().String(),
 		SenderDevice: int(info.Sender.Device),
+		SenderName:   c.nameOf(context.Background(), info.Sender, info.PushName),
 		IsFromMe:     info.IsFromMe,
 		Timestamp:    info.Timestamp,
 		IsStatus:     info.Chat == types.StatusBroadcastJID,
@@ -502,9 +620,17 @@ func (c *Client) convert(v *events.Message) *bridge.Inbound {
 		in.Media = &bridge.MediaIn{Kind: "sticker"}
 	}
 	if ctxInfo != nil && ctxInfo.GetStanzaID() != "" {
-		q := &bridge.Quoted{MsgID: ctxInfo.GetStanzaID(), Text: textOf(ctxInfo.GetQuotedMessage())}
+		qm := ctxInfo.GetQuotedMessage()
+		q := &bridge.Quoted{MsgID: ctxInfo.GetStanzaID(), Text: textOf(qm), Links: previewLinks(qm), Media: mediaOf(qm)}
+		if r, err := types.ParseJID(ctxInfo.GetRemoteJID()); err == nil && !r.IsEmpty() {
+			q.RemoteJID = r.ToNonAD().String()
+			if pn, lid := c.self(); !lid.IsEmpty() && r.ToNonAD() == lid && !pn.IsEmpty() {
+				q.RemoteJID = pn.String()
+			}
+		}
 		if p, err := types.ParseJID(ctxInfo.GetParticipant()); err == nil && !p.IsEmpty() {
 			q.Participant = p.ToNonAD().String()
+			q.SenderName = c.nameOf(context.Background(), p, "")
 			if c.isSelf(p) {
 				pn, _ := c.self()
 				q.Participant = pn.String()
@@ -513,6 +639,46 @@ func (c *Client) convert(v *events.Message) *bridge.Inbound {
 		in.Quoted = q
 	}
 	return in
+}
+
+// previewLinks are the URLs of a quoted message's link preview.
+func previewLinks(m *waE2E.Message) []string {
+	x := m.GetExtendedTextMessage()
+	if x == nil {
+		return nil
+	}
+	var out []string
+	for _, u := range []string{x.GetMatchedText()} {
+		if u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// mediaOf describes a quoted message's media. Only images and documents get a
+// download handle; the bridge decides whether to use it.
+func mediaOf(m *waE2E.Message) *bridge.MediaIn {
+	switch {
+	case m == nil:
+		return nil
+	case m.GetImageMessage() != nil:
+		x := m.GetImageMessage()
+		return &bridge.MediaIn{Kind: "image", Mime: x.GetMimetype(), Size: int64(x.GetFileLength()), Handle: x}
+	case m.GetDocumentMessage() != nil:
+		x := m.GetDocumentMessage()
+		return &bridge.MediaIn{Kind: "document", Mime: x.GetMimetype(), FileName: x.GetFileName(), Size: int64(x.GetFileLength()), Handle: x}
+	case m.GetAudioMessage() != nil:
+		if m.GetAudioMessage().GetPTT() {
+			return &bridge.MediaIn{Kind: "voice"}
+		}
+		return &bridge.MediaIn{Kind: "audio"}
+	case m.GetVideoMessage() != nil || m.GetPtvMessage() != nil:
+		return &bridge.MediaIn{Kind: "video"}
+	case m.GetStickerMessage() != nil:
+		return &bridge.MediaIn{Kind: "sticker"}
+	}
+	return nil
 }
 
 func textOf(m *waE2E.Message) string {

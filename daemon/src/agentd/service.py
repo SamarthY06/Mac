@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentd import context as ctxmod
 from agentd import offload
 from agentd import profiles as pf
 from agentd import schema as s
@@ -114,6 +115,11 @@ class AgentPaths:
         """Fixed, read-only (P1): the WhatsApp pairing's chat list."""
         return self.mac_home / "chat" / "pairing.json"
 
+    @property
+    def chat_media(self) -> Path:
+        """Fixed: where the bridge saves media; a quoted file must resolve inside it (W10.5)."""
+        return self.mac_home / "chat" / "whatsapp" / "media"
+
     def chat_dir(self, conv: str) -> Path:
         """The empty per-chat dir a chat without a folder works in (W9.5)."""
         return self.mac_home / "agent" / "chats" / hashlib.sha1(conv.encode()).hexdigest()[:12]
@@ -164,6 +170,7 @@ class Turn:
     moved: bool = False  # a request moves at most once (no ping-pong between folders)
     torn: bool = False  # its profile was disabled or deleted: nothing more of it is shown (P3)
     switch_tools: int = 0  # tools the moving run had already used: the user decides first
+    context: s.AskContext | None = None  # chat (1.2): validated; framed as a per-session delta (V1)
     done: asyncio.Event = field(default_factory=asyncio.Event)
     ended: asyncio.Event = field(default_factory=asyncio.Event)  # finished, or the brain turn held
 
@@ -277,6 +284,9 @@ class Conversation:
         r.session_fork = False
         if info.session_id:
             r.remember_own(info.session_id)
+            pending = r.framed.pop("", None)
+            if pending:  # a brand-new session's framed refs, filed under its id now it has one
+                ctxmod.remember(r.framed, info.session_id, pending)
         self.svc.save_soon()
 
     async def ensure_brain(self, cwd: Path, sources: list[str], *, rebuild: bool = False) -> Brain:
@@ -472,7 +482,7 @@ class Conversation:
                 raise asyncio.CancelledError
             assert self.brain is not None
             t.in_brain = True
-            await self.brain.ask(t.internal, t.note + t.text)
+            await self._ask_brain(t)
             for text in t.steers:
                 await self.brain.steer(t.internal, text)
             while True:
@@ -540,6 +550,7 @@ class Conversation:
             r.session_updated_at = r.session_started_at = 0.0
         else:
             r.session_id, fresh_session = None, True
+            r.framed.pop("", None)  # a new session starts with nothing framed (V1)
         r.folder = str(folder) if folder else None
         if r.running is not None and r.running.uid == t.uid:
             r.running.folder = display(folder, svc.paths.home)
@@ -619,8 +630,24 @@ class Conversation:
         self.turns[t.internal] = t
         t.answer.clear()
         t.in_brain = True
-        await self.brain.ask(t.internal, t.note + t.text)
+        await self._ask_brain(t)  # a new session id: the ring is framed into it once (V1)
         return True
+
+    async def _ask_brain(self, t: Turn) -> None:
+        """The user turn with its context delta (V1): only ring entries not yet framed into this
+        session, recorded once the brain has accepted the turn. A refused or stopped ask never
+        gets here, so its entries go next time."""
+        assert self.brain is not None
+        r, svc = self.record, self.svc
+        key = r.session_id or ""
+        msgs = ctxmod.delta(t.context, r.framed.get(key, ()))
+        prof = svc.profile_of(self.conv)
+        text = ctxmod.render(t.text, t.context, msgs, display_name=prof.display_name if prof else "",
+                             owner_name=svc.owner_name, assistant_name=svc.voice_settings.name or "Mac")
+        await self.brain.ask(t.internal, t.note + text)
+        if msgs:
+            ctxmod.remember(r.framed, r.session_id or key, [m.msg_ref for m in msgs])
+            svc.save_soon()
 
     async def _move_ok(self, t: Turn, folder: Path | None) -> bool:
         """Work already ran here (tools_run > 0): moving re-runs the request from the start, so
@@ -783,8 +810,9 @@ class Service:
                  workspaces: WorkspaceStore | None = None, memory_file: Any = None,
                  clock: Callable[[], float] = time.time, boot: str | None = None,
                  voice_grace_s: float = VOICE_GRACE_S, events: Any = None,
-                 lag_interval_s: float = 0.1) -> None:
+                 lag_interval_s: float = 0.1, owner_name: str = "") -> None:
         self.paths = paths
+        self.owner_name = owner_name  # macd's user_name: a member named like the owner is marked (V4)
         self.brain_factory = brain_factory
         self.clock = clock
         self.boot = boot or os.urandom(8).hex()
@@ -1274,8 +1302,18 @@ class Service:
         q = c.question
         if q is not None and q.turn_internal == 0:  # a free-standing question: the user moved on
             c.close_question(q, s.CloseOutcome.SKIPPED)
+        context = None
+        if op.context is not None:
+            if c.voice:
+                raise ApiError(s.ErrorCode.BAD_ARGS, "context is for chat conversations only.")
+            try:
+                context = ctxmod.narrow(ctxmod.validate(op.context, self.paths.chat_media),
+                                        "read_chat" in self.live_caps(op.conv))
+            except ctxmod.ContextError as e:
+                raise ApiError(s.ErrorCode.BAD_ARGS, str(e)) from None
         meta = op.meta
         t = self._new_turn(c, epoch, op.turn, op.text, meta.msg_ref if meta else "")
+        t.context = context
         await self._start_turn(c, t, meta)
         return s.AskData(turn_uid=t.uid)
 

@@ -10,10 +10,10 @@ import (
 )
 
 // ProtocolVersion is the stdio protocol version (docs/whatsapp/bridge-protocol.md).
-const ProtocolVersion = "1"
+const ProtocolVersion = "2"
 
 // BridgeVersion is reported in hello and ready.
-const BridgeVersion = "0.1.0"
+const BridgeVersion = "0.2.0"
 
 // Config is the parsed command line. Every field is fixed for the process
 // lifetime; only the allow set is mutable, and only through set_allow (Bridge).
@@ -21,7 +21,9 @@ type Config struct {
 	Store          string
 	MediaDir       string
 	Allow          []string
+	Context        []string // allowed chats whose non-trigger messages become context events
 	Deny           []string
+	TrustedAll     bool // --trusted-devices all (default): every device of the owner's account
 	TrustedDevices []int
 	MaxPerMin      int
 	Budget         int // -1 when --budget was not given
@@ -38,12 +40,13 @@ func ParseFlags(args []string, errOut io.Writer) (Config, error) {
 	fs := flag.NewFlagSet("wa-bridge", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	var c Config
-	var allow, deny, trusted, budget string
+	var allow, context, deny, trusted, budget string
 	fs.StringVar(&c.Store, "store", "", "whatsmeow SQLite store path")
 	fs.StringVar(&c.MediaDir, "media-dir", "", "directory for inbound images and documents")
 	fs.StringVar(&allow, "allow", "", "comma-separated allowlisted chat JIDs")
+	fs.StringVar(&context, "context", "", "comma-separated allowed chats whose other messages are context (subset of --allow)")
 	fs.StringVar(&deny, "deny", "", "comma-separated never-listed chat JIDs (immutable)")
-	fs.StringVar(&trusted, "trusted-devices", "0", "comma-separated owner device ids")
+	fs.StringVar(&trusted, "trusted-devices", "all", "all, or comma-separated owner device ids")
 	fs.IntVar(&c.MaxPerMin, "max-per-min", 20, "new messages per rolling minute")
 	fs.StringVar(&budget, "budget", "", "total outbound actions for the process lifetime (immutable)")
 	fs.BoolVar(&c.DryRun, "dry-run", false, "perform no outbound network write")
@@ -74,8 +77,19 @@ func ParseFlags(args []string, errOut io.Writer) (Config, error) {
 			}
 		}
 	}
-	if c.TrustedDevices, err = parseInts(trusted); err != nil || len(c.TrustedDevices) == 0 {
-		return c, errors.New("--trusted-devices must be a non-empty list of device ids")
+	if c.Context, err = parseJIDList(context); err != nil {
+		return c, fmt.Errorf("--context: %w", err)
+	}
+	allowed := set(c.Allow)
+	for _, j := range c.Context {
+		if !allowed[j] {
+			return c, errors.New("--context holds a JID that is not on --allow")
+		}
+	}
+	if strings.TrimSpace(trusted) == "all" {
+		c.TrustedAll = true
+	} else if c.TrustedDevices, err = parseInts(trusted); err != nil || len(c.TrustedDevices) == 0 {
+		return c, errors.New("--trusted-devices must be all or a non-empty list of device ids")
 	}
 	if c.MaxPerMin < 1 {
 		return c, errors.New("--max-per-min must be at least 1")

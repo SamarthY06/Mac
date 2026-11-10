@@ -57,7 +57,7 @@ async def test_store_created_empty_at_v1_with_private_files(tmp_path):
     finally:
         await st.close()
     db = sqlite3.connect(tmp_path / "state" / pf.DB_NAME)
-    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert db.execute("PRAGMA user_version").fetchone()[0] == pf.MIGRATIONS[-1][0]
     assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     db.close()
     for f in (tmp_path / "state").iterdir():
@@ -65,15 +65,26 @@ async def test_store_created_empty_at_v1_with_private_files(tmp_path):
     assert stat.S_IMODE((tmp_path / "state").stat().st_mode) == 0o700
 
 
-async def test_migration_v1_to_v2_keeps_rows_and_leaves_a_backup(tmp_path, monkeypatch):
+async def test_migration_v1_to_v2_turns_read_chat_on_and_leaves_a_backup(tmp_path, monkeypatch):
+    """v3.5: read_chat is new and on by default for existing rows; a corrupt caps value stays."""
     path = tmp_path / pf.DB_NAME
+    monkeypatch.setattr(pf, "MIGRATIONS", pf.MIGRATIONS[:1])
     st = await opened(path)
-    await st.create(row())
+    await st.create(row(capabilities={"web": False}))
     await st.close()
-    monkeypatch.setattr(pf, "MIGRATIONS", [*pf.MIGRATIONS, (2, "ALTER TABLE profiles ADD COLUMN note TEXT")])
+    db = sqlite3.connect(path)  # a v1 row: no read_chat key at all; a second one with a corrupt value
+    db.execute("UPDATE profiles SET capabilities = json_remove(capabilities, '$.read_chat')")
+    db.execute("INSERT INTO profiles SELECT channel, '2@g.us', display_name, enabled, persona, trigger, prefix, "
+               "shared, default_workspace, '[1]', confirm_files, rev, created_at, updated_at FROM profiles")
+    db.commit()
+    db.close()
+    monkeypatch.undo()
     st = await opened(path)
     try:
-        assert st.available and st.get("whatsapp", "1@g.us").display_name == "Book club"
+        p = st.get("whatsapp", "1@g.us")
+        assert st.available and p.display_name == "Book club"
+        assert pf.granted(p) == frozenset(s.CAPABILITIES) - {"web"}  # read_chat on, the rest untouched
+        assert pf.granted(st.get("whatsapp", "2@g.us")) == frozenset()  # still grants nothing
     finally:
         await st.close()
     bak = Path(f"{path}.bak-v1")

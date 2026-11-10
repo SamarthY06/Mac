@@ -6,7 +6,8 @@ import (
 )
 
 // EchoPrefix marks every message Mac writes. Inbound text starting with it is
-// our own echo and is dropped (protocol §5 rule 4).
+// our own echo and is dropped (protocol §5 rule 4). chatd asserts it equals
+// chatd.format.PREFIX.
 const EchoPrefix = "Mac · "
 
 // MaxAge drops anything older than this (protocol §5 rule 5).
@@ -15,12 +16,14 @@ const MaxAge = 7 * 24 * time.Hour
 // filterState is what the inbound filter needs to decide. It is a snapshot,
 // so filter itself is a pure function.
 type filterState struct {
-	allow   map[string]bool
-	deny    map[string]bool
-	trusted map[int]bool
-	self    Identity
-	sent    func(id string) bool
-	now     time.Time
+	allow    map[string]bool
+	context  map[string]bool
+	deny     map[string]bool
+	trustAll bool
+	trusted  map[int]bool
+	self     Identity
+	sent     func(id string) bool
+	now      time.Time
 }
 
 // Drop reasons, as counted in status.dropped and logged as dropped{reason}.
@@ -39,52 +42,57 @@ const (
 	dropEmpty      = "empty"
 )
 
-// filter returns "" when the message may be emitted, else the drop reason.
-// The never-list is checked first, before anything else is looked at.
-func filter(in *Inbound, s filterState) string {
+// filter decides one inbound message (W10.1, protocol §5). It returns
+// ("", false) for a `message` event (a trigger candidate), (reason, true) for
+// a `context` event, and (reason, false) for a drop. The never-list is
+// checked first, before anything else is looked at.
+func filter(in *Inbound, s filterState) (reason string, context bool) {
+	// Step 1.
 	if s.deny[in.Chat] {
-		return dropDenied
+		return dropDenied, false
 	}
 	if !s.allow[in.Chat] {
-		return dropNotAllowed
+		return dropNotAllowed, false
 	}
-	// Rule 5 first among the rest: it needs no identity.
-	if in.IsStatus {
-		return dropStatus
+	// Step 2: protocol, status, broadcast, age.
+	switch {
+	case in.IsStatus:
+		return dropStatus, false
+	case in.IsBroadcast:
+		return dropBroadcast, false
+	case in.IsProtocol:
+		return dropProtocol, false
+	case !in.Timestamp.IsZero() && s.now.Sub(in.Timestamp) > MaxAge:
+		return dropTooOld, false
 	}
-	if in.IsBroadcast {
-		return dropBroadcast
+	// Step 3: our own echo. The device check compares the full sender (our
+	// account and this bridge's device id), so a member's device number that
+	// equals ours never matches.
+	owner := in.IsFromMe && isSelf(in.SenderUser, s.self)
+	if isSelf(in.SenderUser, s.self) && in.SenderDevice == s.self.Device {
+		return dropEchoDevice, false
 	}
-	if in.IsProtocol {
-		return dropProtocol
-	}
-	// Rule 2: the owner, cross-checked against the paired JID and its LID.
-	if !in.IsFromMe || !isSelf(in.SenderUser, s.self) {
-		return dropNotOwner
-	}
-	// Rule 4a: never our own device (checked before the trusted list, so a
-	// misconfigured --trusted-devices cannot let our echo through).
-	if in.SenderDevice == s.self.Device {
-		return dropEchoDevice
-	}
-	// Rule 3.
-	if !s.trusted[in.SenderDevice] {
-		return dropUntrusted
-	}
-	// Rule 4b, 4c.
 	if s.sent != nil && s.sent(in.MsgID) {
-		return dropEchoID
+		return dropEchoID, false
 	}
 	if strings.HasPrefix(strings.TrimLeft(in.Text, " \t\r\n‎‏"), EchoPrefix) {
-		return dropEchoPrefix
-	}
-	if !in.Timestamp.IsZero() && s.now.Sub(in.Timestamp) > MaxAge {
-		return dropTooOld
+		return dropEchoPrefix, false
 	}
 	if in.Text == "" && in.Reaction == nil && in.Media == nil {
-		return dropEmpty
+		return dropEmpty, false
 	}
-	return ""
+	// Step 4: the owner on a trusted device, else context (or nothing).
+	reason = ""
+	switch {
+	case !owner:
+		reason = dropNotOwner
+	case !s.trustAll && !s.trusted[in.SenderDevice]:
+		reason = dropUntrusted
+	}
+	if reason != "" {
+		return reason, s.context[in.Chat] && in.Reaction == nil
+	}
+	return "", false // step 5
 }
 
 // isSelf reports whether a device-less user JID is the paired account,

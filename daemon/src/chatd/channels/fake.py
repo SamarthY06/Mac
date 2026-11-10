@@ -21,6 +21,8 @@ from chatd.channels.base import (
     ChannelStatus,
     ChatChanged,
     ChatChangedCallback,
+    ContextCallback,
+    ContextMessage,
     InboundMessage,
     Limits,
     LinkState,
@@ -44,6 +46,7 @@ class Write:
     reply_to: str = ""
     path: str = ""
     at: float = 0.0
+    mentions: tuple[str, ...] = ()
 
 
 @dataclass
@@ -57,6 +60,8 @@ class FakeMessage:
     path: str = ""  # a file message
     caption: str = ""
     history: list[str] = field(default_factory=list)  # every text it showed, oldest first
+    from_owner: bool = True  # inbound: yours, or another member's (a context message)
+    sender_name: str = ""
 
 
 class FakeChannel:
@@ -80,12 +85,17 @@ class FakeChannel:
         self.downloads = 0  # attachments fetched (never for voice, audio, video, stickers)
         self.chats: list[dict[str, Any]] = list(cfg.get("groups", []))  # what list_chats returns
         self.allowed_sets: list[frozenset[str]] = []  # every set_allowed call (recorded, not applied)
+        self.context_sets: list[frozenset[str]] = []
+        self.group_members: dict[str, list[dict[str, Any]]] = dict(cfg.get("members", {}))  # chat -> members()
+        self.history_requests: list[tuple[str, str, int]] = []
+        self.on_context: ContextCallback | None = None
         self.on_connected: Callable[[], Awaitable[None]] | None = None  # after every (re)connect
 
     # -- lifecycle ---------------------------------------------------------------------------------
     async def start(self, sink: MessageSink, on_status: StatusCallback,
-                    on_chat_changed: ChatChangedCallback) -> None:
+                    on_chat_changed: ChatChangedCallback, *, on_context: ContextCallback | None = None) -> None:
         self.sink, self.on_status, self.on_chat_changed = sink, on_status, on_chat_changed
+        self.on_context = on_context
         self._set(LinkState.CONNECTED if self._linked else LinkState.UNLINKED)
 
     async def close(self) -> None:
@@ -111,9 +121,35 @@ class FakeChannel:
         if self.on_connected is not None:
             await self.on_connected()
 
-    async def set_allowed(self, chat_ids: frozenset[str]) -> None:
+    async def set_allowed(self, chat_ids: frozenset[str], context_ids: frozenset[str] = frozenset()) -> None:
         """Test-only adapter: the allowlist is fixed by its context (like the bridge under --test)."""
         self.allowed_sets.append(frozenset(chat_ids))
+        self.context_sets.append(frozenset(context_ids))
+
+    async def members(self, chat_id: str) -> list[dict[str, Any]]:
+        self.ctx.check_destination(chat_id)
+        return list(self.group_members.get(chat_id, []))
+
+    async def request_history(self, chat_id: str, before: MessageRef, count: int = 30) -> bool:
+        self.history_requests.append((chat_id, before.message_id, count))
+        return True
+
+    async def inject_context(self, text: str = "", *, chat_id: str, msg_id: str | None = None,
+                             sender: str = "111@s.whatsapp.net", sender_name: str = "Priya",
+                             from_owner: bool = False, at: float | None = None, media: dict[str, Any] | None = None,
+                             history: bool = False) -> bool:  # test driver: a bridge `context` event
+        if not self.ctx.allowed(chat_id) or self.on_context is None:
+            return False
+        if self.context_sets and chat_id not in self.context_sets[-1]:
+            return False  # like the bridge: only chats in the last context set give context
+        msg_id = msg_id or f"cx-{next(self._ids)}"
+        self.messages.setdefault(msg_id, FakeMessage(chat_id, msg_id, text, at or self.ctx.clock(), mine=False,
+                                                     from_owner=from_owner, sender_name=sender_name))
+        await self.on_context(ContextMessage(channel=self.name, chat_id=chat_id, ref=MessageRef(chat_id, msg_id),
+                                             sender=sender, sender_name=sender_name, from_owner=from_owner,
+                                             at=self.ctx.clock() if at is None else at, text=text, media=media,
+                                             history=history))
+        return True
 
     async def go_offline(self) -> None:  # test driver
         self._set(LinkState.OFFLINE, detail="Offline.")
@@ -154,7 +190,10 @@ class FakeChannel:
         quoted = None
         if reply_to:
             q = self.messages.get(reply_to)
-            quoted = Quoted(MessageRef(chat_id, reply_to), q.text if q else "", from_owner=not (q and q.mine))
+            quoted = Quoted(MessageRef(chat_id, reply_to), q.text if q else "",
+                            from_owner=q is None or (q.from_owner and not q.mine), from_mac=bool(q and q.mine),
+                            at=q.sent_at if q else 0.0, sender_name=q.sender_name if q else "",
+                            links=tuple(w for w in (q.text if q else "").split() if w.startswith(("http://", "https://"))))
         self.messages.setdefault(msg_id, FakeMessage(chat_id, msg_id, text, sent_at, mine=False))
         msg = InboundMessage(channel=self.name, chat_id=chat_id, ref=MessageRef(chat_id, msg_id), text=text,
                              attachments=() if unsupported else attachments, reply_to=quoted,
@@ -175,17 +214,18 @@ class FakeChannel:
         n = next(self._ids)
         return f"dry-{n}" if self.ctx.dry_run else f"out-{n}"
 
-    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None) -> MessageRef:
+    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None,
+                        mentions: tuple[str, ...] = ()) -> MessageRef:
         self.ctx.check_destination(chat_id)
         await self.ctx.governor.charge("send", chat_id)
         mid = self._new_id()
         if not self.ctx.dry_run:
             rt = reply_to.message_id if reply_to else ""
             self.messages[mid] = FakeMessage(chat_id, mid, text, self.ctx.clock(), True, rt, history=[text])
-            self.wire.append(Write("send_text", chat_id, mid, text, rt, at=self.ctx.clock()))
+            self.wire.append(Write("send_text", chat_id, mid, text, rt, at=self.ctx.clock(), mentions=tuple(mentions)))
         return MessageRef(chat_id, mid)
 
-    async def edit_text(self, ref: MessageRef, text: str) -> bool:
+    async def edit_text(self, ref: MessageRef, text: str, mentions: tuple[str, ...] = ()) -> bool:
         self.ctx.check_destination(ref.chat_id)
         m = self.messages.get(ref.message_id)
         if self.ctx.dry_run:
@@ -197,7 +237,7 @@ class FakeChannel:
         await self.ctx.governor.charge("edit", ref.chat_id)
         m.text = text
         m.history.append(text)
-        self.wire.append(Write("edit", ref.chat_id, ref.message_id, text, at=self.ctx.clock()))
+        self.wire.append(Write("edit", ref.chat_id, ref.message_id, text, at=self.ctx.clock(), mentions=tuple(mentions)))
         return True
 
     async def react(self, ref: MessageRef, emoji: str) -> None:

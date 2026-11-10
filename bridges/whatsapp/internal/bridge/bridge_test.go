@@ -18,16 +18,18 @@ var allowFlags = []string{"--allow", group, "--deny", never}
 func TestFlagValidation(t *testing.T) {
 	base := []string{"--store", "/tmp/x/device.db", "--media-dir", "/tmp/x/media"}
 	bad := map[string][]string{
-		"test without budget": {"--test"},
-		"allow overlaps deny": {"--allow", group, "--deny", group},
-		"bad jid":             {"--allow", "not-a-jid"},
-		"jid with device":     {"--allow", "111:3@s.whatsapp.net"},
-		"negative budget":     {"--budget", "-1"},
-		"non-numeric budget":  {"--budget", "lots"},
-		"zero max-per-min":    {"--max-per-min", "0"},
-		"bad trusted device":  {"--trusted-devices", "x"},
-		"unknown flag":        {"--raise-budget"},
-		"stray argument":      {"extra"},
+		"test without budget":   {"--test"},
+		"allow overlaps deny":   {"--allow", group, "--deny", group},
+		"bad jid":               {"--allow", "not-a-jid"},
+		"jid with device":       {"--allow", "111:3@s.whatsapp.net"},
+		"negative budget":       {"--budget", "-1"},
+		"non-numeric budget":    {"--budget", "lots"},
+		"zero max-per-min":      {"--max-per-min", "0"},
+		"bad trusted device":    {"--trusted-devices", "x"},
+		"context not in allow":  {"--allow", group, "--context", stranger},
+		"context without allow": {"--context", group},
+		"unknown flag":          {"--raise-budget"},
+		"stray argument":        {"extra"},
 	}
 	for name, extra := range bad {
 		if _, err := ParseFlags(append(append([]string{}, base...), extra...), io.Discard); err == nil {
@@ -41,8 +43,12 @@ func TestFlagValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Budget != 4 || !c.Test || len(c.Allow) != 1 || c.MaxPerMin != 20 || len(c.TrustedDevices) != 1 || c.TrustedDevices[0] != 0 {
+	if c.Budget != 4 || !c.Test || len(c.Allow) != 1 || c.MaxPerMin != 20 || !c.TrustedAll || len(c.TrustedDevices) != 0 {
 		t.Fatalf("unexpected config %+v", c)
+	}
+	c, err = ParseFlags(append(base, "--allow", group, "--context", group, "--trusted-devices", "0,3"), io.Discard)
+	if err != nil || c.TrustedAll || len(c.TrustedDevices) != 2 || len(c.Context) != 1 {
+		t.Fatalf("context and device list: %+v %v", c, err)
 	}
 	c, _ = ParseFlags(base, io.Discard)
 	if c.HasBudget() || len(c.Allow) != 0 {
@@ -65,10 +71,10 @@ func TestBadFlagsExit2(t *testing.T) {
 func TestHelloAndReady(t *testing.T) {
 	h := start(t, newFake(), append(allowFlags, "--budget", "5")...)
 	ready := h.event("ready")
-	if ready["protocol"] != "1" || ready["linked"] != true {
+	if ready["protocol"] != "2" || ready["linked"] != true {
 		t.Fatalf("ready = %v", ready)
 	}
-	d := wantOK(t, h.call(1, "hello", map[string]any{"protocol": "1"}))
+	d := wantOK(t, h.call(1, "hello", map[string]any{"protocol": "2"}))
 	if d["jid"] != ownerPN || d["lid"] != ownerLID || d["device"] != float64(7) || d["budget_left"] != float64(5) ||
 		d["dry_run"] != false || d["test"] != false {
 		t.Fatalf("hello data = %v", d)
@@ -86,14 +92,14 @@ func TestHelloMustComeFirst(t *testing.T) {
 	h.event("ready")
 	wantErr(t, h.call(1, "status", nil), "bad_args")
 	wantErr(t, h.call(2, "frobnicate", nil), "unknown_op")
-	wantOK(t, h.call(3, "hello", map[string]any{"protocol": "1"}))
+	wantOK(t, h.call(3, "hello", map[string]any{"protocol": "2"}))
 	wantOK(t, h.call(4, "status", nil))
 }
 
 func TestVersionMismatchExits2(t *testing.T) {
 	h := start(t, newFake(), allowFlags...)
 	h.event("ready")
-	wantErr(t, h.call(1, "hello", map[string]any{"protocol": "2"}), "version_mismatch")
+	wantErr(t, h.call(1, "hello", map[string]any{"protocol": "1"}), "version_mismatch")
 	// Anything after the mismatch must not be handled (the pipe may already be closed).
 	io.WriteString(h.in, `{"id":2,"op":"status"}`+"\n")
 	if c := h.exitCode(3 * time.Second); c != ExitBadArgs {
@@ -167,7 +173,7 @@ func TestDenyAndBudgetImmutable(t *testing.T) {
 	h.hello()
 	// set_allow with a denied JID: denied, and nothing changes.
 	wantErr(t, h.call(1, "set_allow", map[string]any{"allow": []string{stranger, never}}), "denied")
-	d := wantOK(t, h.call(2, "hello", map[string]any{"protocol": "1"}))
+	d := wantOK(t, h.call(2, "hello", map[string]any{"protocol": "2"}))
 	if a := d["allow"].([]any); len(a) != 1 || a[0] != group {
 		t.Fatalf("allow changed after a denied set_allow: %v", a)
 	}
@@ -178,7 +184,7 @@ func TestDenyAndBudgetImmutable(t *testing.T) {
 		wantErr(t, h.call(10+i, op, map[string]any{"deny": []string{}, "budget": 1000}), "unknown_op")
 	}
 	wantOK(t, h.call(20, "status", map[string]any{"budget": 1000}))
-	d = wantOK(t, h.call(21, "hello", map[string]any{"protocol": "1", "budget": 99, "deny": []string{}}))
+	d = wantOK(t, h.call(21, "hello", map[string]any{"protocol": "2", "budget": 99, "deny": []string{}}))
 	if dn := d["deny"].([]any); len(dn) != 1 || dn[0] != never || d["budget_left"] != float64(2) {
 		t.Fatalf("deny/budget changed: %v", d)
 	}
@@ -209,7 +215,7 @@ func TestTestModeRefusals(t *testing.T) {
 	wantErr(t, h.call(1, "set_allow", map[string]any{"allow": []string{group, stranger}}), "test_mode")
 	wantErr(t, h.call(2, "pair", nil), "test_mode")
 	wantErr(t, h.call(3, "logout", nil), "test_mode")
-	d := wantOK(t, h.call(4, "hello", map[string]any{"protocol": "1"}))
+	d := wantOK(t, h.call(4, "hello", map[string]any{"protocol": "2"}))
 	if a := d["allow"].([]any); len(a) != 1 || d["test"] != true {
 		t.Fatalf("hello = %v", d)
 	}
@@ -569,7 +575,7 @@ func TestInboundEmitsOwnerMessage(t *testing.T) {
 
 func TestInboundDropsAndEchoBySentID(t *testing.T) {
 	f := newFake()
-	h := start(t, f, allowFlags...)
+	h := start(t, f, append(allowFlags, "--trusted-devices", "0")...)
 	h.hello()
 	now := h.clock.Now()
 	sent := wantOK(t, h.call(1, "send_text", map[string]any{"chat": group, "text": "x"}))["msg"].(string)

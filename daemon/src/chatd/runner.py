@@ -42,6 +42,7 @@ from typing import Any
 
 from agentd import schema as s
 from agentd.stores import atomic_write_json, read_json
+from chatd import context as cx
 from chatd import format as fmt
 from chatd.agent_client import BACKOFF_S, AgentClient, AgentError, AgentUnavailable
 from chatd.channels.base import (
@@ -49,11 +50,13 @@ from chatd.channels.base import (
     ChannelAdapter,
     ChannelStatus,
     ChatChanged,
+    ContextMessage,
     DestinationRefused,
     InboundMessage,
     LinkState,
     MessageRef,
 )
+from chatd.context import Ring
 from chatd.governor import BudgetExceeded
 
 log = logging.getLogger(__name__)
@@ -215,8 +218,9 @@ class ChatRunner:
     def __init__(self, adapter: ChannelAdapter, *, sock: Path, token: str, state_dir: Path | None,
                  clock: Callable[[], float] = time.time,
                  catch_up_window_s: float = CATCH_UP_WINDOW_S, status_after_s: float = STATUS_AFTER_S,
-                 backoff: tuple[float, ...] = BACKOFF_S) -> None:
+                 backoff: tuple[float, ...] = BACKOFF_S, assistant_name: str | None = None) -> None:
         self.adapter = adapter
+        self.assistant_name = assistant_name or ""  # never taggable (V4); None: the voice config's name
         # The chats come from agentd only (W9.8): a read-only copy of this channel's enabled
         # profiles, from `profile_list` after every hello, then `profile_changed`. Empty until then.
         self.profiles: dict[str, s.Profile] = {}  # chat id -> enabled profile
@@ -230,6 +234,8 @@ class ChatRunner:
                                   on_notice=self._on_notice, backoff=backoff)  # agentd grants the live set
         self.state: dict[str, ChatState] = {}
         self._saved: dict[str, Any] = {}  # stream.json entries of chats not enabled now (kept for later)
+        self.rings: dict[str, Ring] = {}  # chat id -> recent messages (memory only, W10.2)
+        self.members: dict[str, list[dict[str, Any]]] = {}  # chat id -> [{jid, number, name}] (W10.4)
         self._unprefixed: set[str] = set()  # quoted replies let through without the prefix: never commands
         self.link: ChannelStatus | None = None
         self._q: asyncio.Queue[Job] = asyncio.Queue()
@@ -244,13 +250,15 @@ class ChatRunner:
 
     # -- lifecycle ---------------------------------------------------------------------------------------
     async def start(self) -> None:
+        if not self.assistant_name:
+            self.assistant_name = await asyncio.to_thread(_assistant_name)
         raw = await asyncio.to_thread(read_json, self.path, {}) if self.path else {}
         saved = raw.get("convs", {}) if isinstance(raw, dict) else {}
         self._saved = {k: v for k, v in saved.items() if isinstance(v, dict)}
         self._tasks.append(asyncio.create_task(self._pump(), name="chatd:pump"))
         if hasattr(self.adapter, "on_connected"):  # after every bridge start or `connected` (W9.7, W9.8)
             self.adapter.on_connected = self._bridge_connected
-        await self.adapter.start(self._sink, self._on_link, self._on_chat_changed)
+        await self.adapter.start(self._sink, self._on_link, self._on_chat_changed, on_context=self._context_sink)
         self._tasks.append(asyncio.create_task(self._run_client(), name="chatd:agent"))
 
     async def close(self) -> None:
@@ -396,12 +404,73 @@ class ChatRunner:
         return added
 
     async def _push_allowed(self) -> None:
-        """The adapter's allowlist is the enabled profiles (W9.8 step 4). Under test mode the
-        adapter keeps its fixed list and only logs."""
+        """The adapter's allowlist is the enabled profiles (W9.8 step 4), its context set those with
+        `read_chat` (W10.6). A chat that left the context set loses its ring and members at once.
+        Under test mode the adapter keeps its fixed lists and only logs."""
+        reading = self._reading()
+        for cid in set(self.rings) - reading:
+            self.rings.pop(cid, None)
+        for cid in set(self.members) - reading:
+            self.members.pop(cid, None)
         try:
-            await self.adapter.set_allowed(frozenset(self.profiles))
+            await self.adapter.set_allowed(frozenset(self.profiles), frozenset(reading))
         except Exception:
             log.exception("chatd: updating the channel's allowlist failed")
+        for cid in reading - set(self.members):
+            await self._refresh_members(cid)
+
+    def _reading(self) -> set[str]:
+        return {cid for cid, p in self.profiles.items() if p.capabilities.read_chat}
+
+    # -- group context (W10) -----------------------------------------------------------------------------
+    def _ring_add(self, chat_id: str, msg_ref: str, **kw: Any) -> None:
+        if chat_id in self._reading():
+            self.rings.setdefault(chat_id, Ring()).add(msg_ref, at=kw.pop("at", None) or self.clock(), **kw)
+
+    async def _on_context(self, cm: ContextMessage) -> None:
+        """Context is data only: it enters the ring and nothing else (W10.1). Never the parser,
+        reply, steer or ask."""
+        if cm.chat_id in self.profiles:  # the adapter emits context only for its context set
+            self.rings.setdefault(cm.chat_id, Ring()).add_context(cm)
+
+    async def _refresh_members(self, chat_id: str) -> None:
+        try:
+            self.members[chat_id] = list(await self.adapter.members(chat_id))
+        except Exception as e:  # noqa: BLE001 (members are a convenience: plain-text names without them)
+            log.info("chatd: members unavailable (%s)", type(e).__name__)
+
+    def _context(self, st: ChatState, msg: InboundMessage) -> s.AskContext | None:
+        """`ask.context`: members and the whole ring (minus the trigger) when the chat has
+        `read_chat`; the quoted message always (your choice)."""
+        reading = st.chat_id in self._reading()
+        ring = self.rings.get(st.chat_id) if reading else None
+        names = [cx.display_name(m) for m in self.members.get(st.chat_id, [])][:s.CONTEXT_MAX_MEMBERS] if reading else []
+        msgs = ring.messages(exclude=msg.ref.message_id) if ring is not None else []
+        q = cx.quoted(msg.reply_to) if not msg.reaction else None
+        if not (names or msgs or q):
+            return None
+        return s.AskContext(members=names or None, messages=msgs or None, quoted=q)
+
+    async def _maybe_history(self, st: ChatState, msg: InboundMessage) -> None:
+        """After the first accepted ask with an empty ring, ask the phone for 30 earlier messages;
+        they arrive later as history context (W10.3). The adapter and bridge own the bounds (context
+        set, once an hour, budget) and answer False when they refuse."""
+        if self.rings.get(st.chat_id):
+            return
+        try:
+            await self.adapter.request_history(st.chat_id, msg.ref, cx.HISTORY_COUNT)
+        except Exception as e:  # noqa: BLE001 (history is best effort; the ring fills from live messages)
+            log.info("chatd: history request failed (%s)", type(e).__name__)
+
+    def _mentions(self, st: ChatState, text: str) -> tuple[str, tuple[str, ...]]:
+        members = self.members.get(st.chat_id) if st.chat_id in self._reading() else None
+        if not members:
+            return text, ()
+        me = self.link.account if self.link is not None else ""
+        own = {str(m.get("name") or "").strip().casefold() for m in members if me and m.get("jid") == me}
+        others = [m for m in members if not me or m.get("jid") != me]  # never tags the owner's own account
+        reserved = cx.RESERVED_NAMES | {self.assistant_name.strip().casefold()} | own
+        return cx.resolve_mentions(text, others, frozenset(reserved - {""}))
 
     def _on_notice(self, notice: Any) -> None:
         if isinstance(notice, s.ProfileChanged):
@@ -448,6 +517,8 @@ class ChatRunner:
         """The adapter re-sent its allowlist after a bridge start or `connected` (W9.8 step 5);
         now compare the members (W9.7)."""
         self._enqueue(self._check_members)
+        for cid in self._reading():
+            self._enqueue(self._refresh_members, cid)
 
     async def _check_members(self) -> None:
         try:
@@ -536,6 +607,10 @@ class ChatRunner:
         st.boot, st.last_applied_seq = ev.boot, ev.seq
         t = self._turn(st, getattr(ev, "turn_uid", None))
         match ev:
+            case s.StatusEvent() if isinstance(ev.data.get("compacted"), dict):
+                c = ev.data["compacted"]  # Claude compacted the session: logged, never posted (W10.7)
+                log.info("chatd: %s compacted (%s, %s -> %s tokens)", st.conv, c.get("trigger"), c.get("pre_tokens"),
+                         c.get("post_tokens"))
             case s.StatusEvent() if isinstance(ev.data.get("profile_command"), dict):
                 said = str(ev.data["profile_command"].get("message") or "")  # agentd's result of a bound yes
                 if said:
@@ -665,11 +740,22 @@ class ChatRunner:
                 chunks, full = fmt.plan_answer(answer, lim.max_text) if answer else ([fmt.DONE], None)
                 if full is not None:
                     log.warning("chatd: the answer was too long for chat; sending it as a file (AG21)")
-                await self._show_final(st, t, chunks[0])
+                first, tagged = self._mentions(st, chunks[0])
+                if tagged and t.status:
+                    # WhatsApp pings nobody for a tag added by an edit: an answer that tags someone is a new
+                    # message, and the status stays as it was (no edit, so the answer is never shown twice)
+                    ref = await self._send(st, t, first, reply_to=t.request, final=True, mentions=tagged)
+                    answer_id = ref.message_id if ref else ""
+                else:
+                    await self._show_final(st, t, first, tagged)
+                    answer_id = t.status
                 for c in chunks[1:]:
-                    await self._send(st, t, c)
+                    c, tagged = self._mentions(st, c)
+                    await self._send(st, t, c, mentions=tagged)
                 if full is not None:
                     await self._send_md(st, t, full)
+                if answer and answer_id:  # Mac's reply joins the ring for later asks (W10.2)
+                    self._ring_add(st.chat_id, answer_id, mac=True, text=answer)
         elif how == "stopped" and t.status:
             await self._show_final(st, t, fmt.STOPPED)
         elif how == "error":
@@ -689,11 +775,12 @@ class ChatRunner:
         await self._save()
         await self._call("ack", conv=st.conv, turn_uid=t.uid)
 
-    async def _show_final(self, st: ChatState, t: Turn, text: str) -> None:
+    async def _show_final(self, st: ChatState, t: Turn, text: str, mentions: tuple[str, ...] = ()) -> None:
+        """The final text on the status message, or a new message. Tags only ever go on a new message."""
         if t.status:
             await self._edit_status(st, t, text, final=True)
         else:
-            ref = await self._send(st, t, text, reply_to=t.request, final=True)
+            ref = await self._send(st, t, text, reply_to=t.request, final=True, mentions=mentions)
             if ref is not None:
                 t.status, t.status_sent_at, t.shown = ref.message_id, self.clock(), fmt.outbound(text)
 
@@ -763,6 +850,9 @@ class ChatRunner:
         await self._save()
 
     # -- inbound ---------------------------------------------------------------------------------------------
+    async def _context_sink(self, cm: ContextMessage) -> None:
+        self._enqueue(self._on_context, cm)
+
     async def _sink(self, msg: InboundMessage) -> None:
         gated = self._gate(msg)
         if gated is not None:
@@ -791,6 +881,10 @@ class ChatRunner:
             self._unprefixed.add(msg.ref.message_id)
             return msg
         log.debug("chatd: %s ignored (no prefix)", msg.ref.message_id)
+        if msg.text.strip() or msg.attachments:  # your own non-trigger message: context (W10.2)
+            media = {"kind": msg.attachments[0].kind, "name": msg.attachments[0].name} if msg.attachments else None
+            self._ring_add(msg.chat_id, msg.ref.message_id, owner=True, at=msg.sent_at, text=msg.text.strip(),
+                           media=media)
         return None
 
     def _on_link(self, status: ChannelStatus) -> None:
@@ -802,6 +896,8 @@ class ChatRunner:
             self._enqueue(self._never_listed, change.chat_id)  # renamed to Timetable: never again
             return
         self._enqueue(self._members, change.chat_id, change.owner_only, change.extra.get("members"))
+        if change.chat_id in self._reading():
+            self._enqueue(self._refresh_members, change.chat_id)
 
     async def _never_listed(self, chat_id: str) -> None:
         """A profiled group renamed to a never subject: agentd makes it a sticky never-list entry,
@@ -904,9 +1000,10 @@ class ChatRunner:
         self._turn_no += 1
         atts = [s.AskAttachment(path=str(a.path), kind=a.kind, name=a.name or a.path.name) for a in msg.attachments]
         meta = s.AskMeta(replayed=replayed, sent_at=msg.sent_at, msg_ref=msg.ref.message_id)
+        context = self._context(st, msg)
         try:
             data = await self.client.call("ask", conv=st.conv, turn=self._turn_no, text=text or "(see the file)",
-                                          attachments=atts or None, meta=meta)
+                                          attachments=atts or None, meta=meta, context=context)
         except AgentUnavailable:
             raise
         except AgentError as e:
@@ -921,6 +1018,7 @@ class ChatRunner:
         st.turn = t
         await self._react(st, t, EYES)
         await self._handled(msg)  # R4: only after agentd accepted it
+        await self._maybe_history(st, msg)
         await self._save()
         self._later(st.conv, "status", self.status_after_s, self._status_due, st.conv, t.uid)
 
@@ -1101,13 +1199,13 @@ class ChatRunner:
         return MessageRef(st.chat_id, mid) if mid else None
 
     async def _send(self, st: ChatState, t: Turn | None, text: str, *, reply_to: str = "",
-                    final: bool = False) -> MessageRef | None:
+                    final: bool = False, mentions: tuple[str, ...] = ()) -> MessageRef | None:
         if t is not None and t.new_msgs >= TASK_NEW_MESSAGES and not final:
             log.warning("chatd: task message budget spent; dropped a message")
             return None
         body = fmt.outbound(text)
         try:
-            ref = await self.adapter.send_text(st.chat_id, body, self._ref(st, reply_to))
+            ref = await self.adapter.send_text(st.chat_id, body, self._ref(st, reply_to), mentions=mentions)
         except (BudgetExceeded, DestinationRefused) as e:
             log.warning("chatd: send refused (%s)", type(e).__name__)
             return None
@@ -1123,7 +1221,7 @@ class ChatRunner:
     async def _edit(self, st: ChatState, mid: str, text: str) -> bool:
         body = fmt.outbound(text)
         try:
-            ok = await self.adapter.edit_text(MessageRef(st.chat_id, mid), body)
+            ok = await self.adapter.edit_text(MessageRef(st.chat_id, mid), body)  # never tags: edits ping nobody
         except (BudgetExceeded, DestinationRefused) as e:
             log.warning("chatd: edit refused (%s)", type(e).__name__)
             return False
@@ -1167,3 +1265,13 @@ class ChatRunner:
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(text, encoding="utf-8")
+
+
+def _assistant_name() -> str:
+    """The assistant's name from the voice config (`name`, default "Mac"), read only, never written."""
+    from macd import config as mcfg
+
+    try:
+        return mcfg.load(write_default=False).name
+    except Exception:  # noqa: BLE001 (an unreadable config: the default name is reserved anyway)
+        return "Mac"

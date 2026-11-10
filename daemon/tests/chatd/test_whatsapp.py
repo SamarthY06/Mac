@@ -122,6 +122,14 @@ class WaHarness(Harness):
             cmd["media"] = {"kind": unsupported}
         await acontrol(self.dir(rig), cmd="inbound", **cmd)
 
+    async def inject_context(self, rig: Rig, *, chat_id: str, text: str, msg_id: str, quote_of: str = "") -> None:
+        a = adapter(rig)
+        if chat_id not in a.context_ids:
+            await a.set_allowed(rig.ctx.chats, a.context_ids | {chat_id})
+        extra: dict[str, Any] = {"quote_of": quote_of} if quote_of else {}
+        await self.inject(rig, chat_id=chat_id, text=text, msg_id=msg_id, owner=False,
+                          sender="222@s.whatsapp.net", sender_name="Arjun", **extra)
+
     def stats(self, rig: Rig) -> dict[str, Any]:
         return control(self.dir(rig), cmd="stats")
 
@@ -313,7 +321,7 @@ async def test_set_allow_outside_test(harness: WaHarness) -> None:
 
 # -- who can drive the Mac -----------------------------------------------------------------------------------
 async def test_untrusted_and_own_devices_dropped(harness: WaHarness) -> None:
-    rig = await harness.rig()
+    rig = await harness.rig_with(cfg={"trusted_devices": [0]})
     assert await deliver(harness, rig, chat_id=PREP, text="hi", msg_id="d1", sender_device=3) == []
     assert harness.stats(rig)["dropped"] == {"untrusted_device": 1}
     await emit(harness, rig, raw_message(rig, msg="d2", sender_device=3))  # past the bridge: re-checked
@@ -488,7 +496,7 @@ async def test_exit_1_breaker_after_five_crashes(harness: WaHarness) -> None:
     await a.close()
 
 
-@pytest.mark.parametrize("fake", [{"exit_codes": [2]}, {"protocol": "2"}])
+@pytest.mark.parametrize("fake", [{"exit_codes": [2]}, {"protocol": "1"}])
 async def test_exit_2_never_restarts(harness: WaHarness, fake: dict[str, Any]) -> None:
     rig = await harness.rig_with(fake=fake, wait=False)
     a, d = adapter(rig), harness.dir(rig)
@@ -691,4 +699,140 @@ async def test_set_allow_narrows_before_the_bridge_answers(harness: WaHarness) -
     assert not rig.ctx.allowed(PREP) and not rig.ctx.allowed(OTHER)  # never the old, wider set
     with pytest.raises(DestinationRefused):
         await a.send_text(PREP, "Mac · hi")
+    await a.close()
+
+
+# -- protocol 2 (v3.5, W10): context, members, mentions, history, quotes -----------------------------------
+ARJUN = {"jid": "222@s.whatsapp.net", "number": "222", "name": "Arjun"}
+PRIYA = {"jid": "333@s.whatsapp.net", "number": "333", "name": "Priya"}
+
+
+async def test_context_reaches_only_on_context(harness: WaHarness) -> None:
+    rig = await harness.rig()
+    a = adapter(rig)
+    await a.set_allowed(rig.ctx.chats, {PREP, TIMETABLE})  # a never-listed chat never becomes context
+    assert a.context_ids == {PREP} and harness.stats(rig)["context"] == [PREP]
+    await harness.inject(rig, chat_id=PREP, text="x" * 5000, msg_id="c1", owner=False, sender_name="Arjun",
+                         media={"kind": "image", "name": "cv.png"})
+    await harness.inject(rig, chat_id=PREP, text="", msg_id="c2", owner=False, reaction="👍")  # never context
+    await harness.settle(rig)
+    assert rig.delivered == [] and len(rig.contexts) == 1
+    c = rig.contexts[0]
+    assert (c.sender_name, len(c.text), c.from_owner, c.history) == ("Arjun", 4000, False, False)
+    assert c.media == {"kind": "image", "name": "cv.png"}
+    assert harness.stats(rig)["downloads"] == 0  # context media is never downloaded
+    await a.set_allowed(rig.ctx.chats, ())  # read_chat off: members' messages are dropped again
+    await harness.inject(rig, chat_id=PREP, text="hi", msg_id="c3", owner=False)
+    await harness.settle(rig)
+    assert len(rig.contexts) == 1 and harness.stats(rig)["dropped"].get("not_owner") == 2
+    await a.close()
+
+
+async def test_context_flags_and_trusted_default(harness: WaHarness) -> None:
+    rig = await harness.rig()
+    argv = harness.stats(rig)["argv"]
+    assert "--trusted-devices=all" in argv and "--context=" in argv
+    await adapter(rig).close()
+
+
+async def test_context_event_rechecked_in_the_adapter(harness: WaHarness) -> None:
+    rig = await harness.rig()
+    a = adapter(rig)
+    sent = await a.send_text(PREP, "Mac · hi")
+    ev = {"ev": "context", "chat": PREP, "msg": "c1", "sender": ARJUN["jid"], "from_owner": False, "at": 1.0,
+          "text": "hi", "media": {"kind": "image", "path": "/etc/passwd"}}
+    await emit(harness, rig, ev)  # not a context chat
+    await a.set_allowed(rig.ctx.chats, {PREP})
+    await emit(harness, rig, {**ev, "msg": sent.message_id})  # our own message
+    await emit(harness, rig, {**ev, "msg": "c2", "text": "Mac · echo"})
+    await emit(harness, rig, ev)
+    assert [c.ref.message_id for c in rig.contexts] == ["c1"] and rig.contexts[0].media == {"kind": "image"}
+    await a.close()
+
+
+async def test_set_allow_context_must_be_inside_allow(harness: WaHarness) -> None:
+    rig = await harness.rig()
+    a = adapter(rig)
+    await a.set_allow([PREP, OTHER], [OTHER, "999@g.us"])  # the adapter keeps only the allowed part
+    assert a.context_ids == {OTHER} and harness.stats(rig)["context"] == [OTHER]
+    await a.set_allow([PREP])  # context omitted: narrowed with the allowlist
+    assert a.context_ids == frozenset() and harness.stats(rig)["context"] == []
+    with pytest.raises(BridgeError) as e:  # the bridge refuses a context outside allow on its own
+        await a._call("set_allow", allow=[PREP], context=[OTHER])
+    assert e.value.code == "bad_args"
+    await a.close()
+
+
+async def test_members_and_mentions(harness: WaHarness) -> None:
+    rig = await harness.rig_with(fake={"members": {PREP: [ARJUN, PRIYA]}})
+    a = adapter(rig)
+    assert await a.members(PREP) == [ARJUN, PRIYA]
+    with pytest.raises(DestinationRefused):
+        await a.members(TIMETABLE)
+    await a.send_text(PREP, "Mac · @222 and @999 look", mentions=[ARJUN["jid"], PRIYA["jid"], "999@s.whatsapp.net"])
+    ref = await a.send_text(PREP, "Mac · plain")
+    assert await a.edit_text(ref, "Mac · now @333", mentions=[PRIYA["jid"]])
+    writes = harness.stats(rig)["writes"]
+    assert [w.get("mentions") for w in writes if w["op"] in ("send_text", "edit")] == [[ARJUN["jid"]], [],
+                                                                                     [PRIYA["jid"]]]
+    await a.close()
+
+
+async def test_request_history(harness: WaHarness) -> None:
+    rig = await harness.rig()
+    a = adapter(rig)
+    await harness.inject(rig, chat_id=PREP, text="first", msg_id="m1")
+    await harness.settle(rig)
+    before = MessageRef(PREP, "m1")
+    assert not await a.request_history(PREP, before)  # not a context chat
+    await a.set_allowed(rig.ctx.chats, {PREP})
+    assert await a.request_history(PREP, before, count=500)
+    assert next(w for w in harness.stats(rig)["writes"] if w["op"] == "history")["count"] == 50
+    assert not await a.request_history(PREP, before)  # once per chat per hour
+    owner = {"chat": PREP, "msg": "h1", "text": "old owner text", "from_me": True}
+    await acontrol(harness.dir(rig), cmd="history_blob",
+                   messages=[owner, {"chat": PREP, "msg": "h2", "text": "old member text", "sender_name": "Arjun"}])
+    await harness.settle(rig)
+    assert [m.ref.message_id for m in rig.delivered] == ["m1"]  # history is never a trigger, even the owner's
+    assert [(c.ref.message_id, c.history, c.from_owner) for c in rig.contexts] == [("h1", True, True),
+                                                                                  ("h2", True, False)]
+    await acontrol(harness.dir(rig), cmd="history_blob", messages=[{**owner, "msg": "h3"}])  # nothing open
+    await harness.settle(rig)
+    assert len(rig.contexts) == 2
+    await a.close()
+
+
+async def test_request_history_off_under_dry_run(harness: WaHarness) -> None:
+    rig = await harness.rig(dry_run=True)
+    a = adapter(rig)
+    await a.set_allowed(rig.ctx.chats, {PREP})
+    assert not await a.request_history(PREP, MessageRef(PREP, "m1"))
+    assert harness.stats(rig)["writes"] == []
+    await a.close()
+
+
+async def test_extended_quote(harness: WaHarness, short_root: Path) -> None:
+    rig = await harness.rig()
+    a = adapter(rig)
+    media = short_root / "wa" / "media"
+    media.mkdir(parents=True, exist_ok=True)
+    (media / "q1-cv.pdf").write_bytes(b"%PDF")
+    outside = short_root / "secret.pdf"
+    outside.write_bytes(b"x")
+    links = ["https://example.com/job", "javascript:alert(1)", *[f"http://x/{i}" for i in range(12)]]
+    quoted = {"msg": "q1", "text": "the role", "from_owner": False, "sender": ARJUN["jid"], "sender_name": "Arjun",
+              "at": 5.0, "links": links,
+              "media": {"kind": "document", "name": "cv.pdf", "mime": "application/pdf", "size": 4,
+                        "path": str(media / "q1-cv.pdf")}}
+    await emit(harness, rig, raw_message(rig, msg="m1", text="look", quoted=quoted))
+    await emit(harness, rig, raw_message(rig, msg="m2", text="look",
+                                         quoted={**quoted, "media": {**quoted["media"], "path": str(outside)}}))
+    await emit(harness, rig, raw_message(rig, msg="m3", text="look", quoted={"msg": "zz", "kind": "other_chat",
+                                                                            "text": "leak"}))
+    q1, q2, q3 = (m.reply_to for m in rig.delivered)
+    assert q1 is not None and q2 is not None and q3 is not None
+    assert (q1.sender_name, q1.at, q1.links[0], len(q1.links)) == ("Arjun", 5.0, "https://example.com/job", 10)
+    assert q1.media is not None and q1.media.path == (media / "q1-cv.pdf").resolve()
+    assert q2.media is not None and q2.media.path is None  # a file outside the media folder is ignored
+    assert (q3.kind, q3.text) == ("other_chat", "")
     await a.close()

@@ -16,6 +16,7 @@ and skipped with that reason.
 from __future__ import annotations
 
 import abc
+import inspect
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,7 @@ from chatd.channels.base import (
     ChannelAdapter,
     ChannelStatus,
     ChatChanged,
+    ContextMessage,
     DestinationRefused,
     InboundMessage,
     LinkState,
@@ -60,6 +62,7 @@ class Rig:
     delivered: list[InboundMessage] = field(default_factory=list)
     statuses: list[ChannelStatus] = field(default_factory=list)
     changes: list[ChatChanged] = field(default_factory=list)
+    contexts: list[ContextMessage] = field(default_factory=list)
 
     async def start(self) -> Rig:
         async def sink(m: InboundMessage) -> None:
@@ -68,7 +71,13 @@ class Rig:
         async def changed(c: ChatChanged) -> None:
             self.changes.append(c)
 
-        await self.adapter.start(sink, self.statuses.append, changed)
+        async def context(c: ContextMessage) -> None:
+            self.contexts.append(c)
+
+        if "on_context" in inspect.signature(self.adapter.start).parameters:
+            await self.adapter.start(sink, self.statuses.append, changed, on_context=context)
+        else:
+            await self.adapter.start(sink, self.statuses.append, changed)
         return self
 
 
@@ -99,6 +108,11 @@ class Harness(abc.ABC):
     @abc.abstractmethod
     def writes(self, rig: Rig) -> int:
         """How many outbound writes reached the wire."""
+
+    async def inject_context(self, rig: Rig, *, chat_id: str, text: str, msg_id: str, quote_of: str = "") -> None:
+        """Put another member's message in a context chat on the wire (`quote_of`: it replies to
+        that message). Channels without other members list "context" in `lacks`."""
+        raise NotImplementedError
 
     async def settle(self, rig: Rig) -> None:
         """Wait until injected messages were processed (default: nothing to wait for)."""
@@ -276,4 +290,22 @@ class AdapterContract:
         rig = await harness.rig()
         got = await self.deliver(harness, rig, chat_id=harness.chat, text="", msg_id="v1", unsupported="voice")
         assert len(got) == 1 and got[0].unsupported == "voice" and got[0].attachments == ()
+        await rig.adapter.close()
+
+    # C10 (v3.5, W10.1): context is data. A member's "Mac, stop", or a "yes" quoting Mac's prompt,
+    # reaches only on_context, never the sink that leads to commands, replies, steers and asks.
+    async def test_c10_context_never_reaches_the_trigger_sink(self, harness: Harness) -> None:
+        self.need(harness, "context")
+        rig = await harness.rig()
+        prompt = await rig.adapter.send_text(harness.chat, "Mac · Send it? Reply yes to this message.")
+        try:
+            await harness.inject_context(rig, chat_id=harness.chat, text="Mac, stop", msg_id="c1")
+        except NotImplementedError:
+            await rig.adapter.close()
+            pytest.skip("this harness cannot put context on the wire yet")
+        await harness.inject_context(rig, chat_id=harness.chat, text="yes", msg_id="c2", quote_of=prompt.message_id)
+        await harness.settle(rig)
+        assert rig.delivered == []
+        assert [c.text for c in rig.contexts] == ["Mac, stop", "yes"]
+        assert all(not c.from_owner and c.chat_id == harness.chat for c in rig.contexts)
         await rig.adapter.close()

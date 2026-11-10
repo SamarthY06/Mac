@@ -243,18 +243,23 @@ def test_status_reply_example_round_trips():
 
 
 def test_version_mismatch_text_is_the_doc_text():
-    m = re.search(r'`error: "(agentd speaks API 1\.1 but this client speaks 1\.0[^"]+)"`', DOC)
+    m = re.search(r'`error: "(agentd speaks API 1\.2 but this client speaks 1\.1[^"]+)"`', DOC)
     assert m and "Restart Mac to update all parts together." in m.group(1)
 
 
 # ----------------------------------------------------------------------------- every op, response and event
 
 REQUESTS = {
-    "hello": {"api": "1.1", "token": "ab" * 32, "client": "chatd/0.9.0", "client_epoch": "cd" * 16,
+    "hello": {"api": "1.2", "token": "ab" * 32, "client": "chatd/0.9.0", "client_epoch": "cd" * 16,
               "conversations": ["whatsapp:1203@g.us"]},
     "ask": {"conv": "whatsapp:1203@g.us", "turn": 3, "text": "find me 20 jobs",
             "attachments": [{"path": "/tmp/a.pdf", "kind": "document", "name": "a.pdf"}],
-            "meta": {"replayed": False, "sent_at": 1762790000.5, "msg_ref": "3EB0"}},
+            "meta": {"replayed": False, "sent_at": 1762790000.5, "msg_ref": "3EB0"},
+            "context": {"members": ["Priya", "Arjun"],
+                        "messages": [{"msg_ref": "3EA1", "sender": "Priya", "owner": False, "mac": False,
+                                      "at": 1762789990.0, "text": "can you look at this?"}],
+                        "quoted": {"sender": "Priya", "owner": False, "mac": False, "at": 1762789990.0,
+                                   "text": "can you look at this?", "links": ["https://example.com/job"]}}},
     "steer": {"conv": "whatsapp:1203@g.us", "turn_uid": "b:c:e:3", "text": "only London"},
     "interrupt": {"conv": "voice:local", "turn": 2},
     "new_session": {"conv": "whatsapp:1203@g.us", "folder": "~/Desktop/Personal/Mac"},
@@ -284,7 +289,7 @@ REQUESTS = {
 }
 
 RESPONSES = {
-    "hello": {"api": "1.1", "server": "agentd/0.9.0", "kind": "chat", "boot": "00ff",
+    "hello": {"api": "1.2", "server": "agentd/0.9.0", "kind": "chat", "boot": "00ff",
               "conversations": ["whatsapp:1203@g.us"], "interrupted": []},
     "ask": {"turn_uid": "00ff:whatsapp:1203@g.us:cdcd:3"}, "steer": {"accepted": False},
     "interrupt": {"stopped": True}, "new_session": {}, "reset": {}, "warm": {}, "sleep": {},

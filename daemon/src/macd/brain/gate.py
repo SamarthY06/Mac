@@ -32,7 +32,7 @@ Chat profile (WhatsApp ARCHITECTURE W3.3), switched on through `GateContext`:
   when that folder is one of Mac's own workspaces under ``~/.mac-agent`` (F10).
 - ``capabilities`` (v3.4, W9.5): the chat's granted tool classes (a set, or a callable read at
   every decision; None = voice, no check). Every tool has one row in ``TOOL_MAP``; a call needs
-  every class `tool_classes()` gives it, an unknown tool (user MCP servers included) is denied.
+  every class `tool_classes()` gives it; an unmapped tool (user MCP servers, Skill, ...) needs none.
   Order: whatsapp_ui and the never-list, then a missing capability, then the rules above.
 
 `ConfirmationGate` is owned by the orchestrator and shared with the brain: the model asks
@@ -51,6 +51,7 @@ import os
 import posixpath
 import re
 import time
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,7 +268,6 @@ MAC_TEST_OUTWARD = "mcp__mac__test_outward"
 MAC_CONFIRM = "mcp__mac__request_confirmation"
 MAC_SET_PERSONA = "mcp__mac__set_persona"
 CAPABILITY = "capability"  # reason code prefix: capability:<name> (W9.5)
-UNKNOWN_TOOL = "unknown_tool"
 
 UI_RETURN_COMBOS = {"return", "enter", "cmd+return", "cmd+enter", "ctrl+return", "ctrl+enter",
                     "shift+return", "shift+enter", "cmd+shift+d", "kp_enter"}
@@ -1048,6 +1048,7 @@ def _classify_applescript(script: str, analyze_shell: Callable[[str], GateDecisi
 # ----------------------------------------------------------------------------- per-tool
 
 
+_SHELL_TOOLS = {"Bash", "Monitor"}  # Monitor's `command` is a shell command, classified the same way
 _FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 _FILE_READ_TOOLS = {"Read", "NotebookRead"}
 _CHROME_CLICKS = {"left_click", "right_click", "double_click", "triple_click", "left_click_drag"}
@@ -1202,7 +1203,7 @@ def _whatsapp_ui(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> GateD
         if any(_WA_URL.search(t) for t in texts):
             return hit
         return None
-    if tool_name == "Bash":
+    if tool_name in _SHELL_TOOLS:
         cmd = str(inp.get("command", ""))
         low = cmd.lower()
         scripted = "whatsapp" in low and re.search(r"\b(osascript|jxa|system events)\b", low)
@@ -1239,11 +1240,51 @@ def _never_chat(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateC
         texts = [d.target, d.reason]
     else:
         return None
-    blob = " ".join(texts).lower()
-    for n in names:
-        if re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", blob):
+    return _never_named(" ".join(texts), ctx)
+
+
+def _never_named(text: str, ctx: GateContext) -> GateDecision | None:
+    """`text` names a never-listed chat (NFKC, case-folded, at word boundaries)."""
+    blob = unicodedata.normalize("NFKC", text).casefold()
+    for raw in ctx.never_chat_names:
+        n = unicodedata.normalize("NFKC", raw).strip().casefold()
+        if n and re.search(rf"(?<![^\W_]){re.escape(n)}(?![^\W_])", blob):
             return GateDecision("catastrophic", NEVER_CHAT, f"'{n}' is on the never-list; Mac never reads "
                                 f"from or sends to it", target=n)
+    return None
+
+
+_LEAF_DEPTH, _LEAF_MAX = 4, 200
+
+
+def _leaves(obj: Any, depth: int = 0) -> Iterable[str]:
+    if isinstance(obj, str):
+        yield unicodedata.normalize("NFKC", obj)
+    elif depth < _LEAF_DEPTH and isinstance(obj, dict | list):
+        for v in obj.values() if isinstance(obj, dict) else obj:
+            yield from _leaves(v, depth + 1)
+
+
+def _unparsed(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateContext) -> GateDecision | None:
+    """X1: a tool the gate has no parser for (user MCP servers, Skill, ...): every string in its
+    input (depth 4, 200 leaves) is checked against the never-list, reads included, and every
+    path-like one against the secrets and ~/.mac-agent rules."""
+    paths = _Paths(ctx)
+    write = d.verdict == "outward" or bool(UNKNOWN_MCP_VERBS.search(tool_name.rsplit("__", 1)[-1]))
+    for i, leaf in enumerate(_leaves(inp)):
+        if i >= _LEAF_MAX:
+            break
+        if ctx.never_chat_names:
+            never = _never_named(leaf, ctx)
+            if never is not None:
+                return never
+        raw = leaf.strip()
+        if raw.lower().startswith("file://"):
+            raw = raw[7:]
+        if raw.startswith(("/", "~")):
+            reason = paths.sensitive_reason(raw, ctx.workspace, write=write)
+            if reason:
+                return GateDecision("sensitive_read", "sensitive_write" if write else "sensitive_path", reason)
     return None
 
 
@@ -1286,6 +1327,10 @@ def analyze(tool_name: str, tool_input: dict[str, Any] | None,
             never = _never_chat(tool_name, inp, d, ctx)
             if never is not None:
                 return never
+        if not map_rows(tool_name):
+            unparsed = _unparsed(tool_name, inp, d, ctx)
+            if unparsed is not None:
+                return unparsed
     except Exception:
         log.exception("gate: classifier error for %s", tool_name)
         if ctx.capabilities is not None:  # N2: a chat never gets a yes for a call it could not check
@@ -1299,7 +1344,7 @@ def analyze(tool_name: str, tool_input: dict[str, Any] | None,
 def _analyze(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> tuple[GateDecision, frozenset[str]]:
     """The decision, plus the command names a Bash call runs (empty for other tools)."""
     paths = _Paths(ctx)
-    if tool_name == "Bash":
+    if tool_name in _SHELL_TOOLS:
         bash = _BashAnalyzer(paths)
         return bash.analyze(str(inp.get("command", ""))), frozenset(bash.commands)
     return _analyze_tool(tool_name, inp, ctx, paths), frozenset()
@@ -1330,20 +1375,25 @@ def _analyze_tool(tool_name: str, inp: dict[str, Any], ctx: GateContext, paths: 
 # ----------------------------------------------------------------------------- capabilities (W9)
 
 # W9.1 (P5): every tool a chat brain can call has exactly ONE row ("" = no capability needed).
-# Patterns are fnmatch. A tool that matches no row is unknown and denied in chat, which covers
-# user MCP servers and the voice-only tools (rename_assistant, reset_voice, go_to_sleep).
+# Patterns are fnmatch. A tool that matches no row (user MCP servers, Skill, harness tools) is
+# allowed in chat and logged by name (user decision, v3.5); the gate's other rules still apply.
 TOOL_MAP: dict[str, tuple[str, ...]] = {
     "": ("mcp__mac__say", "mcp__mac__request_confirmation", "mcp__mac__notify",
-         "mcp__mac__switch_workspace", "mcp__mac__set_persona", "TodoWrite", "Task", "Agent"),
+         "mcp__mac__switch_workspace", "mcp__mac__set_persona", "TodoWrite", "Task", "Agent",
+         "ToolSearch"),  # ToolSearch only loads deferred tools; each one is gated when called
     "files_read": ("Read", "NotebookRead", "Glob", "Grep", "LS", "mcp__mac__remember", "mcp__mac__forget",
                    "mcp__mac__rewrite_memory"),
-    "files_write": ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell"),
+    "files_write": ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell",
+                    "Monitor", "TaskStop"),  # Monitor runs a shell command; TaskStop stops one
     "chrome": ("mcp__claude-in-chrome__*",),
     "web": ("WebSearch", "WebFetch"),
     "desktop": ("mcp__mac__ui_*", "mcp__mac__screenshot", "mcp__mac__open_app", "mcp__mac__frontmost"),
     "send_file": ("mcp__mac__send_file",),
     "outward_sends": ("mcp__mac__test_outward",),
+    "read_chat": (),  # no tool: the group's messages and members arrive as context (W10.6)
 }
+# X2: an unclassified tool could read, write, fetch or send, so it needs all four levers on.
+UNCLASSIFIED_NEEDS: tuple[str, ...] = ("files_read", "files_write", "web", "outward_sends")
 # Bash commands that drive the screen or other apps (osascript UI scripting, `open`): + desktop.
 _DESKTOP_COMMANDS = frozenset({"osascript", "open", "screencapture", "cliclick", "shortcuts"})
 # Outward tools whose yes is their own rule, not an outward send (send_file: confirm_files).
@@ -1355,11 +1405,9 @@ def map_rows(tool_name: str) -> list[str]:
     return [cap for cap, pats in TOOL_MAP.items() if any(fnmatch.fnmatchcase(tool_name, p) for p in pats)]
 
 
-def _classes(tool_name: str, d: GateDecision, commands: frozenset[str]) -> set[str] | None:
+def _classes(tool_name: str, d: GateDecision, commands: frozenset[str]) -> set[str]:
     rows = map_rows(tool_name)
-    if len(rows) != 1:
-        return None
-    classes = {rows[0]} - {""}
+    classes = set(rows) - {""}  # an unmapped tool needs no capability (user decision, v3.5)
     if commands & _DESKTOP_COMMANDS:
         classes.add("desktop")
     if d.verdict == "outward" and tool_name not in _OWN_CONFIRM:
@@ -1368,10 +1416,10 @@ def _classes(tool_name: str, d: GateDecision, commands: frozenset[str]) -> set[s
 
 
 def tool_classes(tool_name: str, tool_input: dict[str, Any] | None,
-                 context: GateContext | None = None) -> set[str] | None:
-    """The capabilities a call needs (W9.1): its TOOL_MAP row, + desktop for a Bash call that runs
-    osascript or `open`, + outward_sends for any outward verdict. None: the tool is unknown (no
-    row), so a chat denies it. Uses the same parsing as `analyze`."""
+                 context: GateContext | None = None) -> set[str]:
+    """The capabilities a call needs (W9.1): its TOOL_MAP row (none for an unmapped tool), +
+    desktop for a Bash call that runs osascript or `open`, + outward_sends for any outward
+    verdict. Uses the same parsing as `analyze`."""
     ctx = context or GateContext()
     d, commands = _analyze(tool_name, tool_input or {}, ctx)
     return _classes(tool_name, d, commands)
@@ -1389,17 +1437,24 @@ def _granted(ctx: GateContext) -> frozenset[str]:
 
 def _capability(tool_name: str, d: GateDecision, commands: frozenset[str],
                 ctx: GateContext) -> GateDecision | None:
-    classes = _classes(tool_name, d, commands)
-    if classes is None:
-        log.warning("gate: unknown tool %s denied in this chat", tool_name)
-        return GateDecision("sensitive_read", UNKNOWN_TOOL, "that tool is not available in this chat",
-                            target=tool_name)
     granted = _granted(ctx)  # one read of the live profile per decision
+    where = f"Mac \u25b8 WhatsApp \u25b8 {ctx.display_name}" if ctx.display_name else "Mac \u25b8 WhatsApp"
+    if not map_rows(tool_name):
+        # X2: a tool Mac can't classify runs only while every lever it could bypass is on (the
+        # default, so the allow-all decision holds); otherwise turning one off would mean nothing.
+        off = [c for c in UNCLASSIFIED_NEEDS if c not in granted]
+        if not off:
+            log.info("gate: unmapped tool %s in a chat: allowed (all levers on)", tool_name)
+            return None
+        w = CAPABILITY_WORDS[off[0]]
+        return GateDecision("sensitive_read", f"{CAPABILITY}:{off[0]}",
+                            f"this chat has {w} off, so tools Mac can't classify are off too. You can turn "
+                            f'it on in {where}, or say "Mac, allow {w}"', target=off[0])
+    classes = _classes(tool_name, d, commands)
     missing = [c for c in CAPABILITIES if c in classes and c not in granted]
     if not missing:
         return None
     cap = missing[0]  # `code` stays internal; the reason is plain words the model relays (UX5)
-    where = f"Mac \u25b8 WhatsApp \u25b8 {ctx.display_name}" if ctx.display_name else "Mac \u25b8 WhatsApp"
     return GateDecision("sensitive_read", f"{CAPABILITY}:{cap}",
                         f"this chat can't use {CAPABILITY_WORDS[cap]}. You can turn it on in {where}, "
                         f'or say "Mac, allow {CAPABILITY_WORDS[cap]}"', target=cap)

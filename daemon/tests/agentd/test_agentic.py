@@ -248,7 +248,7 @@ def _spec(profile, **kw):
 
 ALL_ARGS = [*brains.CLAUDE_ARGS, *brains.CHAT_SAFETY_ARGS, "on_alive", "on_rename", "on_reset_voice",
             "on_go_to_sleep", "chat_persona", "display_name", "chat_shared", "on_set_persona", "channel",
-            "switch_workspace", "send_file", "whatsapp_ui_block"]
+            "switch_workspace", "send_file", "whatsapp_ui_block", "snapshot"]
 
 
 def test_factory_passes_profile_policy_to_claude_brain(monkeypatch):
@@ -281,6 +281,7 @@ def test_factory_passes_profile_policy_to_claude_brain(monkeypatch):
     assert chat["display_name"] == "Book club" and chat["chat_shared"] is True and chat["_chrome"] is False
     assert chat["on_alive"] is alive and "on_rename" not in chat
     assert chat["channel"] == "chat" and chat["switch_workspace"] is True
+    assert chat["snapshot"] is False and "snapshot" not in voice  # W10.7: persona edits reach a resumed session
     for k in ("never_chat_names", "capabilities", "confirm_send_file", "channel", "chat_persona"):
         assert k not in voice
     assert voice["on_rename"] is rename and voice["on_alive"] is alive and voice["on_go_to_sleep"] is alive

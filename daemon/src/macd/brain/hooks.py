@@ -35,7 +35,6 @@ from typing import Any, Protocol
 from macd.brain.gate import (
     CAPABILITY,
     MEMORY_WRITE,
-    UNKNOWN_TOOL,
     ConfirmationGate,
     GateContext,
     GateDecision,
@@ -353,8 +352,6 @@ class PreToolHook:
         elif d.code.startswith(f"{CAPABILITY}:"):  # W9.5: plain words the model relays once
             reason = (f"Not allowed: {d.reason}. Tell the user that in one short line, once, and carry on "
                       "without it. Don't try another way.")
-        elif d.code == UNKNOWN_TOOL:
-            reason = f"Not allowed: {d.reason}. Don't try it again; carry on without it."
         elif d.verdict == "sensitive_read":
             reason = (f"Blocked: {d.reason}. Reading or copying secrets, keys, keychains or browser "
                       "profiles is never allowed. Don't try another way; tell the user.")

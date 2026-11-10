@@ -1,5 +1,5 @@
 """The WhatsApp channel (docs/whatsapp/ARCHITECTURE.md W5.1, W5.2, W5.6): runs `wa-bridge` as a
-child process and speaks its stdio protocol (docs/whatsapp/bridge-protocol.md, version 1).
+child process and speaks its stdio protocol (docs/whatsapp/bridge-protocol.md, version 2).
 
 - **Process.** The bridge gets its flags from config and the channel context: the allowlist
   (never-listed chats removed), the immutable never-list, trusted devices, the per-minute cap, an
@@ -14,6 +14,9 @@ child process and speaks its stdio protocol (docs/whatsapp/bridge-protocol.md, v
   maps the event to an `InboundMessage`. Voice, audio, video and stickers arrive flagged
   `unsupported` and are never downloaded.
 - **Outbound** (R1, R2): destination check, then the governor, then the bridge.
+- **Context** (W10): in chats of the context set, other members' messages (and on-demand history)
+  arrive as `context` events and go only to `on_context`, never to the trigger sink. Quotes carry
+  sender, links and a quoted file (realpath-checked); a quote from another chat carries nothing.
 - **Allowlist** (W9.8): chatd starts the bridge with the context's chats (empty in production, so
   it fails closed) and fills it with `set_allowed` from agentd's profiles. The last allowed set is
   re-sent after every bridge start and every `connected`, then `on_connected` runs (chatd's member
@@ -43,6 +46,8 @@ from chatd.channels.base import (
     ChannelStatus,
     ChatChanged,
     ChatChangedCallback,
+    ContextCallback,
+    ContextMessage,
     DestinationRefused,
     InboundMessage,
     Limits,
@@ -50,6 +55,7 @@ from chatd.channels.base import (
     MessageRef,
     MessageSink,
     Quoted,
+    QuotedMedia,
     StatusCallback,
 )
 from chatd.channels.registry import ChannelContext
@@ -58,7 +64,7 @@ from chatd.governor import BudgetExceeded
 
 log = logging.getLogger(__name__)
 
-PROTOCOL = "1"
+PROTOCOL = "2"
 HOME = Path("~/.mac-agent").expanduser()
 DEFAULT_BRIDGE = HOME / "bin" / "wa-bridge"
 DEFAULT_STORE = HOME / "chat" / "whatsapp" / "device.db"
@@ -130,7 +136,9 @@ class WhatsAppChannel:
         self.command = [str(x) for x in cfg.get("command") or [Path(cfg.get("bridge", DEFAULT_BRIDGE)).expanduser()]]
         self.store = Path(cfg.get("store", DEFAULT_STORE)).expanduser()
         self.media_dir = Path(cfg.get("media_dir", DEFAULT_MEDIA)).expanduser()
-        self.trusted_devices = tuple(int(d) for d in cfg.get("trusted_devices", (0,)))
+        trusted = cfg.get("trusted_devices", "all")  # W10.8: every device of the owner's account
+        self.trusted_all = trusted == "all"
+        self.trusted_devices = () if self.trusted_all else tuple(int(d) for d in trusted)
         self.max_per_min = int(cfg.get("max_per_min", 20))
         self.test = bool(ctx.test or cfg.get("test", False))
         budget = cfg.get("budget")
@@ -172,6 +180,8 @@ class WhatsAppChannel:
         self._from_me = _Recent()  # message id -> sent from the owner's number (for reply_to/react)
         self._bridge_log: logging.Handler | None = None
         self._allowed: frozenset[str] | None = None  # the last set_allowed set (re-sent after restarts)
+        self._context: frozenset[str] = frozenset()  # allowed chats whose other messages are context
+        self._on_context: ContextCallback | None = None
         self._resync: asyncio.Task[None] | None = None
         # chatd's hook, run after every bridge start or `connected` once the allowlist is re-sent
         # (W9.8 member compare: chatd calls list_chats and pauses chats that became shared).
@@ -179,8 +189,9 @@ class WhatsAppChannel:
 
     # -- lifecycle ------------------------------------------------------------------------------------
     async def start(self, sink: MessageSink, on_status: StatusCallback,
-                    on_chat_changed: ChatChangedCallback) -> None:
+                    on_chat_changed: ChatChangedCallback, *, on_context: ContextCallback | None = None) -> None:
         self._sink, self._on_status, self._on_chat_changed = sink, on_status, on_chat_changed
+        self._on_context = on_context
         if self.log_path is not None and self._bridge_log is None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self._bridge_log = logging.handlers.RotatingFileHandler(self.log_path, maxBytes=5 * 1024 * 1024,
@@ -254,7 +265,8 @@ class WhatsAppChannel:
         allow = sorted(self.ctx.chats - self.ctx.never_chats)
         args = [*self.command, "--store", str(self.store), "--media-dir", str(self.media_dir),
                 f"--allow={','.join(allow)}", f"--deny={','.join(sorted(self.ctx.never_chats))}",
-                f"--trusted-devices={','.join(str(d) for d in self.trusted_devices)}",
+                f"--context={','.join(sorted(self._context & set(allow)))}",
+                "--trusted-devices=" + ("all" if self.trusted_all else ",".join(str(d) for d in self.trusted_devices)),
                 f"--max-per-min={self.max_per_min}"]
         if self.budget is not None:
             args.append(f"--budget={self.budget}")
@@ -464,6 +476,8 @@ class WhatsAppChannel:
         name = ev.get("ev")
         if name == "message":
             await self._message(ev)
+        elif name == "context":
+            await self._context_event(ev)
         elif name == "connected":
             if isinstance(ev.get("device"), int):
                 self._own_device = ev["device"]
@@ -511,7 +525,7 @@ class WhatsAppChannel:
             return "chat"
         if from_me is not True:
             return "not owner"
-        if not isinstance(device, int) or device not in self.trusted_devices:
+        if not isinstance(device, int) or not (self.trusted_all or device in self.trusted_devices):
             return "device"
         if device == self._own_device or mid in self._sent or text.strip().startswith(PREFIX.strip()):
             return "echo"
@@ -533,9 +547,7 @@ class WhatsAppChannel:
         attachments = () if unsupported else self._attachments(mid, ev.get("attachments"))
         reply_to = reaction = None
         if isinstance(q := ev.get("quoted"), dict) and q.get("msg"):
-            qid, owner = str(q["msg"]), bool(q.get("from_owner"))
-            self._from_me.put(qid, owner)
-            reply_to = Quoted(MessageRef(chat, qid), str(q.get("text", "")), from_owner=owner)
+            reply_to = self._quoted(chat, mid, q)
         if isinstance(r := ev.get("reaction"), dict) and r.get("target_msg"):
             target = str(r["target_msg"])
             reaction, text = str(r.get("emoji", "")), ""
@@ -547,6 +559,61 @@ class WhatsAppChannel:
         log.debug("whatsapp: inbound %s delivered (len %d, %d files, %s%s)", mid, len(text), len(attachments),
                   unsupported or "text", ", replayed" if msg.replayed else "")
         await self._sink(msg)
+
+    def _quoted(self, chat: str, mid: str, q: dict[str, Any]) -> Quoted:
+        """The extended quote (W10.5). A quote from another chat carries nothing but its id; a
+        quoted file is kept only if it resolves inside the media folder."""
+        ref = MessageRef(chat, str(q["msg"]))
+        if q.get("kind") == "other_chat":
+            return Quoted(ref, "", from_owner=False, kind="other_chat")
+        owner = bool(q.get("from_owner"))
+        self._from_me.put(ref.message_id, owner)
+        links = tuple(u for u in (q.get("links") or []) if isinstance(u, str)
+                      and u.lower().startswith(("http://", "https://")))[:10]
+        media = None
+        if isinstance(m := q.get("media"), dict) and m.get("kind"):
+            path = self._in_media(mid, m.get("path")) if m.get("kind") in ("image", "document") else None
+            media = QuotedMedia(kind=str(m["kind"]), name=str(m.get("name", "")), mime=str(m.get("mime", "")),
+                                size=int(m.get("size") or 0), path=path)
+        return Quoted(ref, str(q.get("text", "")), from_owner=owner, sender=str(q.get("sender", "")),
+                      sender_name=str(q.get("sender_name", "")), from_mac=bool(q.get("from_mac")),
+                      at=float(q.get("at") or 0.0), links=links, media=media)
+
+    def _in_media(self, mid: str, raw: Any) -> Path | None:
+        """realpath of a bridge-written file, or None when it is missing or outside the media dir."""
+        if not raw:
+            return None
+        path = Path(str(raw)).resolve()
+        if not path.is_relative_to(self.media_dir.resolve()) or not path.is_file():
+            log.warning("whatsapp: inbound %s file outside the media folder ignored", mid)
+            return None
+        return path
+
+    async def _context_event(self, ev: dict[str, Any]) -> None:
+        """Another member's message, or on-demand history, in a context chat (W10.1). Data only:
+        it goes to on_context, never to the sink that leads to commands, replies, steers and asks."""
+        chat, mid = str(ev.get("chat", "")), str(ev.get("msg", ""))
+        text = ev.get("text") if isinstance(ev.get("text"), str) else ""
+        if not chat or not mid or not self.ctx.allowed(chat) or chat not in self._context:
+            why = "chat"
+        elif mid in self._sent or text.strip().startswith(PREFIX.strip()):
+            why = "echo"
+        else:
+            why = "" if self._on_context is not None else "no listener"
+        if why:
+            log.debug("whatsapp: context %s dropped (%s)", mid, why)
+            return
+        media = ev.get("media") if isinstance(ev.get("media"), dict) else None
+        if media is not None:
+            media = {k: str(media[k]) for k in ("kind", "name") if media.get(k)}  # never a path
+        msg = ContextMessage(channel=self.name, chat_id=chat, ref=MessageRef(chat, mid),
+                             sender=str(ev.get("sender", "")), sender_name=str(ev.get("sender_name", "")),
+                             from_owner=ev.get("from_owner") is True, at=float(ev.get("at") or 0.0),
+                             text=text[:4000], media=media, quoted_msg=str(ev.get("quoted_msg", "")),
+                             replayed=bool(ev.get("replayed")), history=bool(ev.get("history")))
+        log.debug("whatsapp: context %s (len %d%s)", mid, len(text), ", history" if msg.history else "")
+        if (cb := self._on_context) is not None:
+            await cb(msg)
 
     def _attachments(self, mid: str, raw: Any) -> tuple[Attachment, ...]:
         """Images and documents the bridge wrote into the media dir; anything else is ignored."""
@@ -576,10 +643,13 @@ class WhatsAppChannel:
     async def mark_handled(self, ref: MessageRef) -> None:
         await self.ctx.seen.add(f"{ref.chat_id}:{ref.message_id}")
 
-    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None) -> MessageRef:
+    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None,
+                        mentions: tuple[str, ...] = ()) -> MessageRef:
         self._check(chat_id)
         await self.ctx.governor.charge("send", chat_id)
         args: dict[str, Any] = {"chat": chat_id, "text": text}
+        if mentions:
+            args["mentions"] = list(mentions)  # the bridge keeps only members named in the text
         if reply_to is not None:
             args["reply_to"] = {"msg": reply_to.message_id,
                                 "from_me": bool(self._from_me.get(reply_to.message_id, True))}
@@ -587,14 +657,15 @@ class WhatsAppChannel:
         self._sent_now(mid)
         return MessageRef(chat_id, mid)
 
-    async def edit_text(self, ref: MessageRef, text: str) -> bool:
+    async def edit_text(self, ref: MessageRef, text: str, mentions: tuple[str, ...] = ()) -> bool:
         self._check(ref.chat_id)
         sent = self._sent.get(ref.message_id)
         if sent is not None and self.ctx.clock() - sent > self.limits.edit_window_s:
             return False  # past the window: the runner sends a new message
         await self.ctx.governor.charge("edit", ref.chat_id)
         try:
-            await self._call("edit", chat=ref.chat_id, msg=ref.message_id, text=text)
+            args: dict[str, Any] = {"mentions": list(mentions)} if mentions else {}
+            await self._call("edit", chat=ref.chat_id, msg=ref.message_id, text=text, **args)
         except BridgeError as e:
             if e.code in ("edit_window", "not_found"):
                 return False
@@ -648,17 +719,18 @@ class WhatsAppChannel:
         chats = (await self._call("list_chats")).get("chats", [])
         return [c for c in chats if isinstance(c, dict)] if isinstance(chats, list) else []
 
-    async def set_allowed(self, chat_ids: Iterable[str]) -> None:
-        """The contract's allowlist update (W9.8 step 4): the enabled chats from agentd. Never-listed
-        ids are filtered out. Under test mode nothing changes and nothing is sent (step 8). A bridge
-        that is down gets the set at its next start."""
+    async def set_allowed(self, chat_ids: Iterable[str], context_ids: Iterable[str] = frozenset()) -> None:
+        """The contract's allowlist update (W9.8 step 4, W10.6): the enabled chats from agentd, and
+        those of them with read_chat on. Never-listed ids are filtered out. Under test mode nothing
+        changes and nothing is sent (step 8). A bridge that is down gets the sets at its next start."""
         if self.test:
             log.warning("whatsapp: allowlist change ignored in test mode")
             return
         allow = frozenset(chat_ids) - self.ctx.never_chats
         self._allowed = allow
+        self._context = frozenset(context_ids) & allow  # narrowed at once; also the --context at restart
         try:
-            await self.set_allow(allow)
+            await self.set_allow(allow, self._context)
         except BridgeError as e:
             if e.code not in ("offline", "timeout"):
                 raise
@@ -670,7 +742,7 @@ class WhatsAppChannel:
         if self._allowed is None or self.test:
             return
         try:
-            await self._call("set_allow", allow=sorted(self._allowed))
+            await self._call("set_allow", allow=sorted(self._allowed), context=sorted(self._context))
         except (BridgeError, DestinationRefused) as e:
             log.warning("whatsapp: re-sending the allowlist failed (%s)", type(e).__name__)
 
@@ -682,17 +754,44 @@ class WhatsAppChannel:
             except Exception as e:  # noqa: BLE001 (chatd's hook must not stop the channel)
                 log.error("whatsapp: on_connected failed (%s)", type(e).__name__)
 
-    async def set_allow(self, chats: Iterable[str]) -> None:
-        """Replace the allowlist (the chat picker). Never-listed chats are refused, and so is any
-        change under test mode; the bridge enforces both again."""
+    async def set_allow(self, chats: Iterable[str], context: Iterable[str] | None = None) -> None:
+        """Replace the allowlist (and, if given, the context set ⊆ it). Never-listed chats are
+        refused, and so is any change under test mode; the bridge enforces both again."""
         allow = frozenset(chats)
         if allow & self.ctx.never_chats:
             raise DestinationRefused("Mac never uses that chat.")
         if self.test:
             raise BridgeError("test_mode", "The allowlist can't change during a test run.")
+        ctx_set = self._context & allow if context is None else frozenset(context) & allow
         self.ctx.chats = self.ctx.chats & allow  # narrow first: an error never leaves a wider set
-        await self._call("set_allow", allow=sorted(allow))
-        self.ctx.chats = allow  # widen only once the bridge has it
+        self._context = self._context & ctx_set
+        await self._call("set_allow", allow=sorted(allow), context=sorted(ctx_set))
+        self.ctx.chats, self._context = allow, ctx_set  # widen only once the bridge has it
+
+    @property
+    def context_ids(self) -> frozenset[str]:
+        """The chats whose other members' messages arrive as context."""
+        return self._context
+
+    async def members(self, chat_id: str) -> list[dict[str, Any]]:
+        """The chat's participants `{jid, number, name}` (for mentions, W10.4)."""
+        self.ctx.check_destination(chat_id)
+        raw = (await self._call("members", chat=chat_id)).get("members", [])
+        return [m for m in raw if isinstance(m, dict)] if isinstance(raw, list) else []
+
+    async def request_history(self, chat_id: str, before: MessageRef, count: int = 30) -> bool:
+        """Ask the phone for up to `count` messages before `before` (W10.3). Results arrive later as
+        context with `history`. False when refused (not a context chat, dry run, hourly limit,
+        budget, offline); never raises for those."""
+        self.ctx.check_destination(chat_id)
+        if self.ctx.dry_run or chat_id not in self._context or self._exhausted:
+            return False
+        try:
+            await self._call("history", chat=chat_id, before_msg=before.message_id, count=max(1, min(count, 50)))
+        except (BridgeError, BudgetExceeded) as e:
+            log.info("whatsapp: history not requested (%s)", getattr(e, "code", type(e).__name__))
+            return False
+        return True
 
     async def bridge_status(self) -> dict[str, Any]:
         """The bridge's counters: linked, connected, sent_last_min, budget_left, total_outbound."""

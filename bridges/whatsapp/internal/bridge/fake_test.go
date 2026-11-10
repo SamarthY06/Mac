@@ -27,13 +27,19 @@ type fakeClient struct {
 	media     map[string][]byte // handle -> bytes
 	pairItems []QRItem
 	chats     []ChatInfo
+	members   map[string][]Member // chat -> participants
+	history   []*Inbound          // what FetchHistory returns
+	histReqs  []MsgMeta
+	sendMent  [][]string // mentions of every SendText/Edit
+	written   int64      // bytes the last DownloadToFile managed to write
 }
 
 func newFake() *fakeClient {
 	return &fakeClient{
 		linked: true, connected: true,
-		ident: Identity{JID: "111@s.whatsapp.net", LID: "999@lid", Device: 7},
-		media: map[string][]byte{},
+		ident:   Identity{JID: "111@s.whatsapp.net", LID: "999@lid", Device: 7},
+		media:   map[string][]byte{},
+		members: map[string][]Member{},
 	}
 }
 
@@ -110,16 +116,61 @@ func (f *fakeClient) newID() string {
 	f.nextID++
 	return fmt.Sprintf("3EB0%04d", f.nextID)
 }
-func (f *fakeClient) SendText(ctx context.Context, chat, text string, reply *ReplyRef) (string, error) {
+func (f *fakeClient) SendText(ctx context.Context, chat, text string, reply *ReplyRef, mentions []string) (string, error) {
 	op := "send_text"
 	if reply != nil {
 		op += "/reply:" + reply.MsgID + ":" + reply.Sender
 	}
 	f.record(op)
+	f.mu.Lock()
+	f.sendMent = append(f.sendMent, mentions)
+	f.mu.Unlock()
 	return f.newID(), nil
 }
-func (f *fakeClient) Edit(ctx context.Context, chat, msgID, text string) error {
+func (f *fakeClient) Edit(ctx context.Context, chat, msgID, text string, mentions []string) error {
 	f.record("edit")
+	f.mu.Lock()
+	f.sendMent = append(f.sendMent, mentions)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeClient) Members(ctx context.Context, chat string) ([]Member, error) {
+	f.record("members")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.members[chat], nil
+}
+func (f *fakeClient) RequestHistory(ctx context.Context, before MsgMeta, count int) error {
+	f.record(fmt.Sprintf("history:%d", count))
+	f.mu.Lock()
+	f.histReqs = append(f.histReqs, before)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeClient) FetchHistory(ctx context.Context, notice any) ([]*Inbound, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.history, nil
+}
+
+// DownloadToFile writes the handle's bytes in 1 MiB chunks, like a stream,
+// so a body larger than declared is cut off by the CappedFile.
+func (f *fakeClient) DownloadToFile(ctx context.Context, m *MediaIn, w *CappedFile) error {
+	f.mu.Lock()
+	f.downloads++
+	key, _ := m.Handle.(string)
+	data := f.media[key]
+	f.mu.Unlock()
+	var n int64
+	defer func() { f.mu.Lock(); f.written = n; f.mu.Unlock() }()
+	for len(data) > 0 {
+		k := min(len(data), 1<<20)
+		if _, err := w.Write(data[:k]); err != nil {
+			return err
+		}
+		n += int64(k)
+		data = data[k:]
+	}
 	return nil
 }
 func (f *fakeClient) React(ctx context.Context, chat, sender, msgID, emoji string) error {
@@ -341,7 +392,7 @@ func (h *harness) call(id int, op string, args map[string]any) map[string]any {
 func (h *harness) hello() map[string]any {
 	h.t.Helper()
 	h.event("ready")
-	r := h.call(0, "hello", map[string]any{"protocol": "1"})
+	r := h.call(0, "hello", map[string]any{"protocol": "2"})
 	if r["ok"] != true {
 		h.t.Fatalf("hello failed: %v", r)
 	}

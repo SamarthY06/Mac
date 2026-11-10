@@ -30,6 +30,10 @@ class FakeHarness(Harness):
         await a.inject(text, chat_id=chat_id, msg_id=echo_of or msg_id, from_owner=owner, replayed=replayed,
                        unsupported=unsupported)  # type: ignore[arg-type]
 
+    async def inject_context(self, rig: Rig, *, chat_id: str, text: str, msg_id: str, quote_of: str = "") -> None:
+        assert isinstance(rig.adapter, FakeChannel)
+        await rig.adapter.inject_context(text, chat_id=chat_id, msg_id=msg_id)
+
     def writes(self, rig: Rig) -> int:
         assert isinstance(rig.adapter, FakeChannel)
         return len(rig.adapter.wire)
@@ -48,7 +52,8 @@ class FakeHarness(Harness):
 class CliHarness(Harness):
     lacks: ClassVar[dict[str, str]] = {"non_owner": "a terminal has no other members",
              "replay": "a terminal has no offline history",
-             "unsupported": "a terminal only carries text"}
+             "unsupported": "a terminal only carries text",
+             "context": "a terminal has no other members"}
 
     def __init__(self, root: Path) -> None:
         super().__init__(root)

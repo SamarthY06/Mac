@@ -212,11 +212,11 @@ def test_chat_persona_is_written_not_spoken(tmp_path: Path) -> None:
     for spoken in ("spoken aloud", "Mac folder", "out loud", "Shall I go ahead", "web.whatsapp.com in Chrome"):
         assert spoken not in chat, spoken
     assert "WhatsApp style" in chat and "mcp__mac__send_file" in chat and "switch_workspace" in chat
-    assert 'Never read from or send to these chats, in any app: "Timetable".' in chat
+    assert "Off-limits chats" in chat and "Timetable" not in chat  # enforced by the gate, never volunteered
     assert "Reply in the language the user writes in." in chat
     assert "—" not in chat and "–" not in chat
     voice = prompts.persona_prompt(cfg, memory_path=tmp_path / "m.md")
-    assert "spoken aloud" in voice and "Never-list" not in voice and "WhatsApp style" not in voice
+    assert "spoken aloud" in voice and "Off-limits" not in voice and "WhatsApp style" not in voice
     assert "web.whatsapp.com" in voice  # voice keeps WhatsApp (V6, Option A)
 
 
@@ -236,7 +236,7 @@ async def test_brain_persona_uses_its_channel(make) -> None:
     await collect(brain)
     await brain.close()
     persona = MockClient.instances[0].options.system_prompt["append"]
-    assert "WhatsApp style" in persona and '"Timetable"' in persona and "spoken aloud" not in persona
+    assert "WhatsApp style" in persona and "Off-limits chats" in persona and "Timetable" not in persona and "spoken aloud" not in persona
 
 
 def test_voice_language_note_makes_no_claim_about_the_user(tmp_path: Path) -> None:

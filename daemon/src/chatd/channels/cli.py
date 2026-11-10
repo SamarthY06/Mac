@@ -21,6 +21,7 @@ from chatd.channels.base import (
     Cap,
     ChannelStatus,
     ChatChangedCallback,
+    ContextCallback,
     InboundMessage,
     Limits,
     LinkState,
@@ -52,8 +53,8 @@ class CliChannel:
         self._task: asyncio.Task[None] | None = None
 
     async def start(self, sink: MessageSink, on_status: StatusCallback,
-                    on_chat_changed: ChatChangedCallback) -> None:
-        self._on_status = on_status
+                    on_chat_changed: ChatChangedCallback, *, on_context: ContextCallback | None = None) -> None:
+        self._on_status = on_status  # a terminal has no other members: no context
         if self._input is None:
             loop = asyncio.get_running_loop()
             self._input = asyncio.StreamReader()
@@ -97,7 +98,8 @@ class CliChannel:
             self._out.write(line + "\n")
             self._out.flush()
 
-    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None) -> MessageRef:
+    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None,
+                        mentions: tuple[str, ...] = ()) -> MessageRef:
         self.ctx.check_destination(chat_id)
         await self.ctx.governor.charge("send", chat_id)
         mid = f"out-{next(self._ids)}"
@@ -105,7 +107,7 @@ class CliChannel:
         self._print(text)
         return MessageRef(chat_id, mid)
 
-    async def edit_text(self, ref: MessageRef, text: str) -> bool:
+    async def edit_text(self, ref: MessageRef, text: str, mentions: tuple[str, ...] = ()) -> bool:
         self.ctx.check_destination(ref.chat_id)
         sent = self._sent.get(ref.message_id)
         if sent is None or self.ctx.clock() - sent > self.limits.edit_window_s:
@@ -139,8 +141,14 @@ class CliChannel:
     async def list_chats(self) -> list[dict[str, Any]]:
         return [{"id": self.chat_id, "subject": "Terminal", "owner_only": True}]
 
-    async def set_allowed(self, chat_ids: frozenset[str]) -> None:
+    async def set_allowed(self, chat_ids: frozenset[str], context_ids: frozenset[str] = frozenset()) -> None:
         """The terminal is one fixed local chat; nothing to change."""
+
+    async def members(self, chat_id: str) -> list[dict[str, Any]]:
+        return []  # one person: nobody to tag
+
+    async def request_history(self, chat_id: str, before: MessageRef, count: int = 30) -> bool:
+        return False
 
 
 def create(cfg: dict[str, Any], ctx: ChannelContext) -> CliChannel:

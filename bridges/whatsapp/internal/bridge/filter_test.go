@@ -71,8 +71,53 @@ func TestFilterRules(t *testing.T) {
 			m := ownerMsg(now)
 			s := baseState(now)
 			c.mutate(m, &s)
-			if got := filter(m, s); got != c.want {
-				t.Fatalf("filter = %q, want %q", got, c.want)
+			if got, ctx := filter(m, s); got != c.want || ctx {
+				t.Fatalf("filter = %q (context %v), want %q", got, ctx, c.want)
+			}
+		})
+	}
+}
+
+// W10.1: the trigger/context split in a context chat.
+func TestFilterContextSplit(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	member := func() *Inbound {
+		return &Inbound{Chat: group, MsgID: "P1", SenderUser: "222@s.whatsapp.net", SenderDevice: 0,
+			Timestamp: now.Add(-time.Minute), Text: "can you look at this?"}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(*Inbound, *filterState)
+		want    string
+		context bool
+	}{
+		{"member in a context chat is context", func(*Inbound, *filterState) {}, dropNotOwner, true},
+		{"member in a non-context chat is dropped", func(_ *Inbound, s *filterState) { s.context = map[string]bool{} }, dropNotOwner, false},
+		{"member whose device equals ours is still context", func(m *Inbound, _ *filterState) { m.SenderDevice = 7 }, dropNotOwner, true},
+		{"member in a non-allowed chat is dropped", func(m *Inbound, s *filterState) { m.Chat = stranger; s.context[stranger] = true }, dropNotAllowed, false},
+		{"member in Timetable is dropped", func(m *Inbound, s *filterState) { m.Chat = never; s.context[never] = true }, dropDenied, false},
+		{"member text with our prefix is an echo", func(m *Inbound, _ *filterState) { m.Text = "Mac · hi" }, dropEchoPrefix, false},
+		{"member reaction is dropped", func(m *Inbound, _ *filterState) { m.Text = ""; m.Reaction = &Reaction{Emoji: "👍"} }, dropNotOwner, false},
+		{"member media is context", func(m *Inbound, _ *filterState) { m.Text = ""; m.Media = &MediaIn{Kind: "image"} }, dropNotOwner, true},
+		{"old member message dropped", func(m *Inbound, _ *filterState) { m.Timestamp = now.Add(-8 * 24 * time.Hour) }, dropTooOld, false},
+		{"owner on an untrusted device is context", func(m *Inbound, _ *filterState) {
+			m.SenderUser, m.IsFromMe, m.SenderDevice = ownerPN, true, 3
+		}, dropUntrusted, true},
+		{"owner on any device with trust all is a trigger", func(m *Inbound, s *filterState) {
+			m.SenderUser, m.IsFromMe, m.SenderDevice, s.trustAll = ownerPN, true, 3, true
+		}, "", false},
+		{"our own device stays an echo with trust all", func(m *Inbound, s *filterState) {
+			m.SenderUser, m.IsFromMe, m.SenderDevice, s.trustAll = ownerLID, true, 7, true
+		}, dropEchoDevice, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := member()
+			s := baseState(now)
+			s.context = map[string]bool{group: true}
+			c.mutate(m, &s)
+			if got, ctx := filter(m, s); got != c.want || ctx != c.context {
+				t.Fatalf("filter = %q (context %v), want %q (context %v)", got, ctx, c.want, c.context)
 			}
 		})
 	}

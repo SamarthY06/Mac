@@ -283,6 +283,7 @@ class ClaudeBrain:
                  chat_persona: str = "",
                  display_name: str = "",
                  chat_shared: bool = False,
+                 snapshot: bool | None = None,
                  channel: Literal["voice", "chat"] = "voice",
                  channel_note: str = "",
                  send_file: bool = False,
@@ -323,6 +324,9 @@ class ClaudeBrain:
         self._chat_persona = chat_persona  # W9.4: rendered (escaped) by prompts after the safety rules
         self._display_name = display_name
         self._chat_shared = chat_shared
+        # W10.7: False rebuilds the system prompt on every request, so a persona edit reaches a
+        # resumed session (chat brains). None keeps the SDK default (the recorded prompt).
+        self._snapshot = snapshot
         if channel == "chat" and (on_rename or on_reset_voice or on_go_to_sleep):
             log.warning("brain: voice-only tools are never given to a chat brain; ignoring their callbacks")
             on_rename = on_reset_voice = on_go_to_sleep = None
@@ -849,8 +853,11 @@ class ClaudeBrain:
                                          tools={t.name for t in self.tools.tools()},
                                          chat_persona=self._chat_persona, display_name=self._display_name,
                                          shared=self._chat_shared)
+        system_prompt: dict[str, Any] = {"type": "preset", "preset": "claude_code", "append": persona}
+        if self._snapshot is not None:
+            system_prompt["snapshot"] = self._snapshot
         opts = ClaudeAgentOptions(
-            system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
+            system_prompt=system_prompt,  # type: ignore[arg-type]
             permission_mode="bypassPermissions",
             hooks=self.hook_matchers(),
             mcp_servers={"mac": self.tools.server()},
@@ -1344,6 +1351,9 @@ class ClaudeBrain:
             self._on_user(a, msg)
 
     def _on_system(self, msg: SystemMessage) -> None:
+        if msg.subtype == "compact_boundary":
+            self._on_compacted(msg.data or {})
+            return
         if msg.subtype != "init":
             return
         data = msg.data or {}
@@ -1373,6 +1383,17 @@ class ClaudeBrain:
                 self.chrome_status_cb(connected)
             except Exception:
                 log.exception("chrome_status_cb failed")
+
+    def _on_compacted(self, data: dict[str, Any]) -> None:
+        """W10.7: Claude compacted the session. STATUS {compacted: {trigger, pre_tokens, post_tokens?}}
+        for agentd (logged and shown in the app, never a chat message)."""
+        meta = data.get("compact_metadata") or {}
+        info: dict[str, Any] = {"trigger": str(meta.get("trigger") or "auto"), "pre_tokens": meta.get("pre_tokens")}
+        if meta.get("post_tokens") is not None:
+            info["post_tokens"] = meta["post_tokens"]
+        log.info("brain: session compacted %s", info)
+        turn = self._current_turn()
+        self._emit(BrainEventKind.STATUS, max(turn, 0), data={"compacted": info})
 
     def _on_stream_event(self, a: _Turn, msg: StreamEvent) -> None:
         if msg.parent_tool_use_id:

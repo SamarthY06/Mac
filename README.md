@@ -167,6 +167,16 @@ uv run macd --audio sounddevice   # headless daemon (permissions attribute to yo
 
 Reviews that shaped the code (architecture, code quality, simplicity, UX) are in `docs/reviews/`.
 
+## Using Mac in WhatsApp groups
+
+In a group, Mac acts only on your own messages that start with "Mac" (for example
+"Mac, find me 20 jobs"). It reads the group's last 50 messages, other members' included,
+so it can follow the conversation and tag people. Those messages go to Claude with your
+request and are never treated as instructions. To stop that in a group, send
+"Mac, disallow reading group messages", or turn it off in Mac ▸ WhatsApp. Replying to a
+message with your request always shows Mac that message. Mac answers from any of your
+linked devices.
+
 ## Run the WhatsApp bot as a service
 
 The WhatsApp bot (chatd) and the agent behind it (agentd) can run in the background on their own.
@@ -174,10 +184,19 @@ They start when you log in, restart by themselves if they crash, and need no ope
 
 ```bash
 scripts/services.sh install     # start now and at every login
-scripts/services.sh status      # what is running, and whether WhatsApp is connected
+scripts/services.sh status      # what is running, from which commit, and whether WhatsApp is connected
+scripts/services.sh update      # switch to the commit you have checked out and restart
+scripts/services.sh rollback    # go back to the commit that ran before
 scripts/services.sh restart     # restart both (also brings back a bot that stopped)
 scripts/services.sh uninstall   # stop and remove
 ```
+
+The service runs a frozen copy of the last commit, kept in `~/.mac-agent/release/`, never the
+files you are editing. Changes reach it only when you commit and run `update`. `install` and
+`update` refuse to run while the repo has uncommitted changes unless you add `--allow-dirty`
+(the last commit is still what runs). The last 3 copies are kept for `rollback`. Building needs
+Go, because the WhatsApp helper is built from that copy. After a dependency change, run
+`install.sh` before `update`.
 
 If the bot stops for a reason a restart can't fix (its settings are wrong, its message budget is
 spent, or WhatsApp is in use by another run), it stays stopped and `status` says why. The agent

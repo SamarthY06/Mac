@@ -59,10 +59,51 @@ class Attachment:
 
 
 @dataclass(frozen=True)
+class QuotedMedia:
+    """An image or document in a quoted message (W10.5). `path` is set only after the bytes were
+    read (25 MB cap) and resolved with realpath inside the media dir."""
+
+    kind: str
+    name: str = ""
+    mime: str = ""
+    size: int = 0
+    path: Path | None = None
+
+
+@dataclass(frozen=True)
 class Quoted:
+    """The message a trigger replies to (W10.5). `kind == "other_chat"`: a quote from another
+    chat, with no text, links or media."""
+
     ref: MessageRef
     text: str
     from_owner: bool
+    sender: str = ""  # jid
+    sender_name: str = ""
+    from_mac: bool = False
+    at: float = 0.0
+    links: tuple[str, ...] = ()
+    media: QuotedMedia | None = None
+    kind: str = ""
+
+
+@dataclass(frozen=True)
+class ContextMessage:
+    """A message in a chat of the context set that is not a trigger (W10.1): another member's, or
+    on-demand history (`history`). Data only: it never starts, steers or answers anything."""
+
+    channel: str
+    chat_id: str
+    ref: MessageRef
+    sender: str = ""  # jid
+    sender_name: str = ""
+    from_owner: bool = False
+    at: float = 0.0
+    text: str = ""
+    media: dict[str, Any] | None = None  # {kind, name?}; never downloaded
+    quoted_msg: str = ""
+    replayed: bool = False
+    history: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +155,7 @@ class ChatChanged:
 MessageSink = Callable[[InboundMessage], Awaitable[None]]
 StatusCallback = Callable[[ChannelStatus], None]
 ChatChangedCallback = Callable[[ChatChanged], Awaitable[None]]
+ContextCallback = Callable[[ContextMessage], Awaitable[None]]
 
 
 @runtime_checkable
@@ -123,21 +165,28 @@ class ChannelAdapter(Protocol):
     limits: Limits
 
     async def start(self, sink: MessageSink, on_status: StatusCallback,
-                    on_chat_changed: ChatChangedCallback) -> None: ...
+                    on_chat_changed: ChatChangedCallback, *, on_context: ContextCallback | None = None) -> None: ...
     async def close(self) -> None: ...
     def status(self) -> ChannelStatus: ...
     async def mark_handled(self, ref: MessageRef) -> None: ...
-    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None) -> MessageRef: ...
-    async def edit_text(self, ref: MessageRef, text: str) -> bool: ...
+    async def send_text(self, chat_id: str, text: str, reply_to: MessageRef | None = None,
+                        mentions: tuple[str, ...] = ()) -> MessageRef: ...
+    async def edit_text(self, ref: MessageRef, text: str, mentions: tuple[str, ...] = ()) -> bool: ...
     async def react(self, ref: MessageRef, emoji: str) -> None: ...
     async def set_typing(self, chat_id: str, on: bool) -> None: ...
     async def send_file(self, chat_id: str, path: Path, caption: str = "") -> MessageRef: ...
     async def link(self) -> None: ...
     async def unlink(self) -> None: ...
     async def list_chats(self) -> list[dict[str, Any]]: ...
-    async def set_allowed(self, chat_ids: frozenset[str]) -> None:
-        """The allowlist from agentd's enabled profiles (W9.8). The adapter keeps the last set and
-        re-applies it after every restart of its transport. Under test mode: logged, not applied."""
+    async def set_allowed(self, chat_ids: frozenset[str], context_ids: frozenset[str] = frozenset()) -> None:
+        """The allowlist from agentd's enabled profiles (W9.8) and the context set, the subset with
+        `read_chat` (W10.6). The adapter keeps the last pair and re-applies it after every restart
+        of its transport. Under test mode: logged, not applied."""
+    async def members(self, chat_id: str) -> list[dict[str, Any]]:
+        """`[{jid, number, name}]` of an allowed chat (W10.4); raises DestinationRefused otherwise."""
+    async def request_history(self, chat_id: str, before: MessageRef, count: int = 30) -> bool:
+        """Ask for on-demand history (W10.3); results arrive as `history` context messages. False
+        when the adapter can't (rate, dry run, not in the context set, unsupported)."""
 
 
 class DestinationRefused(Exception):

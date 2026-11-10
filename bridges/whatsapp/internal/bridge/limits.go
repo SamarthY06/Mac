@@ -117,30 +117,40 @@ func (r *sentRing) save() {
 }
 
 // senderCache maps recent message ids in allowlisted chats to their author,
-// so react/reply_to with from_me=false can address the right participant.
-// Only ids and JIDs are kept, never content.
+// time and from-me flag, so react/reply_to with from_me=false can address the
+// right participant and `history` can name the message to start before.
+// Only ids, JIDs and times are kept, never content.
 type senderCache struct {
 	order []string
-	m     map[string]string
+	m     map[string]MsgMeta
+	who   map[string]string
 }
 
 const senderCacheSize = 2000
 
-func newSenderCache() *senderCache { return &senderCache{m: map[string]string{}} }
+func newSenderCache() *senderCache {
+	return &senderCache{m: map[string]MsgMeta{}, who: map[string]string{}}
+}
 
-func (c *senderCache) put(chat, id, sender string) {
-	k := chat + "/" + id
+func (c *senderCache) put(meta MsgMeta, sender string) {
+	k := meta.Chat + "/" + meta.ID
 	if _, ok := c.m[k]; !ok {
 		c.order = append(c.order, k)
 	}
-	c.m[k] = sender
+	c.m[k], c.who[k] = meta, sender
 	for len(c.order) > senderCacheSize {
 		delete(c.m, c.order[0])
+		delete(c.who, c.order[0])
 		c.order = c.order[1:]
 	}
 }
 
 func (c *senderCache) get(chat, id string) (string, bool) {
-	s, ok := c.m[chat+"/"+id]
+	s, ok := c.who[chat+"/"+id]
 	return s, ok
+}
+
+func (c *senderCache) meta(chat, id string) (MsgMeta, bool) {
+	m, ok := c.m[chat+"/"+id]
+	return m, ok
 }

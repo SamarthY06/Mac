@@ -146,7 +146,8 @@ def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
             kw.update(env_exempt_dir=spec.cwd, never_chat_names=list(spec.never_chat_names),
                       capabilities=spec.capabilities, confirm_send_file=spec.confirm_send_file)
             optional = {"chat_persona": spec.chat_persona, "display_name": spec.display_name,
-                        "chat_shared": spec.chat_shared, "on_set_persona": spec.on_set_persona}
+                        "chat_shared": spec.chat_shared, "on_set_persona": spec.on_set_persona,
+                        "snapshot": False}  # W10.7: a persona edit must apply to a resumed session
             kw.update({k: v for k, v in optional.items() if v is not None and k in params})
         else:  # never the never-list: by voice any chat may be named, behind a spoken confirm (V6)
             kw.update(desktop_wait_s=cb.VOICE_DESKTOP_WAIT_S, confirm_timeout_s=spec.profile.confirm_window_s)
