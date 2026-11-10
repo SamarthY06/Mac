@@ -17,12 +17,20 @@ Event contract (shared with FakeBrain):
 - after interrupt(turn_id) nothing is emitted for that turn except the final
   DONE(interrupted=True); the stale tail is drained until its ResultMessage, and the next
   Ask is only sent after the drain (bounded; otherwise the client is reconnected).
+
+Profiles (WhatsApp ARCHITECTURE W3.1): every constructor argument after ``wall_clock`` defaults
+to today's voice behaviour; `CHAT_PROFILE` holds the chat-channel values. They cover the session
+store (M3), a shared memory file (F11), session policy (F9: no idle rotation, no handoff, a
+``session_fallback`` status when a resume fails), ``steer_only`` (F12), the WhatsApp gate rules
+(M1), the ``.env`` exemption (F10), ``mac.send_file`` (ATTACH events) and the desktop lease (F3),
+which is released at turn teardown, while confirming and at idle.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import re
@@ -31,10 +39,10 @@ import signal
 import subprocess
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -53,8 +61,22 @@ from claude_agent_sdk import (
 
 from macd import config
 from macd.brain import errors, mac_tools, memory, prompts
-from macd.brain.gate import ConfirmationGate, GateContext
-from macd.brain.hooks import CONFIRM_TOOL, MEMORY_TOOLS, HookDecision, PreToolHook
+from macd.brain.gate import MAC_SEND_FILE, ConfirmationGate, GateContext, analyze
+from macd.brain.hooks import (
+    CHAT_DESKTOP_WAIT_S,
+    CONFIRM_TOOL,
+    HOOK_TIMEOUT_S,
+    MEMORY_TOOLS,
+    REASON_DESKTOP_BUSY_CHAT,
+    REASON_DESKTOP_BUSY_VOICE,
+    VOICE_DESKTOP_WAIT_S,
+    DesktopGuard,
+    DesktopLock,
+    HookDecision,
+    PreToolHook,
+    default_desktop_locks,
+    is_desktop_tool,
+)
 from macd.brain.mac_tools import MacTools
 from macd.brain.narration import describe_tool
 from macd.contracts import BrainErrorKind, BrainEvent, BrainEventKind
@@ -65,6 +87,14 @@ SAY_TOOL = "mcp__mac__say"
 _SILENT_TOOLS = {SAY_TOOL, CONFIRM_TOOL}
 HANDOFF_TURN = -1  # turn id of the silent session-handoff query (never emitted)
 PROBE_TURN = -2  # turn id of the silent connect_check probe query (never emitted)
+TABS_TURN = -3  # turn id of the silent "close your own Chrome tabs" query (chat profile)
+TABS_TIMEOUT_S = 30.0
+TABS_PROMPT = (
+    "[Internal, not shown to the user.] The task is finished. Close every tab in your own Chrome "
+    "tab group with mcp__claude-in-chrome__tabs_close_mcp (list them with tabs_context_mcp; don't "
+    "create a group if you have none). Never close other tabs. Call no other tools; reply with no text.")
+_TABS_TOOLS = {"mcp__claude-in-chrome__tabs_context_mcp", "mcp__claude-in-chrome__tabs_close_mcp"}
+STEER_REPLY_TIMEOUT_S = 15.0
 PROBE_PROMPT = "Reply with exactly the word OK and nothing else. Do not use any tools."
 CONNECT_CHECK_TIMEOUT_S = 25.0
 CHROME_HINT = ("Chrome isn't running, the Claude in Chrome extension isn't installed, or Chrome is "
@@ -103,6 +133,54 @@ CONNECT_TIMEOUT_S = 60.0
 BREAKER_FAILURES = 3
 BREAKER_COOLDOWN_S = 30.0
 _SETTING_SOURCES = ("user", "project", "local")  # SDK SettingSource literal
+_FROM_CONFIG = "config"  # rotate_after_idle_min default: cfg.brain.session_idle_rotate_min
+_POST_TOOL_MATCHER = "mcp__claude-in-chrome__.*|mcp__mac__ui_.*|mcp__mac__screenshot|mcp__mac__open_app"
+SettingSourcesFn = Callable[[], "Sequence[str] | Awaitable[Sequence[str]]"]
+
+
+# ----------------------------------------------------------------------------- sessions (M3)
+
+
+@dataclass
+class SessionInfo:
+    session_id: str | None
+    updated_at: float = 0.0  # wall time of the last use (0: unknown)
+    started_at: float = 0.0  # wall time the session was created
+    fork: bool = False  # resume as a fork: a session Mac did not create is never written to
+
+
+class SessionStore(Protocol):
+    """Where a brain keeps its session id. Voice (local mode): state.json; chat: agentd's
+    conversation record. Both methods are async so a store may use its own asyncio lock."""
+
+    async def load(self) -> SessionInfo | None: ...
+    async def save(self, info: SessionInfo) -> None: ...
+
+
+class StateJsonSessionStore:
+    """Today's store: ``state.json["brain"]`` (voice in local mode, the default)."""
+
+    async def load(self) -> SessionInfo | None:
+        brain = (await asyncio.to_thread(config.read_state)).get("brain")
+        if not isinstance(brain, dict) or not brain.get("session_id"):
+            return None
+        ts = float(brain.get("updated_at", 0) or 0)
+        return SessionInfo(str(brain["session_id"]), ts, float(brain.get("started_at", ts) or ts))
+
+    async def save(self, info: SessionInfo) -> None:
+        await asyncio.to_thread(config.update_state, brain={
+            "session_id": info.session_id, "updated_at": info.updated_at, "started_at": info.started_at})
+
+
+# The chat column of the W3.1 profile table (agentd adds cwd, session_store, memory_file,
+# setting_sources, never_chat_names and a cfg carrying [chat_brain]).
+CHAT_PROFILE: dict[str, Any] = {
+    "steer_only": True, "rotate_after_idle_min": None, "handoff_enabled": False,
+    "on_resume_fallback": "status", "max_turn_s": 2700.0, "write_claude_md": False,
+    "whatsapp_ui_block": True, "send_file": True, "close_own_tabs": True,
+    "channel_note": prompts.CHAT_CHANNEL_NOTE, "desktop_wait_s": CHAT_DESKTOP_WAIT_S,
+    "desktop_busy_reason": REASON_DESKTOP_BUSY_CHAT, "confirm_timeout_s": 600.0,
+}
 
 
 @dataclass
@@ -131,6 +209,7 @@ class _Turn:
     queries: int = 1
     handoff: bool = False  # silent, memory-tools-only query (session handoff)
     probe: bool = False  # silent, tool-less connect_check query
+    tabs: bool = False  # silent "close your own Chrome tabs" query (chat profile)
     after: Callable[[], Any] | None = None  # deferred action once a handoff turn ends
     future: asyncio.Future[bool] | None = None
 
@@ -186,16 +265,56 @@ class ClaudeBrain:
                  chrome_running: Callable[[], bool] = _chrome_running,
                  frontmost: Callable[[], str] = _frontmost_app,
                  clock: Callable[[], float] = time.monotonic,
-                 wall_clock: Callable[[], float] = time.time) -> None:
+                 wall_clock: Callable[[], float] = time.time,
+                 # -- profile (WhatsApp ARCHITECTURE W3.1); defaults = the voice profile ----------
+                 session_store: SessionStore | None = None,
+                 memory_file: memory.MemoryFile | None = None,
+                 steer_only: bool = False,
+                 rotate_after_idle_min: float | str | None = _FROM_CONFIG,
+                 handoff_enabled: bool = True,
+                 on_resume_fallback: Literal["silent", "status"] = "silent",
+                 max_turn_s: float | None = None,
+                 write_claude_md: bool = True,
+                 setting_sources: Sequence[str] | SettingSourcesFn | None = None,
+                 env_exempt_dir: Path | None = None,
+                 whatsapp_ui_block: bool = False,
+                 never_chat_names: Sequence[str] = (),
+                 shared_chat: bool = False,
+                 channel_note: str = "",
+                 send_file: bool = False,
+                 test_tools: bool = False,
+                 close_own_tabs: bool = False,
+                 desktop_locks: Sequence[DesktopLock] | None = None,
+                 desktop_wait_s: float = VOICE_DESKTOP_WAIT_S,
+                 desktop_busy_reason: str = REASON_DESKTOP_BUSY_VOICE,
+                 confirm_timeout_s: float = 45.0) -> None:
         self.cfg = cfg
         self.gate = gate
         self.chrome_status_cb = chrome_status_cb
         self.cwd = Path(cwd) if cwd else config.WORKSPACE_DIR
+        if memory_file is not None:
+            memory_path = memory_file.path
         self.memory_path = memory_path or (self.cwd / "memory.md" if cwd else config.MEMORY_PATH)
         self.results_dir = Path(getattr(cfg, "results_dir", "~/Documents/Mac")).expanduser()
         self._client_factory = client_factory or ClaudeSDKClient
         self._recent_user_text = recent_user_text  # B2 hook: last ~10 user utterances, newest last
-        self._memory = memory.MemoryFile(self.memory_path)
+        self._memory = memory_file if memory_file is not None else memory.MemoryFile(self.memory_path)
+        self._store: SessionStore = session_store or StateJsonSessionStore()
+        self._steer_only = steer_only
+        self._rotate_arg = rotate_after_idle_min
+        self._handoff_enabled = handoff_enabled
+        self._announce_fallback = on_resume_fallback == "status"
+        self._max_turn_arg = max_turn_s
+        self._write_claude_md = write_claude_md
+        self._sources_arg = setting_sources
+        self._channel_note = channel_note
+        self._close_own_tabs = close_own_tabs
+        self._ingest_all_tabs = whatsapp_ui_block  # keep tab hosts fresh for the M1 block
+        self._fork_next = False  # the next connect resumes `_resume_next` as a fork
+        self._fork_live = False  # connected to a fork whose new session id is not known yet
+        self._fallback_from: str | None = None  # F9: the session a failed resume dropped
+        self._connected_sources: list[str] | None = None
+        self._tabs_dirty = False  # a chat turn used Chrome: close its own tab group after it
         self._chrome_running = chrome_running
         self._frontmost = frontmost
         self._clock = clock
@@ -237,18 +356,27 @@ class ClaudeBrain:
             "msg": self._on_msg, "reader_done": self._on_reader_done, "handoff": self._on_handoff,
             "connect_check": self._on_connect_check,
         }
+        locks = default_desktop_locks() if desktop_locks is None else list(desktop_locks)
+        self.desktop: DesktopGuard | None = DesktopGuard(
+            locks, wait_s=desktop_wait_s, busy_reason=desktop_busy_reason,
+            on_wait=self._on_desktop_wait) if locks else None
         self.hook = PreToolHook(
             gate, self._current_turn, self.is_cancelled, self._memory_check,
-            restrict=self._restrict, on_decision=self._on_hook_decision)
+            restrict=self._restrict, on_decision=self._on_hook_decision, desktop=self.desktop)
         self.tools = MacTools(gate=gate, current_turn=self._current_turn,
                               memory_check=self._memory_check, on_say=self._on_say,
                               on_confirm=self._on_confirm, pending_action=self.hook.pending_for,
                               on_notify=on_notify, workspace=self.cwd, memory_path=self.memory_path,
-                              results_dir=self.results_dir)
+                              results_dir=self.results_dir, confirm_timeout_s=confirm_timeout_s,
+                              memory=self._memory, on_attach=self._on_attach if send_file else None,
+                              test_tools=test_tools)
         self.hook.context = GateContext(
             workspace=str(self.cwd), element_label=self.tools.registry.label,
             chrome_ref_label=self.tools.chrome_refs.label, chrome_tab_host=self.tools.chrome_tabs.host,
-            current_app=self._current_app)
+            current_app=self._current_app, whatsapp_ui_block=whatsapp_ui_block,
+            never_chat_names=tuple(never_chat_names),
+            env_exempt_dir=str(env_exempt_dir) if env_exempt_dir is not None else None,
+            memory_path=str(self.memory_path), shared_chat=shared_chat)
 
     # ------------------------------------------------------------------ Brain protocol
     async def start(self) -> None:
@@ -257,9 +385,9 @@ class ClaudeBrain:
         self.cwd.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         claude_md = self.cwd / "CLAUDE.md"
-        if not claude_md.exists():
+        if self._write_claude_md and not claude_md.exists():
             claude_md.write_text(prompts.WORKSPACE_CLAUDE_MD)
-        self._resume_next = await asyncio.to_thread(self._load_session)
+        self._resume_next = await self._load_session()
         self._spawn_owner()
 
     async def close(self) -> None:
@@ -277,6 +405,7 @@ class ClaudeBrain:
                 await self._task
         if pid:
             await asyncio.to_thread(_kill_process_tree, pid)
+        self._release_desktop()
         self._task = None
         self._closing = False
 
@@ -299,8 +428,23 @@ class ClaudeBrain:
             return
         self._put(_Cmd("ask", turn_id, text))
 
-    async def steer(self, turn_id: int, text: str) -> None:
-        self._put(_Cmd("steer", turn_id, text))
+    async def steer(self, turn_id: int, text: str) -> bool | None:
+        """Voice: fire and forget; a steer for a finished turn starts a new query (today's
+        behaviour). ``steer_only`` (chat, F12): returns whether the text joined the RUNNING turn
+        (``turn_id`` 0 = whichever turn runs); False means nothing was sent and the caller makes it
+        a new ask under fresh leases."""
+        if not self._steer_only:
+            self._put(_Cmd("steer", turn_id, text))
+            return None
+        if self._task is None:
+            return False
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._put(_Cmd("steer", turn_id, text, payload=fut))
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), STEER_REPLY_TIMEOUT_S)
+        except TimeoutError:
+            fut.cancel()  # the owner sees a done future and drops the text
+            return False
 
     async def interrupt(self, turn_id: int) -> None:
         if turn_id:
@@ -325,7 +469,7 @@ class ClaudeBrain:
     async def handoff(self) -> bool:
         """Run the silent session-handoff query (memory tools only, ≤ 60 s) if the CLI is alive
         and idle. Returns True when it completed. B2 calls this before rotation/reset."""
-        if self._task is None:
+        if self._task is None or not self._handoff_enabled:
             return False
         fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._put(_Cmd("handoff", payload=fut))
@@ -471,6 +615,7 @@ class ClaudeBrain:
             elif a is not None and not a.timed_out:
                 self._emit(BrainEventKind.DONE, a.turn_id, data={"interrupted": True})
             self._active = None
+            self._release_desktop()
             await self._disconnect()
             if self._closing:
                 self._out.put_nowait(None)
@@ -486,6 +631,25 @@ class ClaudeBrain:
         else:
             return None
         return max(0.01, target - self._clock())
+
+    # ------------------------------------------------------------------ profile values
+    def _rotate_min(self) -> float | None:
+        """Idle minutes after which the session is rotated; None: never (chat, F9)."""
+        if self._rotate_arg == _FROM_CONFIG:
+            return float(self.cfg.brain.session_idle_rotate_min)
+        return None if self._rotate_arg is None else float(self._rotate_arg)
+
+    def _max_turn_s(self) -> float:
+        return float(self._max_turn_arg if self._max_turn_arg is not None else self.cfg.brain.max_turn_s)
+
+    # ------------------------------------------------------------------ desktop lease (F3)
+    def _release_desktop(self) -> None:
+        if self.desktop is not None and self.desktop.held:
+            self.desktop.release()
+
+    def _on_desktop_wait(self, turn: int) -> None:
+        if turn and not self.is_cancelled(turn):
+            self._emit(BrainEventKind.STATUS, turn, data={"waiting_for": "desktop"})
 
     # ------------------------------------------------------------------ helpers for hook/tools
     def _current_turn(self) -> int:
@@ -523,6 +687,8 @@ class ClaudeBrain:
             return "Connection check: no tools; just reply OK."
         if a is not None and a.handoff and tool not in MEMORY_TOOLS:
             return "Session handoff: only mcp__mac__remember / forget / rewrite_memory may be called."
+        if a is not None and a.tabs and tool not in _TABS_TOOLS:
+            return "Tab cleanup: only tabs_context_mcp and tabs_close_mcp may be called."
         return None
 
     def _on_say(self, text: str) -> None:
@@ -531,9 +697,22 @@ class ClaudeBrain:
             self._emit(BrainEventKind.SAY, turn, text=text)
 
     def _on_confirm(self, summary: str, target: str) -> None:
+        self._release_desktop()  # W3.4: never hold the screen while a human decides
         turn = self._current_turn()
         if turn and not self.is_cancelled(turn):
             self._emit(BrainEventKind.CONFIRM, turn, text=summary, data={"target": target})
+
+    def _on_attach(self, attach_id: str, path: str, caption: str) -> str | None:
+        """mac.send_file → ATTACH. The real path is re-checked (a symlink swapped in after the
+        hook's check must not leak a secret)."""
+        turn = self._current_turn()
+        if turn <= 0 or self.is_cancelled(turn):
+            return "The request was stopped; nothing was sent."
+        d = analyze(MAC_SEND_FILE, {"path": path}, self.hook.context)
+        if d.always_denied:
+            return f"Not sent: {d.reason}."
+        self._emit(BrainEventKind.ATTACH, turn, data={"attach_id": attach_id, "path": path, "caption": caption})
+        return None
 
     def _on_hook_decision(self, d: HookDecision) -> None:
         if not d.allowed and not self.is_cancelled(d.turn_id):
@@ -566,25 +745,29 @@ class ClaudeBrain:
         self._breaker_until = 0.0
 
     # ------------------------------------------------------------------ session state
-    def _load_session(self) -> str | None:
-        brain = config.read_state().get("brain")
-        if not isinstance(brain, dict):
+    async def _load_session(self) -> str | None:
+        try:
+            info = await self._store.load()
+        except Exception:
+            log.exception("brain: could not load the session store")
             return None
-        sid, ts = brain.get("session_id"), float(brain.get("updated_at", 0) or 0)
-        if sid and self._wall() - ts < self.cfg.brain.session_idle_rotate_min * 60:
-            self._session_id = str(sid)
-            self._last_activity = ts
-            self._session_started = float(brain.get("started_at", ts) or ts)
-            log.info("brain: resuming session %s", sid)
-            return str(sid)
-        return None
+        if info is None or not info.session_id:
+            return None
+        ts, rotate = info.updated_at, self._rotate_min()
+        if rotate is not None and self._wall() - ts >= rotate * 60:
+            return None
+        self._session_id = str(info.session_id)
+        self._last_activity = ts or self._wall()
+        self._session_started = info.started_at or ts or self._wall()
+        self._fork_next = info.fork
+        log.info("brain: resuming session %s%s", info.session_id, " as a fork" if info.fork else "")
+        return str(info.session_id)
 
     async def _save_session(self, session_id: str | None) -> None:
         try:
-            await asyncio.to_thread(config.update_state, brain={
-                "session_id": session_id, "updated_at": self._wall(),
-                "started_at": self._session_started})
-        except OSError:
+            await self._store.save(SessionInfo(session_id, self._wall(), self._session_started,
+                                               fork=bool(session_id) and self._fork_live))
+        except Exception:
             log.exception("brain: could not persist session state")
 
     # ------------------------------------------------------------------ options / connection
@@ -593,14 +776,16 @@ class ClaudeBrain:
         cfg = self.cfg.brain
         env = {"ANTHROPIC_API_KEY": api_key} if api_key else {}
         persona = prompts.persona_prompt(self.cfg, browser_available=self.chrome_connected is not False,
-                                         memory_path=self.memory_path, results_dir=self.results_dir)
+                                         memory_path=self.memory_path, results_dir=self.results_dir,
+                                         channel_note=self._channel_note)
         opts = ClaudeAgentOptions(
             system_prompt={"type": "preset", "preset": "claude_code", "append": persona},
             permission_mode="bypassPermissions",
-            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[self.hook])]},
+            hooks=self.hook_matchers(),
             mcp_servers={"mac": self.tools.server()},
             cwd=str(self.cwd),
-            setting_sources=self._setting_sources(),
+            setting_sources=list(self._connected_sources) if self._connected_sources is not None
+            else self._setting_sources(),
             include_partial_messages=True,
             extra_args={"chrome": None} if cfg.chrome else {},
             env=env,
@@ -608,12 +793,38 @@ class ClaudeBrain:
             resume=resume,
             model=cfg.model or None,
         )
+        if resume and self._fork_next:
+            opts.fork_session = True  # never write into a session Mac did not create
         if cfg.auth == "claude_cli":
             opts.cli_path = default_cli_path(self.cfg)
         return opts
 
+    def hook_matchers(self) -> dict[Any, list[HookMatcher]]:
+        """F1: the gate fails CLOSED. A hook that raises or outlives HOOK_TIMEOUT_S denies the
+        call (on_failure="block"; SPIKES P0.3), and every wait inside it is capped well below that.
+        PostToolUse stamps the last desktop use (idle release)."""
+        return {
+            "PreToolUse": [HookMatcher(matcher=None, hooks=[self.hook], timeout=HOOK_TIMEOUT_S,
+                                       on_failure="block")],
+            "PostToolUse": [HookMatcher(matcher=_POST_TOOL_MATCHER, hooks=[self.hook], timeout=10)],
+        }
+
+    async def _wanted_sources(self) -> list[str]:
+        """Setting sources for the next connect: the profile's (fixed or re-checked at every turn
+        start, M2) or cfg.brain.setting_sources."""
+        arg = self._sources_arg
+        if arg is None:
+            return self._setting_sources()
+        value: Any = arg() if callable(arg) else arg
+        if inspect.isawaitable(value):
+            value = await value
+        return self._valid_sources(list(value))
+
     def _setting_sources(self) -> list[Any]:
-        wanted = list(self.cfg.brain.setting_sources)
+        return self._valid_sources(list(self.cfg.brain.setting_sources))
+
+    @staticmethod
+    def _valid_sources(wanted: list[Any]) -> list[Any]:
         bad = [x for x in wanted if x not in _SETTING_SOURCES]
         if bad:
             log.warning("brain: ignoring unknown setting_sources %s (valid: %s)", bad, _SETTING_SOURCES)
@@ -636,6 +847,7 @@ class ClaudeBrain:
             return errors.ClassifiedError(BrainErrorKind.CLI_MISSING,
                                           errors.MESSAGES[BrainErrorKind.CLI_MISSING], "claude not found")
         err: errors.ClassifiedError | None = None
+        self._connected_sources = await self._wanted_sources()
         for attempt in ([resume, resume, None] if resume else [None]):  # N9: retry with resume first
             client = self._client_factory(await asyncio.to_thread(self.build_options, attempt, api_key))
             try:
@@ -650,8 +862,13 @@ class ClaudeBrain:
             self._gen += 1
             self._reader = asyncio.create_task(self._read(client, self._gen), name="claude-brain-reader")
             self._session_id = attempt
+            self._fork_live = bool(attempt) and self._fork_next
+            self._fork_next = False
             if attempt is None:
                 self._session_started = self._wall()
+                if resume:  # F9: the stored session could not be reopened; a fresh one started
+                    log.warning("brain: could not resume session %s; started a fresh one", resume)
+                    self._fallback_from = resume
             self._handed_off = False
             self._turns_this_session = 0
             self._idle_at = self._clock()
@@ -706,12 +923,20 @@ class ClaudeBrain:
         await self._start_turn(cmd)
 
     async def _ensure_connected(self) -> errors.ClassifiedError | None:
-        """Lazy connect (ask/warm). Rotates the session if idle for too long."""
+        """Lazy connect (ask/warm). Rotates the session if idle for too long (voice profile), and
+        reconnects (same session) when the profile's setting sources changed (M2 re-check)."""
         idle = self._wall() - self._last_activity
-        if idle > self.cfg.brain.session_idle_rotate_min * 60 and (self._client or self._resume_next):
+        rotate = self._rotate_min()
+        if rotate is not None and idle > rotate * 60 and (self._client or self._resume_next):
             log.info("brain: rotating session after %.0f idle minutes", idle / 60)
             await self._disconnect()
             self._resume_next = None
+            self._fork_next = False
+        if self._client is not None and self._sources_arg is not None and callable(self._sources_arg):
+            wanted = await self._wanted_sources()
+            if wanted != self._connected_sources:
+                log.info("brain: setting sources changed to %s; reconnecting, same session", wanted)
+                await self._park_session()
         if self._client is not None:
             return None
         err = await self._connect(self._resume_next)
@@ -783,8 +1008,10 @@ class ClaudeBrain:
     async def _park_session(self) -> None:
         """Disconnect but keep the session id for the next connect."""
         sid = self._session_id
+        fork = self._fork_live  # still on a fork whose own id never arrived: resume it as a fork
         await self._disconnect()
         self._resume_next = sid
+        self._fork_next = fork and bool(sid)
         await self._save_session(sid)
 
     async def _start_turn(self, cmd: _Cmd) -> None:
@@ -799,7 +1026,12 @@ class ClaudeBrain:
                        error_kind=err.kind, data=err.as_data())
             return
         now = self._clock()
-        self._active = _Turn(cmd.turn_id, now + self.cfg.brain.max_turn_s, texts=[cmd.text])
+        self._active = _Turn(cmd.turn_id, now + self._max_turn_s(), texts=[cmd.text])
+        if self._fallback_from is not None:
+            if self._announce_fallback:  # F9: the client says so instead of "Continuing ..."
+                self._emit(BrainEventKind.STATUS, cmd.turn_id,
+                           data={"session_fallback": {"session_id": self._fallback_from}})
+            self._fallback_from = None
         self._last_activity = self._wall()
         self._turns_this_session += 1
         prompt = cmd.text
@@ -817,6 +1049,9 @@ class ClaudeBrain:
         return self._clock() - self._init_at > CHROME_RECHECK_S and self._chrome_running()
 
     async def _on_steer(self, cmd: _Cmd) -> None:
+        if cmd.payload is not None:
+            await self._on_steer_only(cmd)
+            return
         a = self._active
         if a is None or a.turn_id != cmd.turn_id:
             if a is None and cmd.turn_id not in self._cancelled:
@@ -833,6 +1068,26 @@ class ClaudeBrain:
             await self._client.query(cmd.text)
         except Exception as e:  # noqa: BLE001
             await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
+
+    async def _on_steer_only(self, cmd: _Cmd) -> None:
+        """F12: join the RUNNING turn or report False; never start a query on its own."""
+        fut: asyncio.Future[bool] = cmd.payload
+        if fut.done():
+            return  # the caller gave up waiting: drop the text, it will come back as an ask
+        a = self._active
+        target = cmd.turn_id or (a.turn_id if a is not None else 0)
+        if a is None or target <= 0 or a.turn_id != target or a.draining or self._client is None:
+            fut.set_result(False)
+            return
+        a.texts.append(cmd.text)
+        a.queries += 1
+        try:
+            await self._client.query(cmd.text)
+        except Exception as e:  # noqa: BLE001
+            fut.set_result(False)
+            await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
+            return
+        fut.set_result(True)
 
     async def _on_interrupt(self, cmd: _Cmd) -> None:
         a = self._active
@@ -862,7 +1117,8 @@ class ClaudeBrain:
 
     async def _on_reset(self, cmd: _Cmd) -> None:
         a = self._active
-        if a is None and self._client is not None and not self._handed_off and self._turns_this_session:
+        if (a is None and self._client is not None and self._handoff_enabled and not self._handed_off
+                and self._turns_this_session):
             await self._start_handoff(after=self._do_reset)  # save context, then start fresh
             return
         if a is not None:
@@ -887,7 +1143,9 @@ class ClaudeBrain:
             limit = self.cfg.brain.idle_shutdown_min * 60
             if self._client is not None and limit > 0 and now - self._idle_at >= limit:
                 log.info("brain: idle for %d min; shutting the CLI down", self.cfg.brain.idle_shutdown_min)
-                if not self._handed_off and self._session_age_s() > self.cfg.brain.session_idle_rotate_min * 60:
+                rotate = self._rotate_min()
+                if (self._handoff_enabled and not self._handed_off and rotate is not None
+                        and self._session_age_s() > rotate * 60):
                     await self._start_handoff(after=lambda: self._on_sleep(_Cmd("sleep")))
                 else:
                     await self._on_sleep(_Cmd("sleep"))
@@ -949,15 +1207,30 @@ class ClaudeBrain:
         await self._fail_active(err)
 
     async def _next_pending(self) -> None:
+        if self._active is None:
+            self._release_desktop()  # turn teardown (finish, drain, timeout, failure, reset)
         while self._pending and self._active is None:
             await self._on_ask(self._pending.popleft())
         if self._active is None:
             self._idle_at = self._clock()
-            if self._sleep_requested and self._client is not None:
+            if self._tabs_dirty and self._client is not None and not self._closing:
+                await self._start_tab_cleanup()
+            elif self._sleep_requested and self._client is not None:
                 await self._on_sleep(_Cmd("sleep"))
             elif self._client is not None and self.chrome_connected is False and self._chrome_recheck_due():
                 log.info("brain: Chrome appeared; reconnecting at idle to re-probe the extension")
                 await self._park_session()
+
+    async def _start_tab_cleanup(self) -> None:
+        """P0.1 case (a): a chat turn closes its own Chrome tab group once it is done. A silent
+        query limited to the two tab tools; a new ask interrupts it like a handoff."""
+        self._tabs_dirty = False
+        self._active = _Turn(TABS_TURN, self._clock() + TABS_TIMEOUT_S, tabs=True)
+        log.info("brain: closing this session's Chrome tabs")
+        try:
+            await self._client.query(TABS_PROMPT)
+        except Exception as e:  # noqa: BLE001
+            await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
 
     # ------------------------------------------------------------------ messages
     async def _on_msg(self, cmd: _Cmd) -> None:
@@ -996,7 +1269,7 @@ class ClaudeBrain:
         status = next((s.get("status") for s in servers
                        if isinstance(s, dict) and s.get("name") == _CHROME_SERVER), None)
         if data.get("session_id"):
-            self._session_id = str(data["session_id"])
+            self._note_session_id(str(data["session_id"]))
         self._init_at = self._clock()
         self._init_info = {"servers": servers, "version": data.get("claude_code_version", "")}
         connected: bool | None
@@ -1057,6 +1330,8 @@ class ClaudeBrain:
                 inp = block.input or {}
                 if block.name == f"{_CHROME}navigate":
                     self.tools.chrome_tabs.note_navigate(inp.get("tabId"), str(inp.get("url", "")))
+                if self._close_own_tabs and a.turn_id > 0 and block.name.startswith(_CHROME):
+                    self._tabs_dirty = True
                 if block.name in _SILENT_TOOLS:
                     continue
                 self._emit(BrainEventKind.TOOL_START, a.turn_id, tool_name=block.name,
@@ -1074,16 +1349,24 @@ class ClaudeBrain:
             text = _result_text(block.content)
             if name in (f"{_CHROME}find", f"{_CHROME}read_page"):
                 self.tools.chrome_refs.ingest(text)
-            elif name in (f"{_CHROME}tabs_context_mcp", f"{_CHROME}tabs_create_mcp", f"{_CHROME}navigate"):
+            elif name in (f"{_CHROME}tabs_context_mcp", f"{_CHROME}tabs_create_mcp", f"{_CHROME}navigate") \
+                    or (self._ingest_all_tabs and name.startswith(_CHROME)):
                 self.tools.chrome_tabs.ingest(text)
+            if self.desktop is not None and is_desktop_tool(name):
+                self.desktop.stamp(block.tool_use_id)  # also covers failed calls (no PostToolUse)
             if name in _SILENT_TOOLS:
                 continue
             self._emit(BrainEventKind.TOOL_END, a.turn_id, tool_name=name, tool_use_id=block.tool_use_id,
                        is_error=bool(block.is_error), text=text[:500])
 
+    def _note_session_id(self, sid: str) -> None:
+        if self._fork_live and sid != self._session_id:
+            self._fork_live = False  # the fork has its own id now: that one is ours to continue
+        self._session_id = sid
+
     async def _on_result(self, a: _Turn, msg: ResultMessage) -> None:
         if msg.session_id:
-            self._session_id = msg.session_id
+            self._note_session_id(msg.session_id)
             await self._save_session(msg.session_id)
         self._last_activity = self._wall()
         if a.queries > 1:
@@ -1100,6 +1383,9 @@ class ClaudeBrain:
     async def _finish_turn(self, a: _Turn, msg: ResultMessage) -> None:
         self._active = None
         self._cancelled.discard(a.turn_id)
+        if a.tabs:
+            await self._next_pending()
+            return
         if a.handoff:
             await self._end_handoff(a, ok=not a.draining)
             await self._next_pending()

@@ -13,14 +13,26 @@ Layout (always all sections, in this order):
 A line ending in `` [kept]`` was an explicit "remember …" from the user; consolidation must
 preserve it verbatim. Writes are capability-gated by the PreToolUse hook: a fact is written only
 when the user explicitly asked, or when it is *grounded* in what the user recently said.
+
+Writers (F11, WhatsApp ARCHITECTURE D8 and W3.4): one `MemoryFile` instance is meant to be shared
+by every brain of a process (agentd injects its single instance). Each read-modify-write runs under
+an in-process lock and, while the voice brain can still run in macd (`brain.mode = local`), under a
+transitional `flock` on the sidecar ``memory.md.lock`` so a second process never loses a fact.
+The flock goes away together with local mode (pass ``flock=False``).
 """
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import fcntl
+import logging
 import os
 import re
 import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +51,9 @@ GROUNDING_RATIO = 0.6
 RECENT_CONTEXT_LIMIT = 1024
 CONSOLIDATE_ABOVE = 6 * 1024
 CONSOLIDATE_TARGET = 4 * 1024
+FLOCK_TIMEOUT_S = 5.0  # a write never waits longer than this for another process
+
+log = logging.getLogger(__name__)
 
 _STOPWORDS = frozenset(["about", "above", "after", "again", "against", "also", "always", "answer", "answers", "anything", "around", "because", "been", "before", "being", "between", "both", "could", "does", "doing", "done", "during", "each", "either", "every", "from", "have", "having", "here", "into", "just", "like", "mine", "more", "most", "much", "must", "never", "only", "other", "over", "please", "prefer", "prefers", "quite", "rather", "really", "same", "shall", "should", "since", "some", "such", "than", "that", "their", "them", "then", "there", "these", "they", "thing", "things", "this", "those", "through", "under", "until", "very", "want", "wants", "were", "what", "when", "where", "which", "while", "will", "with", "would", "your", "yours"])
 _WORD = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
@@ -180,10 +195,62 @@ class Memory:
 
 
 class MemoryFile:
-    """memory.md on disk; every operation re-reads and rewrites atomically."""
+    """memory.md on disk; every operation re-reads and rewrites atomically.
 
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    Thread-safe (calls run in `asyncio.to_thread`). Mutations hold `_lock` and, with ``flock``,
+    an exclusive flock on ``<name>.lock`` next to the file (transitional, local mode only).
+    """
+
+    def __init__(self, path: Path, *, flock: bool = True, lock_path: Path | None = None,
+                 flock_timeout_s: float = FLOCK_TIMEOUT_S) -> None:
+        self.path = Path(path)
+        self.flock = flock
+        self.lock_path = lock_path or self.path.with_name(self.path.name + ".lock")
+        self.flock_timeout_s = flock_timeout_s
+        self._lock = threading.RLock()
+
+    @contextlib.contextmanager
+    def _write_lock(self) -> Iterator[None]:
+        with self._lock:
+            if not self.flock:
+                yield
+                return
+            fd = self._open_flock()
+            try:
+                yield
+            finally:
+                if fd is not None:
+                    os.close(fd)  # closing the descriptor drops the flock
+
+    def _open_flock(self) -> int | None:
+        """Exclusive flock on the sidecar, polled (bounded). None: proceed without it, a broken
+        lock file must not stop memory writes (the in-process lock still serialises)."""
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            log.warning("memory: cannot open %s; writing without the cross-process lock", self.lock_path)
+            return None
+        deadline = time.monotonic() + self.flock_timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise TimeoutError("memory file is busy in another process") from None
+                time.sleep(0.02)
+            except OSError:
+                log.warning("memory: flock on %s failed; writing without it", self.lock_path)
+                return fd
+
+    def _mutate(self, fn: Callable[[Memory], bool]) -> None:
+        """Load, apply `fn` (returns whether to save), save: one locked read-modify-write."""
+        with self._write_lock():
+            mem = self.load()
+            if fn(mem):
+                self.save(mem)
 
     def load(self) -> Memory:
         try:
@@ -211,33 +278,43 @@ class MemoryFile:
             return ""
 
     def remember(self, fact: str, kind: str | None = None, kept: bool = False) -> str:
-        mem = self.load()
-        result = mem.remember(fact, kind, kept)
-        self.save(mem)
+        result = ""
+
+        def apply(mem: Memory) -> bool:
+            nonlocal result
+            result = mem.remember(fact, kind, kept)
+            return True
+        self._mutate(apply)
         return result
 
     def forget(self, text: str) -> int:
-        mem = self.load()
-        n = mem.forget(text)
-        if n:
-            self.save(mem)
-        return n
+        removed = 0
+
+        def apply(mem: Memory) -> bool:
+            nonlocal removed
+            removed = mem.forget(text)
+            return removed > 0
+        self._mutate(apply)
+        return removed
 
     def set_recent_context(self, lines: list[str]) -> None:
-        mem = self.load()
-        mem.set_recent_context(lines)
-        self.save(mem)
+        def apply(mem: Memory) -> bool:
+            mem.set_recent_context(lines)
+            return True
+        self._mutate(apply)
 
     def recent_context(self) -> list[str]:
         return list(self.load().sections["Recent context"])
 
     def add_recent_context(self, line: str) -> None:
-        mem = self.load()
-        mem.set_recent_context([*mem.sections["Recent context"], line])
-        self.save(mem)
+        def apply(mem: Memory) -> bool:
+            mem.set_recent_context([*mem.sections["Recent context"], line])
+            return True
+        self._mutate(apply)
 
     def consolidate(self, rewritten: str) -> None:
-        self.save(self.load().consolidate(rewritten))
+        with self._write_lock():
+            self.save(self.load().consolidate(rewritten))
 
     def needs_consolidation(self) -> bool:
         return self.size() > CONSOLIDATE_ABOVE

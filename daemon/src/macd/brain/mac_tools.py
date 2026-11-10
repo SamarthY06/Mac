@@ -13,6 +13,7 @@ import logging
 import re
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,9 @@ ALREADY_PENDING = ("A confirmation is already being asked, wait for that answer;
                    "and do not treat this as a decline.")
 AX_HELP = ("Accessibility permission is missing. Ask the user to open System Settings > Privacy & "
            "Security > Accessibility and turn on Mac (Mac.app), then try again.")
+
+SEND_FILE_MAX_BYTES = 100 * 1024 * 1024  # WhatsApp's document limit
+TEST_OUTWARD_DONE = "Test action done. Nothing was sent anywhere."
 
 ToolResult = dict[str, Any]
 
@@ -338,6 +342,21 @@ def notify_argv(title: str, body: str) -> list[str]:
     return ["osascript", "-e", APPLESCRIPT_NOTIFY, "--", title[:200], body[:1000]]
 
 
+def _attach_problem(path: Path) -> str | None:
+    """Why `path` can't be sent, or None. Runs in a thread (stat)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return f"No such file: {path.name}."
+    if not path.is_file():
+        return f"{path.name} is not a file; send one file at a time (zip a folder first)."
+    if st.st_size == 0:
+        return f"{path.name} is empty."
+    if st.st_size > SEND_FILE_MAX_BYTES:
+        return f"{path.name} is larger than 100 MB, too big to send."
+    return None
+
+
 def _run(argv: list[str], timeout: float = 20) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
 
@@ -354,7 +373,10 @@ class MacTools:
                  pending_action: Callable[[int], ActionFingerprint | None] | None = None,
                  on_notify: Callable[[str, str, str | None], Any] | None = None,
                  workspace: Path | None = None, memory_path: Path | None = None,
-                 results_dir: Path | None = None, confirm_timeout_s: float = 45.0) -> None:
+                 results_dir: Path | None = None, confirm_timeout_s: float = 45.0,
+                 memory: MemoryFile | None = None,
+                 on_attach: Callable[[str, str, str], str | None] | None = None,
+                 test_tools: bool = False) -> None:
         self.gate = gate
         self.current_turn = current_turn
         self.memory_check = memory_check  # (tool, args) -> (allowed, "explicit"|"grounded"|"handoff"|reason)
@@ -364,7 +386,11 @@ class MacTools:
         self.on_notify = on_notify  # (title, body, path) -> truthy if the app showed it
         self.workspace = workspace or config.WORKSPACE_DIR
         self.memory_path = memory_path or config.MEMORY_PATH
-        self.memory = MemoryFile(self.memory_path)
+        self.memory = memory if memory is not None else MemoryFile(self.memory_path)
+        # (attach_id, real path, caption) -> None when the ATTACH event went out, else why not.
+        # None disables mac.send_file (voice profile).
+        self.on_attach = on_attach
+        self.test_tools = test_tools  # registers mac.test_outward (live test only)
         self.results_dir = results_dir or Path("~/Documents/Mac").expanduser()
         self.confirm_timeout_s = confirm_timeout_s
         self.registry = ElementRegistry()
@@ -447,6 +473,30 @@ class MacTools:
                 log.exception("on_notify failed; falling back to osascript")
         res = await asyncio.to_thread(_run, notify_argv(title, body), 10)
         return _ok("Notification shown.") if res.returncode == 0 else _err(f"notify failed: {res.stderr.strip()}")
+
+    # -- chat channel ------------------------------------------------------------------
+    async def send_file(self, args: dict[str, Any]) -> ToolResult:
+        """Deliver a file to the user's chat. The gate already refused sensitive paths."""
+        if self.on_attach is None:
+            return _err("Sending files is not available here.")
+        raw = str(args.get("path", "")).strip()
+        caption = " ".join(str(args.get("caption", "") or "").split())[:1000]
+        if not raw:
+            return _err("path is required")
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = self.workspace / path
+        problem = await asyncio.to_thread(_attach_problem, path)
+        if problem:
+            return _err(problem)
+        refused = self.on_attach(uuid.uuid4().hex, str(path.resolve()), caption)
+        if refused:
+            return _err(refused)
+        return _ok(f"File queued for the user: {path.name}.")
+
+    async def test_outward(self, args: dict[str, Any]) -> ToolResult:
+        """Harmless outward action for the live test: gated like a send, does nothing."""
+        return _ok(TEST_OUTWARD_DONE)
 
     # -- screen / apps -----------------------------------------------------------------
     async def screenshot(self, args: dict[str, Any]) -> ToolResult:
@@ -582,6 +632,15 @@ class MacTools:
             ("ui_key", "Press a key combo, e.g. \"cmd+shift+4\", \"return\", \"escape\".",
              {**obj, "properties": {"combo": {"type": "string"}}, "required": ["combo"]}, self.ui_key),
         ]
+        if self.on_attach is not None:
+            specs.append(("send_file", ("Send a file you made or found to the user in this chat. `path` to the "
+                                        "file, optional one-line `caption`. Use it to deliver results."),
+                          {**obj, "properties": {"path": {"type": "string"}, "caption": {"type": "string"}},
+                           "required": ["path"]}, self.send_file))
+        if self.test_tools:
+            specs.append(("test_outward", ("Test-only action that counts as sending: the safety check asks the "
+                                           "user first. `target` names what it would go to."),
+                          {**obj, "properties": {"target": {"type": "string"}}}, self.test_outward))
         return [tool(name, desc, schema)(handler) for name, desc, schema, handler in specs]
 
     def server(self) -> Any:

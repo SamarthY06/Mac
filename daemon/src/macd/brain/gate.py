@@ -20,6 +20,17 @@ files to osascript/shells/interpreters are read and classified. Remaining blind 
 event log only): values computed at run time (`$(base64 -d …)`), clicks on unknown hosts whose
 labels avoid the verb list, and read-only exfiltration through GET URLs.
 
+Chat profile (WhatsApp ARCHITECTURE W3.3), switched on through `GateContext`:
+- ``whatsapp_ui_block``: every use of WhatsApp's own screens is catastrophic with code
+  ``whatsapp_ui``, reads included (M1): Claude in Chrome on a web.whatsapp.com tab or URL, the
+  mac ui/screenshot/open_app tools with WhatsApp targeted or frontmost, and osascript, ``open``
+  or ``whatsapp://`` URLs aimed at WhatsApp. The voice profile keeps today's behaviour (V6,
+  Option A: WhatsApp sends behind the spoken confirmation).
+- ``never_chat_names``: an outward action or a confirmation summary naming a never-listed chat
+  (for example "Timetable") is catastrophic with code ``never_chat``.
+- ``.env`` files are readable only inside ``env_exempt_dir`` (default: the workspace), and only
+  when that folder is one of Mac's own workspaces under ``~/.mac-agent`` (F10).
+
 `ConfirmationGate` is owned by the orchestrator and shared with the brain: the model asks
 via ``mcp__mac__request_confirmation``; the orchestrator speaks the summary, listens for a
 human yes/no and calls ``resolve()``. Approval mints a token (single turn, TTL, max uses)
@@ -223,6 +234,21 @@ _JS_OUTWARD = re.compile(
 _JS_CLICK = re.compile(r"\.click\s*\(")
 _STRING_LITERAL = re.compile(r"""(['"])((?:\\.|(?!\1).)*)\1""", re.DOTALL)
 
+# WhatsApp's own screens (chat profile hard block, M1).
+WHATSAPP_HOSTS = re.compile(r"(^|\.)(whatsapp\.com|whatsapp\.net|wa\.me)$", re.IGNORECASE)
+_WA_URL = re.compile(r"whatsapp://|(?<![a-z0-9.-])(?:https?://)?(?:[a-z0-9-]+\.)*(?:whatsapp\.com|wa\.me)(?:[/:?#]|$)",
+                     re.IGNORECASE)
+_WA_SCRIPT = re.compile(r"whatsapp://|tell\s+application\s+\\?[\"']?whatsapp|application\s+id\s+\\?[\"']?"
+                        r"net\.whatsapp|net\.whatsapp\.whatsapp|application\s*\(\s*[\"']whatsapp",
+                        re.IGNORECASE)
+WHATSAPP_UI = "whatsapp_ui"
+NEVER_CHAT = "never_chat"
+REASON_WHATSAPP_UI = ("WhatsApp's own screens are off limits on this channel, reading included; "
+                      "your replies reach the user through Mac's own link")
+MAC_SEND_FILE = "mcp__mac__send_file"
+MAC_TEST_OUTWARD = "mcp__mac__test_outward"
+MAC_CONFIRM = "mcp__mac__request_confirmation"
+
 UI_RETURN_COMBOS = {"return", "enter", "cmd+return", "cmd+enter", "ctrl+return", "ctrl+enter",
                     "shift+return", "shift+enter", "cmd+shift+d", "kp_enter"}
 
@@ -242,6 +268,12 @@ class GateContext:
     chrome_tab_host: Callable[[Any], str | None] | None = None  # tabId -> host (navigate/tabs)
     current_app: Callable[[], str] | None = None  # frontmost app, queried at decision time
     read_file: Callable[[str], str | None] = lambda p: _read_small_file(p)  # script files
+    # Profile switches (WhatsApp ARCHITECTURE W3.1/W3.3); the defaults are the voice profile.
+    whatsapp_ui_block: bool = False  # chat: WhatsApp's own screens are catastrophic (M1)
+    never_chat_names: tuple[str, ...] = ()  # chat: outward actions naming these are catastrophic
+    env_exempt_dir: str | None = None  # .env readable here (None: the workspace); F10 limits it
+    memory_path: str | None = None  # an injected shared memory.md is a memory file too
+    shared_chat: bool = False  # mac.send_file is outward in a chat with other members
 
 
 def _read_small_file(path: str, limit: int = 256 * 1024) -> str | None:
@@ -287,6 +319,20 @@ class _Paths:
             str(config.MEMORY_PATH).lower(),
             str(config.WORKSPACE_DIR / "CLAUDE.md").lower(),
         }
+        if ctx.memory_path:
+            self.memory_files.add(posixpath.normpath(self.expand_tilde(ctx.memory_path)).lower())
+        self.env_exempt = self._env_exempt_dir(ctx)
+
+    def _env_exempt_dir(self, ctx: GateContext) -> str | None:
+        """F10: the .env exemption holds only inside one of Mac's own workspaces (under
+        ~/.mac-agent), never in a real project folder used as the working directory."""
+        raw = ctx.env_exempt_dir if ctx.env_exempt_dir is not None else ctx.workspace
+        if not raw:
+            return None
+        d = posixpath.normpath(self.expand_tilde(raw)).lower()
+        own = [posixpath.join(self.home.lower(), ".mac-agent"),
+               posixpath.normpath(str(config.HOME)).lower()]
+        return d if any(self._under(d, root) for root in own) else None
 
     def expand_tilde(self, p: str) -> str:
         if p == "~" or p.startswith("~/"):
@@ -343,7 +389,7 @@ class _Paths:
                                  for s in _SENSITIVE_SAMPLES) and base != "*"))
             if not hit:
                 continue
-            if pat == ".env*" and self._under(lowered, self.workspace):
+            if pat == ".env*" and self.env_exempt and self._under(lowered, self.env_exempt):
                 continue
             return f"{raw} looks like a credential or key file"
         return None
@@ -1076,30 +1122,144 @@ def _chrome(name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecision:
 # ----------------------------------------------------------------------------- public API
 
 
+def _app_name(ctx: GateContext) -> str:
+    if not ctx.current_app:
+        return ""
+    try:
+        return ctx.current_app() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _strings(obj: Any) -> Iterable[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
+def _whatsapp_ui(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecision | None:
+    """Chat profile (M1): any use of WhatsApp's own screens, reads included. None: not WhatsApp."""
+    hit = GateDecision("catastrophic", WHATSAPP_UI, REASON_WHATSAPP_UI, target="whatsapp")
+    texts = list(_strings(inp))
+    if tool_name.startswith("mcp__claude-in-chrome__"):
+        if any(_WA_URL.search(t) for t in texts):
+            return hit
+        if ctx.chrome_tab_host:
+            for d in _iter_dicts(inp):
+                for key in ("tabId", "tab_id"):
+                    if d.get(key) is not None and WHATSAPP_HOSTS.search(ctx.chrome_tab_host(d[key]) or ""):
+                        return hit
+        return None
+    if tool_name.startswith("mcp__mac__ui_") or tool_name in ("mcp__mac__screenshot", "mcp__mac__open_app"):
+        named = " ".join(str(inp.get(k, "")) for k in ("name", "app"))
+        if "whatsapp" in named.lower() or "whatsapp" in _app_name(ctx).lower():
+            return hit
+        if any(_WA_URL.search(t) for t in texts):
+            return hit
+        return None
+    if tool_name == "Bash":
+        cmd = str(inp.get("command", ""))
+        low = cmd.lower()
+        scripted = "whatsapp" in low and re.search(r"\b(osascript|jxa|system events)\b", low)
+        if _WA_SCRIPT.search(cmd) or _WA_URL.search(cmd) or scripted or _open_targets_whatsapp(cmd):
+            return hit
+        return None
+    if any(_WA_URL.search(t) for t in texts) and tool_name.startswith("mcp__mac__"):
+        return hit
+    return None
+
+
+def _open_targets_whatsapp(cmd: str) -> bool:
+    """`open -a WhatsApp`, `open -b net.whatsapp.WhatsApp`, `open /Applications/WhatsApp.app`."""
+    for pipeline in shell.parse(cmd).pipelines:
+        for sc in pipeline:
+            words = [w.text for w in sc.words]
+            while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+                words.pop(0)
+            if words and posixpath.basename(words[0]) == "open" and any(
+                    "whatsapp" in w.lower() for w in words[1:]):
+                return True
+    return False
+
+
+def _never_chat(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateContext) -> GateDecision | None:
+    """Chat profile: an outward action whose target names a never-listed chat, or a confirmation
+    summary that does (the summary must name the destination, so every send passes here)."""
+    names = [n.strip().lower() for n in ctx.never_chat_names if n.strip()]
+    if not names:
+        return None
+    if tool_name == MAC_CONFIRM:
+        texts = [str(inp.get("summary", ""))]
+    elif d.verdict == "outward":
+        texts = [d.target, d.reason]
+    else:
+        return None
+    blob = " ".join(texts).lower()
+    for n in names:
+        if re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", blob):
+            return GateDecision("catastrophic", NEVER_CHAT, f"'{n}' is on the never-list; Mac never reads "
+                                f"from or sends to it", target=n)
+    return None
+
+
+def _mac_send_file(inp: dict[str, Any], paths: _Paths, ctx: GateContext) -> GateDecision:
+    target = str(inp.get("path", ""))
+    reason = paths.sensitive_reason(target, ctx.workspace) if target else None
+    if reason:
+        return GateDecision("sensitive_read", "sensitive_path", reason)
+    if target and paths.is_memory_file(target, ctx.workspace):
+        return GateDecision("sensitive_read", "sensitive_path", f"{target} is Mac's private memory")
+    if ctx.shared_chat:
+        return GateDecision("outward", "send_file", "sends a file into a chat with other members",
+                            target=posixpath.basename(target))
+    return ALLOW
+
+
 def analyze(tool_name: str, tool_input: dict[str, Any] | None,
             context: GateContext | None = None) -> GateDecision:
     """Classify one tool call. Never runs anything (reads script files passed by path)."""
     inp = tool_input or {}
     ctx = context or GateContext()
     try:
-        paths = _Paths(ctx)
-        if tool_name == "Bash":
-            return _BashAnalyzer(paths).analyze(str(inp.get("command", "")))
-        if tool_name in _FILE_WRITE_TOOLS | _FILE_READ_TOOLS | {"Grep", "Glob"}:
-            return _file_tool(tool_name, inp, paths)
-        if tool_name.startswith("mcp__mac__ui_"):
-            return _mac_ui(tool_name, inp, ctx)
-        if tool_name.startswith("mcp__claude-in-chrome__"):
-            return _chrome(tool_name, inp, ctx)
-        if tool_name.startswith("mcp__") and not tool_name.startswith("mcp__mac__"):
-            short = tool_name.rsplit("__", 1)[-1]
-            if UNKNOWN_MCP_VERBS.search(short):  # user's own MCP servers: name-based, conservative
-                return GateDecision("outward", "mcp_write", f"{short} looks like it sends or changes something",
-                                    target=tool_name)
-        return ALLOW
+        if ctx.whatsapp_ui_block:
+            wa = _whatsapp_ui(tool_name, inp, ctx)
+            if wa is not None:
+                return wa
+        d = _analyze(tool_name, inp, ctx)
+        if ctx.never_chat_names:
+            return _never_chat(tool_name, inp, d, ctx) or d
+        return d
     except Exception:
         log.exception("gate: classifier error for %s", tool_name)
         return GateDecision("outward", "classifier_error", "could not verify this action")
+
+
+def _analyze(tool_name: str, inp: dict[str, Any], ctx: GateContext) -> GateDecision:
+    paths = _Paths(ctx)
+    if tool_name == MAC_SEND_FILE:
+        return _mac_send_file(inp, paths, ctx)
+    if tool_name == MAC_TEST_OUTWARD:  # harmless tool for the live test: always needs a yes
+        return GateDecision("outward", "test_outward", "test action that needs confirmation",
+                            target=str(inp.get("target", "test")))
+    if tool_name == "Bash":
+        return _BashAnalyzer(paths).analyze(str(inp.get("command", "")))
+    if tool_name in _FILE_WRITE_TOOLS | _FILE_READ_TOOLS | {"Grep", "Glob"}:
+        return _file_tool(tool_name, inp, paths)
+    if tool_name.startswith("mcp__mac__ui_"):
+        return _mac_ui(tool_name, inp, ctx)
+    if tool_name.startswith("mcp__claude-in-chrome__"):
+        return _chrome(tool_name, inp, ctx)
+    if tool_name.startswith("mcp__") and not tool_name.startswith("mcp__mac__"):
+        short = tool_name.rsplit("__", 1)[-1]
+        if UNKNOWN_MCP_VERBS.search(short):  # user's own MCP servers: name-based, conservative
+            return GateDecision("outward", "mcp_write", f"{short} looks like it sends or changes something",
+                                target=tool_name)
+    return ALLOW
 
 
 def classify(tool_name: str, tool_input: dict[str, Any] | None,

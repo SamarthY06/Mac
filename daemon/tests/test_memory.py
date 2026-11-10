@@ -86,3 +86,91 @@ def test_memory_file_roundtrip_and_legacy_format(tmp_path: Path) -> None:
     assert f.forget("tea") == 1
     assert "likes tea" not in f.text()
     assert not f.needs_consolidation()
+
+
+# ----------------------------------------------------------------------------- F11 writers
+
+def _distinct(seed: str) -> str:
+    """A fact no other fact dedupes into (Memory.remember merges near-duplicates)."""
+    import hashlib
+
+    return hashlib.sha256(seed.encode()).hexdigest()[:40]
+
+
+def test_f11_two_writers_never_lose_a_fact(tmp_path: Path) -> None:
+    """Two MemoryFile instances (two brains) on one memory.md, writing at the same time."""
+    import threading
+
+    path = tmp_path / "memory.md"
+    a, b = MemoryFile(path), MemoryFile(path)
+    facts = [_distinct(f"t{i}") for i in range(60)]
+
+    def write(f: MemoryFile, items: list[str]) -> None:
+        for x in items:
+            f.remember(x, "project")
+
+    threads = [threading.Thread(target=write, args=(a, facts[0::2])),
+               threading.Thread(target=write, args=(b, facts[1::2]))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    saved = MemoryFile(path).load().sections["Projects & work"]
+    assert sorted(saved) == sorted(facts)
+    assert (tmp_path / "memory.md.lock").exists()
+
+
+def test_f11_single_shared_instance_without_flock(tmp_path: Path) -> None:
+    import threading
+
+    f = MemoryFile(tmp_path / "memory.md", flock=False)  # remote mode: one writer, no flock
+    items = [_distinct(f"s{i}") for i in range(40)]
+    threads = [threading.Thread(target=f.remember, args=(x, "task")) for x in items]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(f.load().sections["Recurring tasks"]) == sorted(items)
+    assert not (tmp_path / "memory.md.lock").exists()
+
+
+_WRITER = """
+import hashlib, sys
+from pathlib import Path
+from macd.brain.memory import MemoryFile
+f = MemoryFile(Path(sys.argv[1]))
+for i in range(int(sys.argv[3])):
+    f.remember(sys.argv[2] + " " + hashlib.sha256(f"{sys.argv[2]}{i}".encode()).hexdigest()[:40], "project")
+"""
+
+
+def test_f11_two_processes_never_lose_a_fact(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    path = tmp_path / "memory.md"
+    procs = [subprocess.Popen([sys.executable, "-c", _WRITER, str(path), who, "40"]) for who in ("voice", "chat")]
+    for p in procs:
+        assert p.wait(60) == 0
+    saved = MemoryFile(path).load().sections["Projects & work"]
+    assert len(saved) == 80
+    assert {s.split()[0] for s in saved} == {"voice", "chat"}
+
+
+def test_flock_held_elsewhere_times_out_instead_of_hanging(tmp_path: Path) -> None:
+    import fcntl
+    import os
+
+    import pytest
+
+    path = tmp_path / "memory.md"
+    fd = os.open(tmp_path / "memory.md.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # another process (another open file description) holds it
+    try:
+        f = MemoryFile(path, flock_timeout_s=0.2)
+        with pytest.raises(TimeoutError):
+            f.remember("Something new", "about")
+        assert f.text() == ""
+    finally:
+        os.close(fd)
+    assert MemoryFile(path).remember("Something new", "about") == "added"
