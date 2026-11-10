@@ -167,6 +167,26 @@ uv run macd --audio sounddevice   # headless daemon (permissions attribute to yo
 
 Reviews that shaped the code (architecture, code quality, simplicity, UX) are in `docs/reviews/`.
 
+## Run the WhatsApp bot as a service
+
+The WhatsApp bot (chatd) and the agent behind it (agentd) can run in the background on their own.
+They start when you log in, restart by themselves if they crash, and need no open terminal.
+
+```bash
+scripts/services.sh install     # start now and at every login
+scripts/services.sh status      # what is running, and whether WhatsApp is connected
+scripts/services.sh restart     # restart both (also brings back a bot that stopped)
+scripts/services.sh uninstall   # stop and remove
+```
+
+If the bot stops for a reason a restart can't fix (its settings are wrong, its message budget is
+spent, or WhatsApp is in use by another run), it stays stopped and `status` says why. The agent
+keeps running. Fix the cause, then run `restart`. Logs are in `~/Library/Logs/Mac/services.log`.
+They never contain message text.
+
+macOS may ask once whether Python may use files in the folder that holds this repo (for example
+Desktop or Documents). Allow it, or keep the repo outside those folders.
+
 ## Screen off, screen locked
 
 Mac keeps listening with the display off or the screen locked (it runs in your user session, not
