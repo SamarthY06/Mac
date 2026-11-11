@@ -141,7 +141,7 @@ echo "${B}OpenMac, an always-on voice agent for macOS, powered by Claude${O}"
 # ------------------------------------------------------------------------- system
 step "Checking your system"
 [[ $(uname -s) == Darwin ]] || die "OpenMac only runs on macOS."
-[[ $(uname -m) == arm64 ]] || die "OpenMac requires an Apple silicon Mac (arm64); found $(uname -m)."
+[[ $(uname -m) == arm64 ]] || die "OpenMac requires an Apple silicon Mac (arm64); found $(uname -m). See https://github.com/SamarthY06/OpenMac/blob/main/docs/FAQ.md for why."
 MACOS="$(sw_vers -productVersion)"
 [[ ${MACOS%%.*} -ge 14 ]] || die "macOS 14 (Sonoma) or newer is required; you have $MACOS."
 ok "macOS $MACOS on Apple silicon"
