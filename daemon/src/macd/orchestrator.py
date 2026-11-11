@@ -689,7 +689,7 @@ class Orchestrator:
         """VAD onset over Mac's speech (AEC on): pause NOW; the transcript decides (LiveKit's
         "pause on speech, resume on false interruption")."""
         turn = self.turn
-        if (turn is None or turn.confirming or not self.cfg.listen.barge_in or not self._is_partner(turn, ev.source)
+        if (turn is None or not self.cfg.listen.barge_in or not self._is_partner(turn, ev.source)
                 or self.speech.playing_turn != turn.id):
             return
         if self._barge == turn.id and self.speech.paused:
@@ -727,6 +727,19 @@ class Orchestrator:
             else:
                 self.speech.flush_all()
             return
+        # Answering over the confirmation question (live 2026-11-12: the summary comes first and
+        # "Send it?" last, so people answer over its tail; dropping those yeses looped the question
+        # three times). A clear yes, an explicit no, or a longer reply resolves it; "hmm" lets the
+        # question finish. Not the model's call: the gate needs the owner's own words.
+        if turn is not None and turn.confirming and partner:
+            verdict = P.classify_confirmation(text)
+            if verdict == "no" and not P.has_negation(text):
+                verdict = ""  # unclear and short: not an answer yet
+            if verdict:
+                self._barge_clear()
+                self.speech.flush_turn(turn.id)  # the rest of the question is moot
+                self._resolve_confirm(turn, verdict, "utterance", text=text, confirm_source="voice")
+                return
         # before the brain said anything real (only the "On it." filler plays), the user is still
         # finishing the request: any words merge into it, however short ("…about" "octopuses")
         early = turn is not None and partner and not turn.brain_done and not turn.output_started

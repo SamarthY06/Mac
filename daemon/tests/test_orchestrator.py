@@ -687,15 +687,30 @@ async def test_stop_while_paused_stops_and_next_ask_knows_what_was_missed(talky:
     assert talky.brain.asks[-1][1].startswith("[Your last reply was cut off: they heard")
 
 
-async def test_no_barge_in_pause_over_a_confirmation(talky: Rig) -> None:
+async def test_answering_over_the_confirmation_question_counts(talky: Rig) -> None:
+    """Live 2026-11-12: the owner answered "yes, please send it" over the tail of "Send it?" three
+    times and every yes was dropped. Now the question pauses when the user talks; a clear answer
+    resolves it, an unclear sound lets the question go on."""
     await start_turn(talky, "email Bob", [confirm("I'll email Bob the report"), pause()])
     await wait_until(lambda: talky.orch.state == State.CONFIRMING and talky.speech.speaking, timeout=4)
     _barge(talky)
-    await asyncio.sleep(0.1)
-    assert not talky.speech.paused
-    talky.mic.say("yes send it", window=WindowReason.SPEAKING)  # said over the question: not a yes
-    await asyncio.sleep(0.1)
+    await wait_until(lambda: talky.speech.paused)
+    talky.mic.say("hmm", window=WindowReason.SPEAKING)  # not an answer: the question resumes
+    await wait_until(lambda: not talky.speech.paused)
     assert talky.gate.resolved == [] and talky.orch.turn.confirming
+    _barge(talky)
+    talky.mic.say("yes send it", window=WindowReason.SPEAKING)  # over the question: still a yes
+    await wait_until(lambda: talky.gate.resolved == [True])
+    assert not talky.orch.turn.confirming and talky.orch.state in (State.THINKING, State.SPEAKING)
+
+
+async def test_no_over_the_confirmation_question_denies(talky: Rig) -> None:
+    await start_turn(talky, "email Bob", [confirm("I'll email Bob the report"), pause()])
+    await wait_until(lambda: talky.orch.state == State.CONFIRMING and talky.speech.speaking, timeout=4)
+    _barge(talky)
+    talky.mic.say("no", window=WindowReason.SPEAKING)
+    await wait_until(lambda: talky.gate.resolved == [False])
+    await wait_until(lambda: P.DENIED in talky.spoken)
 
 
 async def test_barge_in_off_keeps_the_old_rule(talky: Rig) -> None:

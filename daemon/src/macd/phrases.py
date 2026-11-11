@@ -271,6 +271,11 @@ _AFF = re.compile(
 )
 
 
+def has_negation(text: str) -> bool:
+    """An explicit negative or redirect word ("no", "not", "instead", "wait") is present."""
+    return bool(_NEG.search(normalize(text)))
+
+
 def classify_confirmation(text: str) -> str:
     """'yes' | 'no' | 'steer' for a reply to "<summary>. Shall I go ahead?".
 
