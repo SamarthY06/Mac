@@ -1341,3 +1341,38 @@ async def test_question_say_is_spoken(rig: Rig) -> None:
     rig.scripts["book it"] = [say("Which day works, Monday or Tuesday?"), pause()]
     rig.mic.say("book it", woke=True)
     await wait_until(lambda: "Which day works, Monday or Tuesday?" in rig.spoken, msg="question")
+
+
+async def test_a_restart_resumes_the_turn_the_brain_was_working_on() -> None:
+    """Owner, 2026-11-12: a restart must not lose the request. The shutdown keeps it in state; the
+    next start says so and asks the brain to continue in the same session, with a note."""
+    import time as _time
+
+    from macd import orchestrator as orch_mod
+    config.update_state(resume_turn={"text": "find twenty jobs", "source": "local", "origin": "voice", "at": _time.time()})
+    orch_mod.RESUME_DELAY_S = 0.3
+    r, task = await make_rig()
+    r.brain.alive = True
+    r.scripts[orch_mod.RESTART_NOTE + " find twenty jobs"] = [pause()]  # the resumed work stays in flight below
+    try:
+        await wait_until(lambda: r.brain.asks and r.brain.asks[-1][1].endswith("find twenty jobs"), timeout=5, msg="resumed ask")
+        assert "restarted" in r.brain.asks[-1][1] and "do not start over" in r.brain.asks[-1][1]
+        await wait_until(lambda: P.RESUMING in r.spoken)
+        assert config.read_state().get("resume_turn") is None
+        # and a shutdown while that work is still running keeps it for the next start
+        r.orch.remember_in_flight()
+        assert config.read_state()["resume_turn"]["text"] == "find twenty jobs"
+    finally:
+        await teardown(r, task)
+
+
+async def test_a_stale_resume_record_is_dropped() -> None:
+    import time as _time
+    config.update_state(resume_turn={"text": "old", "source": "local", "origin": "voice", "at": _time.time() - 7200})
+    r, task = await make_rig()
+    r.brain.alive = True
+    try:
+        await asyncio.sleep(0.2)
+        assert r.brain.asks == [] and config.read_state().get("resume_turn") is None
+    finally:
+        await teardown(r, task)

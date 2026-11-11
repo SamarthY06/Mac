@@ -119,6 +119,8 @@ scripts/mac status                 # what is running, and whether WhatsApp is co
 ```
 
 The services run a frozen copy of a commit, so editing the repo never changes what runs.
+A restart during a task is not a loss: the request is picked up again in the same session, with
+a note to Claude to continue rather than start over.
 
 ## Your data
 

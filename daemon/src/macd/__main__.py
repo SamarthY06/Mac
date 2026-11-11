@@ -416,6 +416,7 @@ class Daemon:
                 self.eventlog.emit("daemon_ready", audio=self.backend, voice=self.stack is not None)
                 await self.stop.wait()
                 log.info("shutting down")
+                self.orch.remember_in_flight()  # a restart picks the current request up again
                 self.orch.close()
         finally:
             await self._shutdown()

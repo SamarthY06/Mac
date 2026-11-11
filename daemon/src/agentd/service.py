@@ -72,6 +72,10 @@ QUESTION_TTL_S = {s.QuestionKind.FOLDER_APPROVAL: 600.0, s.QuestionKind.ROUTE: 3
                   s.QuestionKind.CATCH_UP: 3600.0, s.QuestionKind.RESTART: 3600.0,
                   s.QuestionKind.PROFILE: 600.0}
 RESTART_TEXT = "I restarted on your Mac in the middle of this, so I stopped. Want me to pick it up?"
+RESUME_WINDOW_S = 1800.0  # a turn cut by a restart this recently is picked up again by itself; older ones ask
+RESUMED_NOTE = ("[Note from Mac: Mac was restarted while working on this request and is picking it up where it "
+                "left off, in the same conversation. Continue; do not start over or repeat what is already done. "
+                "The request was:]\n\n")
 AGENTD_EPOCH = "agentd"  # epoch of turns agentd starts itself (a "yes" to a restart question)
 # a late STATUS/DONE of a finished turn is dropped; these mean the brain started a new query on it
 _NEW_QUERY_KINDS = frozenset({BrainEventKind.TEXT, BrainEventKind.SAY, BrainEventKind.TOOL_START,
@@ -876,6 +880,14 @@ class Service:
         if r.restart_notice_for == run.uid:
             return
         r.restart_notice_for = run.uid
+        if not c.voice and not r.paused and self.clock() - run.started_at < RESUME_WINDOW_S:
+            # Owner, 2026-11-12: a restart must not lose the request. Same session, same request, a note
+            # that says so; the chat sees an ordinary turn start instead of a "pick it up?" question.
+            t = self._new_turn(c, AGENTD_EPOCH, self._next_internal + 1, run.text, run.msg_ref)
+            t.note = RESUMED_NOTE
+            log.info("conv %s: resuming the turn cut by the restart", c.conv)
+            self.spawn(self._start_turn(c, t, None))
+            return
         self._notices.setdefault(c.conv, []).append(s.InterruptedTurn(conv=c.conv, uid=run.uid, text=run.text))
         c.emit(s.InterruptedEvent, uid=run.uid, text=run.text)
         if not c.voice:

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A restart no longer loses the request in flight: the voice daemon and the chat backend pick a turn cut by a restart up again in the same session ("Back. Picking up where I left off."), if it was running within the last 30 minutes; older ones still ask.
 - Claude Code's own permission classifier runs on every tool call (`brain.permission_mode = "auto"`, the default); what it escalates is put to the user as a confirmation and passes once they say yes. `"bypassPermissions"` restores the previous behaviour.
 - `brain.confirm_outward` (default true): set it to false and the model decides when to ask before sending, posting or paying; the hook then blocks only dangerous actions (destructive commands, secrets, Mac's own files, the never-list).
 - "Stop everything" (chat and voice): ends the running task, its background agents and the session at once.
