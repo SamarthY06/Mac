@@ -33,7 +33,7 @@ STT_LANGUAGES = ["en"]  # Parakeet TDT 0.6B v2 is English-only
 PREVIEW_TEXT = "Hi, I'm Mac. This is how I sound."
 MAX_NAME_LEN = 32
 RANGES: dict[str, tuple[float, float]] = {
-    "tts.speed": (0.5, 2.0), "listen.silence_ms": (200, 3000), "listen.followup_s": (0, 60),
+    "tts.speed": (0.5, 2.0), "listen.silence_ms": (200, 3000), "listen.turn_max_silence_ms": (500, 5000), "listen.followup_s": (0, 60),
     "listen.max_utterance_s": (5, 600), "brain.idle_shutdown_min": (1, 720), "wake.kws_threshold": (0.01, 1.0),
 }
 

@@ -38,7 +38,14 @@ class WakeConfig:
 
 @dataclass
 class ListenConfig:
-    silence_ms: int = 700  # end-of-utterance silence
+    silence_ms: int = 700  # end-of-utterance silence (without the Smart Turn model)
+    # Smart Turn (semantic end of turn): after turn_check_ms of silence the model decides from the
+    # audio whether the sentence is finished; if not ("tell me about..."), wait for more speech up to
+    # turn_max_silence_ms. Pipecat's pattern (their stop_secs is 3 s).
+    smart_turn: bool = True
+    turn_check_ms: int = 300
+    turn_max_silence_ms: int = 2000
+    turn_threshold: float = 0.5
     max_utterance_s: float = 60.0
     no_speech_timeout_s: float = 5.0  # after wake, give up if nothing is said
     followup_s: float = 6.0  # after speaking, listen without wake word
@@ -170,7 +177,7 @@ SETTABLE_KEYS: dict[str, type] = {
     # dotted key -> type; the subset the Settings window / `settings_set` may change at runtime
     "name": str, "user_name": str, "results_dir": str,
     "wake.phrases": list, "wake.kws_threshold": float,
-    "listen.silence_ms": int, "listen.followup_s": float, "listen.max_utterance_s": float,
+    "listen.silence_ms": int, "listen.smart_turn": bool, "listen.turn_max_silence_ms": int, "listen.followup_s": float, "listen.max_utterance_s": float,
     "tts.voice": str, "tts.speed": float, "tts.lang": str, "tts.engine": str,
     "brain.idle_shutdown_min": int, "brain.model": str, "brain.chrome": bool,
     "brain.setting_sources": list, "remote.enabled": bool,

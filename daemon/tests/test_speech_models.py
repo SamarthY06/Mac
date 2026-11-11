@@ -300,9 +300,20 @@ async def test_stop_word_over_playback(stack):
     utts = [e.utterance for e in events if e.kind is ListenerEventKind.UTTERANCE]
     assert len(utts) == 1 and utts[0].window is WindowReason.SPEAKING and not utts[0].woke, [e.kind for e in events]
     assert "stop" in utts[0].text.lower()
-    # a non-stop sentence over playback is dropped
+    # barge-in (default): a full sentence over playback reaches the orchestrator, which decides
     src = FileInput(padded(tts16(stack, "What about tomorrow?"), 1.0, 1.5), realtime=False, trailing_silence_s=0.5)
     lis = make_listener(src, stack, Config(), aec=True)
+    lis.set_speaking(True, "Here is what I found.")
+    events = []
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 60)
+    utts = [e.utterance for e in events if e.kind is ListenerEventKind.UTTERANCE]
+    assert ListenerEventKind.BARGE_IN in kinds(events)
+    assert len(utts) == 1 and utts[0].window is WindowReason.SPEAKING and "tomorrow" in utts[0].text.lower()
+    # barge-in off: only a stop word counts, any other sentence over playback is dropped
+    cfg = Config()
+    cfg.listen.barge_in = False
+    src = FileInput(padded(tts16(stack, "What about tomorrow?"), 1.0, 1.5), realtime=False, trailing_silence_s=0.5)
+    lis = make_listener(src, stack, cfg, aec=True)
     lis.set_speaking(True, "Here is what I found.")
     events = []
     await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 60)
@@ -353,3 +364,41 @@ async def test_settings_switch_wake_phrase_and_voice_live(stack, tmp_path, monke
     finally:
         await asyncio.to_thread(stack.set_wake_phrases, ["hey mac", "ok mac"])
         await asyncio.to_thread(stack.set_kokoro_voice, "af_heart")
+
+
+needs_turn = needs("turn")
+
+
+def say16(text: str) -> np.ndarray:
+    """macOS `say` (Samantha), 16 kHz. Unlike Kokoro, which reads every fragment as a finished
+    sentence, `say` keeps a rising/level pitch on a cut-off phrase, as a person does."""
+    import shutil
+    import subprocess
+    import tempfile
+    import wave
+
+    if not shutil.which("say"):
+        pytest.skip("macOS `say` not available")
+    with tempfile.TemporaryDirectory() as td:
+        aiff, wav = f"{td}/a.aiff", f"{td}/a.wav"
+        subprocess.run(["say", "-v", "Samantha", "-o", aiff, text], check=True)
+        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", aiff, wav], check=True)
+        with wave.open(wav) as w:
+            return np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+
+
+@needs_stt
+@needs_turn
+async def test_smart_turn_waits_for_the_rest_of_a_cut_off_sentence(stack):
+    """Real VAD + Smart Turn + STT: "can you tell me about" ... 1.3 s ... "octopuses" is ONE turn
+    (silence alone ends it at 700 ms); a finished question followed by the same gap is two."""
+    assert stack.turn is not None
+    gap = np.zeros(int(1.3 * SAMPLE_RATE), np.float32)
+    pcm = padded(np.concatenate([say16("Can you tell me about"), gap, say16("octopuses.")]))
+    events, _, _ = await run_listener(stack, pcm, window=(3600, WindowReason.TURN))
+    utts = [e.utterance.text.lower() for e in events if e.kind is ListenerEventKind.UTTERANCE]
+    assert len(utts) == 1 and "about" in utts[0] and "octopus" in utts[0], utts
+    pcm = padded(np.concatenate([say16("What time is it in Tokyo?"), gap, say16("Thanks.")]))
+    events, _, _ = await run_listener(stack, pcm, window=(3600, WindowReason.TURN))
+    utts = [e.utterance.text.lower() for e in events if e.kind is ListenerEventKind.UTTERANCE]
+    assert len(utts) == 2 and "tokyo" in utts[0], utts

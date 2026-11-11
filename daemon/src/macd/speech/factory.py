@@ -55,6 +55,7 @@ class SpeechStack:
     voice_error: str | None = None  # why the persisted "clone" choice could not be loaded at startup
     make_kws_model: Callable[[list[str]], Any] = field(default=lambda phrases: None)  # injectable for tests
     make_detector: Callable[[Any], WakeDetector] = SherpaWakeDetector  # model -> per-listener detector
+    turn: Any = None  # SmartTurn shared by all listeners (None = end of turn on silence alone)
     listeners: weakref.WeakSet[ListenerImpl] = field(default_factory=weakref.WeakSet)
 
     @property
@@ -216,6 +217,7 @@ def build_speech(cfg: Config, metrics: Metrics | None = None) -> SpeechStack:
     if error:
         log.warning("%s; using Kokoro", error)
     return SpeechStack(
+        turn=_smart_turn(cfg),
         make_wake=lambda: SherpaWakeDetector(kws),
         make_vad=lambda: SileroVAD(vad_path),
         stt=stt,
@@ -228,6 +230,21 @@ def build_speech(cfg: Config, metrics: Metrics | None = None) -> SpeechStack:
     )
 
 
+def _smart_turn(cfg: Config) -> Any:
+    if not cfg.listen.smart_turn:
+        return None
+    if models.missing_models(["turn"]):
+        log.warning("Smart Turn model missing; ending turns on %d ms of silence (run `python -m macd.speech.models`)", cfg.listen.silence_ms)
+        return None
+    from macd.speech.turn import SmartTurn
+
+    try:
+        return SmartTurn(models.path("turn"))
+    except Exception:
+        log.exception("Smart Turn failed to load; ending turns on silence")
+        return None
+
+
 def make_listener(
     source: AudioInput, stack: SpeechStack, cfg: Config, aec: bool | Callable[[], bool] = False,
     metrics: Metrics | None = None, eventlog: Any = None,
@@ -237,6 +254,6 @@ def make_listener(
     kws_hit_to_wake/listener_* latencies in `status`) and ``EventLog`` (kws_hit / wake_verify /
     wake_suppressed events)."""
     wake = stack.make_wake() if source.requires_wake_word else None
-    lis = ListenerImpl(source, wake, stack.make_vad(), stack.stt, cfg, aec=aec, metrics=metrics, eventlog=eventlog)
+    lis = ListenerImpl(source, wake, stack.make_vad(), stack.stt, cfg, aec=aec, metrics=metrics, eventlog=eventlog, turn=stack.turn)
     stack.listeners.add(lis)  # so set_wake_phrases can swap detectors live
     return lis

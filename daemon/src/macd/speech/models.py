@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 KWS_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 PARAKEET_NAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
 POCKET_NAME = "kyutai-pocket-tts-int8"
+TURN_NAME = "smart-turn-v3.2-cpu.onnx"
+TURN_REV = "f766f81d3cfdf7737ac64aad813d91bbfd56bf93"  # pinned pipecat-ai/smart-turn-v3 commit
 CONNECT_TIMEOUT_S = 10.0
 _GH = "https://github.com"
 _HF = "https://huggingface.co"
@@ -118,6 +120,11 @@ SPECS: tuple[ModelSpec, ...] = (
             Source(f"{_HF}/csukuangfj/{PARAKEET_NAME}/resolve/main", _PARAKEET_FILES),
         ),
         required=_PARAKEET_FILES,
+    ),
+    ModelSpec(  # end-of-turn detection (Pipecat Smart Turn v3.2, BSD-2-Clause); listener falls back to silence without it
+        "turn",
+        TURN_NAME,
+        (Source(f"{_HF}/pipecat-ai/smart-turn-v3/resolve/{TURN_REV}/{TURN_NAME}"),),
     ),
     ModelSpec(  # voice cloning (tts.engine = "clone"), opt-in; weights are CC-BY-4.0 (see LICENSE)
         "pocket",

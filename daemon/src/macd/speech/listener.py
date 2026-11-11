@@ -67,6 +67,8 @@ STOP_CAPTURE_S = 2.0  # stop-word captures while speaking (no AEC) are at most t
 TRAILING_KEEP_S = 0.3
 KWS_BATCH_FRAMES = 4  # feed KWS 80 ms at a time: the encoder steps every 16 frames anyway, 4x fewer thread hops
 MAX_KWS_INFLIGHT = 2  # batches the executor may lag before the frame loop waits (never in real time)
+TURN_DECIDE_FRAMES = 3  # Smart Turn runs off-loop (~35 ms); its answer is applied exactly this many frames later
+TURN_AUDIO_S = 8.0  # the model reads the last 8 s
 
 def _samples(seconds: float) -> int:
     return round(seconds * SAMPLE_RATE)
@@ -95,12 +97,16 @@ class _Capture:
     barge: bool = False  # SPEAKING capture with AEC: any words count (the orchestrator decides)
     onset_sent: bool = False  # BARGE_IN already emitted for this capture
     wall_hit: float = 0.0
+    turn_fut: asyncio.Future[float] | None = None  # Smart Turn check in flight for the current pause
+    turn_at: int = 0  # sample index at which its answer is applied
+    turn_wait: bool = False  # the model said "not finished" for this pause: wait for more speech
 
     def restart(self, pos: int, *, speaking: bool, max_end: int) -> None:
         self.parts, self.start, self.end = [], pos, pos
         self.speech_started = self.speech_seen = speaking
         self.speech_start = self.last_speech = pos
         self.capped = speaking
+        self.turn_fut, self.turn_wait = None, False
         self.max_end = max_end
 
 
@@ -117,6 +123,7 @@ class ListenerImpl:
         aec: bool | Callable[[], bool] = False,
         metrics: Metrics | None = None,
         eventlog: Any = None,
+        turn: Any = None,
     ) -> None:
         self.source = source
         self.source_name = source.name
@@ -128,6 +135,8 @@ class ListenerImpl:
         self._wake = wake
         self._vad = vad
         self._stt = stt
+        self._turn = turn  # SmartTurn (complete_prob(audio) -> float) or None: silence-only endpointing
+        self._turn_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="turn_pool") if turn is not None else None
         self._cfg = cfg
         self._aec = aec
         self._phrases = WakePhrases(cfg.wake.phrases, accept_similar_names=cfg.wake.accept_similar_names)
@@ -171,6 +180,8 @@ class ListenerImpl:
                 await self._collect_kws(wait=True)
         finally:
             self._kws_pool.shutdown(wait=False)
+            if self._turn_pool is not None:
+                self._turn_pool.shutdown(wait=False)
             self._end_of_input()
             while self._chain is not None and not self._chain.done():
                 await asyncio.shield(self._chain)
@@ -249,6 +260,9 @@ class ListenerImpl:
         self._speech_run = self._speech_run + 1 if is_speech else 0
         if not self._muted:
             self._step_capture(frame, idx, is_speech)
+            t_wait = time.perf_counter()
+            await self._apply_turn_check()
+            waited += time.perf_counter() - t_wait
             self._step_window(is_speech)
         dt = (time.perf_counter() - t0 - waited) * 1000
         self.frame_ms_max = max(self.frame_ms_max, dt)
@@ -328,6 +342,7 @@ class ListenerImpl:
         after_hit = c.hit is None or idx >= c.hit.sample_index
         if is_speech and after_hit:
             c.last_speech = c.end
+            c.turn_fut, c.turn_wait = None, False  # talking again: any verdict on the pause is moot
             if not c.speech_seen:
                 c.speech_seen = c.speech_started = True
                 c.speech_start = idx - (self._speech_run - 1) * FRAME_SAMPLES
@@ -339,13 +354,53 @@ class ListenerImpl:
             c.onset_sent = True  # straight onto the queue (not chained behind STT): the pause must be instant
             self._queue.put_nowait(ListenerEvent(ListenerEventKind.BARGE_IN, self.source_name, window=WindowReason.SPEAKING))
         if c.speech_started:
+            silent = c.end - c.last_speech
             if c.end >= c.max_end:
                 self._finalize(c, capped=is_speech)  # still talking: the rest continues as dictation
-            elif c.end - c.last_speech >= self._silence:
+            elif self._smart(c):
+                lc = self._cfg.listen
+                if silent >= _samples(lc.turn_max_silence_ms / 1000):
+                    self._finalize(c, capped=False)  # the model said "not finished" but nothing followed
+                elif c.turn_fut is None and not c.turn_wait and silent >= _samples(lc.turn_check_ms / 1000):
+                    assert self._turn is not None and self._turn_pool is not None
+                    audio = np.concatenate(c.parts)[-_samples(TURN_AUDIO_S):]
+                    c.turn_fut = asyncio.get_running_loop().run_in_executor(self._turn_pool, self._turn.complete_prob, audio)
+                    c.turn_at = c.end + TURN_DECIDE_FRAMES * FRAME_SAMPLES
+            elif silent >= self._silence:
                 self._finalize(c, capped=False)
         elif c.end >= c.deadline:
             self._capture = None
             self._enqueue(self._no_speech_job(c))
+
+    def _smart(self, c: _Capture) -> bool:
+        """Semantic end of turn for this capture (not for short no-AEC stop-word captures)."""
+        return (
+            self._turn is not None and self._cfg.listen.smart_turn
+            and not (c.window is WindowReason.SPEAKING and not c.barge)
+        )
+
+    async def _apply_turn_check(self) -> None:
+        """Act on the Smart Turn verdict for the current pause, at a fixed sample offset so that
+        file-fed runs are deterministic (in real time the answer is normally already there)."""
+        c = self._capture
+        if c is None or c.turn_fut is None or c.end < c.turn_at:
+            return
+        fut, c.turn_fut = c.turn_fut, None
+        t0 = time.perf_counter()
+        try:
+            prob = await fut
+        except Exception:
+            log.exception("Smart Turn failed; ending the turn on silence")
+            prob = 1.0
+        self.metrics.observe("turn_check_wait", (time.perf_counter() - t0) * 1000)
+        if self._capture is not c or c.rejected or c.turn_fut is not None:
+            return
+        done = prob >= self._cfg.listen.turn_threshold
+        self._emit_log("turn_check", prob=round(prob, 3), complete=done, silence_ms=round((c.end - c.last_speech) * 1000 / SAMPLE_RATE))
+        if done:
+            self._finalize(c, capped=False)
+        else:
+            c.turn_wait = True
 
     def _step_window(self, is_speech: bool) -> None:
         if self._capture is not None:

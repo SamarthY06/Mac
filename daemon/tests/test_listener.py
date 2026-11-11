@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import numpy as np
+import pytest
 
 from macd.audio.file_backend import FileInput
 from macd.config import Config
@@ -61,11 +62,11 @@ def audio(*regions: tuple[float, float], total_s: float = 6.0) -> np.ndarray:
     return x
 
 
-async def run(pcm, wake_at: float | None, stt=None, cfg=None, before=None, trailing=0.5):
+async def run(pcm, wake_at: float | None, stt=None, cfg=None, before=None, trailing=0.5, turn=None, aec=False):
     cfg = cfg or Config()
     src = FileInput(pcm, trailing_silence_s=trailing)
     stt = stt or FakeSTT()
-    lis = ListenerImpl(src, FakeWake(int(wake_at * SAMPLE_RATE) if wake_at is not None else None), FakeVAD(), stt, cfg)
+    lis = ListenerImpl(src, FakeWake(int(wake_at * SAMPLE_RATE) if wake_at is not None else None), FakeVAD(), stt, cfg, aec=aec, turn=turn)
     if before:
         before(lis)
     events = []
@@ -352,3 +353,69 @@ async def test_turn_window_stays_open_across_utterances():
                                  before=lambda l: l.open_window(3600, WindowReason.TURN))
     assert kinds == [K.SPEECH_START, K.UTTERANCE, K.SPEECH_START, K.UTTERANCE]
     assert all(e.utterance.window is WindowReason.TURN for e in events if e.utterance)
+
+
+# ----------------------------------------------------------------------------- Smart Turn (semantic end of turn)
+
+
+class FakeTurn:
+    """Returns the queued probabilities in order (then 1.0); records the audio it was shown."""
+
+    def __init__(self, *probs: float, fail: bool = False) -> None:
+        self.probs, self.fail, self.seen = list(probs), fail, []
+
+    def complete_prob(self, pcm):
+        self.seen.append(len(pcm) / SAMPLE_RATE)
+        if self.fail:
+            raise RuntimeError("onnx blew up")
+        return self.probs.pop(0) if self.probs else 1.0
+
+
+def _window(l):
+    l.open_window(3600, WindowReason.TURN)
+
+
+async def test_smart_turn_not_finished_waits_through_the_pause():
+    """"give me a fun fact about ... octopuses": the model says the first part is unfinished, so
+    the 1.2 s pause (longer than silence_ms) does not end the turn: one utterance, both parts."""
+    turn, stt = FakeTurn(0.05, 0.9), FakeSTT("give me a fun fact about octopuses")
+    kinds, _, _ = await run(audio((1.0, 2.0), (3.2, 3.8)), wake_at=None, stt=stt, turn=turn, before=_window)
+    assert kinds == [K.SPEECH_START, K.UTTERANCE]
+    assert len(turn.seen) == 2 and stt.calls == [pytest.approx(3.8 + 0.3 - 0.7, abs=0.05)]  # one STT pass over both
+
+
+async def test_smart_turn_finished_ends_the_turn_before_silence_ms():
+    """A complete sentence ends after turn_check_ms (+3 frames), not silence_ms: a 0.5 s gap that
+    the 700 ms silence rule would have merged is two turns."""
+    kinds, _, _ = await run(audio((1.0, 1.5), (2.0, 2.5)), wake_at=None, stt=FakeSTT("yes"), turn=FakeTurn(0.9, 0.9), before=_window)
+    assert kinds == [K.SPEECH_START, K.UTTERANCE, K.SPEECH_START, K.UTTERANCE]
+    kinds, _, _ = await run(audio((1.0, 1.5), (2.0, 2.5)), wake_at=None, stt=FakeSTT("yes"), before=_window)
+    assert kinds == [K.SPEECH_START, K.UTTERANCE]  # no model: silence_ms decides
+
+
+async def test_smart_turn_not_finished_but_nothing_follows_ends_at_max_silence():
+    turn = FakeTurn(0.1)
+    kinds, _, _ = await run(audio((1.0, 2.0), total_s=5.0), wake_at=None, stt=FakeSTT("tell me about"), turn=turn, before=_window)
+    assert kinds == [K.SPEECH_START, K.UTTERANCE] and len(turn.seen) == 1
+    cfg = Config()
+    cfg.listen.turn_max_silence_ms = 5000  # longer than the input: only end-of-input finalises it
+    _, events, _ = await run(audio((1.0, 2.0), total_s=3.5), wake_at=None, stt=FakeSTT("tell me about"), cfg=cfg,
+                             turn=FakeTurn(0.1), before=_window, trailing=0.0)
+    assert [e.kind for e in events][-1] is K.UTTERANCE
+
+
+async def test_smart_turn_disabled_or_failing_falls_back_to_silence():
+    cfg = Config()
+    cfg.listen.smart_turn = False
+    turn = FakeTurn(0.0)
+    kinds, _, _ = await run(audio((1.0, 1.5), (2.0, 2.5)), wake_at=None, stt=FakeSTT("yes"), cfg=cfg, turn=turn, before=_window)
+    assert kinds == [K.SPEECH_START, K.UTTERANCE] and turn.seen == []
+    kinds, _, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=FakeSTT("yes"), turn=FakeTurn(fail=True), before=_window)
+    assert kinds == [K.SPEECH_START, K.UTTERANCE]
+
+
+async def test_smart_turn_skips_no_aec_stop_word_captures():
+    turn = FakeTurn(0.0)
+    kinds, _, _ = await run(audio((1.0, 1.4), total_s=4.0), wake_at=None, stt=FakeSTT("stop"), turn=turn,
+                                 before=lambda l: l.set_speaking(True, "a long answer"))
+    assert K.UTTERANCE in kinds and turn.seen == []

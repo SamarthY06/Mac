@@ -92,7 +92,9 @@ CLI: `macctl settings get`, `macctl settings set tts.voice=bm_george tts.speed=1
 ## Configuration
 
 `~/.mac-agent/config.toml` (created with defaults on first run; `MAC_*` env vars override).
-Notable keys: `wake.phrases` (default `["hey mac", "ok mac"]`), `listen.silence_ms`,
+Notable keys: `wake.phrases` (default `["hey mac", "ok mac"]`), `listen.smart_turn` (end of turn by the
+Smart Turn model; when it hears an unfinished sentence Mac waits up to `listen.turn_max_silence_ms`, 2000),
+`listen.silence_ms` (used without the model),
 `listen.followup_s`, `tts.voice`, `tts.engine` (`kokoro` | `clone`; the *Voice…* panel sets it), `brain.idle_shutdown_min`, `brain.setting_sources`
 (`["user"]` loads your own `~/.claude` MCP servers, skills and plugins into Mac; `[]` isolates),
 `results_dir` (`~/Documents/Mac`), `remote.enabled`.
@@ -206,5 +208,5 @@ talk to Mac's agent with a token the services make at each start
 ## License
 
 MIT, see [LICENSE](../LICENSE). Speech models carry their own licenses (sherpa-onnx: Apache-2.0;
-Parakeet: CC-BY-4.0; Kokoro: Apache-2.0; Silero VAD: MIT; Kyutai Pocket TTS weights: CC-BY-4.0;
+Parakeet: CC-BY-4.0; Kokoro: Apache-2.0; Silero VAD: MIT; Pipecat Smart Turn v3.2: BSD-2-Clause; Kyutai Pocket TTS weights: CC-BY-4.0;
 only clone voices you own or have permission to use).
