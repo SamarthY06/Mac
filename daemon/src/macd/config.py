@@ -87,6 +87,10 @@ class BrainConfig:
     # says yes to that exact action. False: the model decides when to ask; the hook only blocks
     # dangerous actions (destructive commands, secrets, Mac's own files, the never-list).
     confirm_outward: bool = True
+    # "auto": Claude Code's own permission classifier runs on every tool call; what it escalates is
+    # put to the user as a confirmation (spoken, or a question in the chat). "bypassPermissions":
+    # no classifier; only this project's hook decides.
+    permission_mode: str = "auto"
     setting_sources: list[str] = field(default_factory=lambda: ["user"])  # load ~/.claude MCP servers/skills/plugins; [] to isolate
     session_idle_rotate_min: int = 180  # after this long idle, handoff() writes memory and the next turn starts a fresh session
     idle_shutdown_min: int = 10  # kill the claude process after this long with no work

@@ -605,3 +605,30 @@ async def test_stop_everything_kills_background_agents_and_skips_the_handoff(mak
     assert len(c.queries) == 2  # no session-handoff query on a hard stop
     assert brain.is_cancelled(0)  # a straggling agent call is refused by the hook
     await brain.close()
+
+
+async def test_auto_mode_escalation_is_put_to_the_user_and_passes_after_yes(make) -> None:
+    """permission_mode "auto": Claude Code's classifier escalates a call through can_use_tool. The
+    first time the model is told to ask; once the user said yes, the retry is allowed."""
+    from types import SimpleNamespace
+    brain = make(simple("ok"), chat=True)
+    await brain.start()
+    await brain.ask(1, "hi")
+    await collect(brain)
+    brain._active = cb._Turn(4, 10**9)  # a running turn, for current_turn()
+    ctx = SimpleNamespace(title="Claude wants to run git push --force", display_name="Run command",
+                          description="", decision_reason="", suggestions=[], tool_use_id="t1")
+    first = await brain._can_use_tool("Bash", {"command": "git push --force"}, ctx)
+    assert first.behavior == "deny" and "request_confirmation" in first.message and "git push --force" in first.message
+    fp = brain.hook.pending_for(4)
+    assert fp is not None and fp.code == "auto_classifier"
+    task = asyncio.create_task(brain.gate.request(4, "force-push main", 2, fp.key))
+    await asyncio.sleep(0)
+    brain.gate.resolve(True)
+    assert await task is True
+    second = await brain._can_use_tool("Bash", {"command": "git push --force"}, ctx)
+    assert second.behavior == "allow"
+    other = await brain._can_use_tool("Bash", {"command": "rm -rf ~/x"}, SimpleNamespace(title="Claude wants to run rm", display_name="", description="", decision_reason="", suggestions=[], tool_use_id="t2"))
+    assert other.behavior == "deny"  # a different action: ask again
+    brain._active = None
+    await brain.close()

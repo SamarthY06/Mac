@@ -52,7 +52,7 @@ Out of scope, by design:
 The model can only ask. With `brain.confirm_outward = true` (the default) the confirmation token is minted by the orchestrator when the owner
 says yes to the summary, is bound to that tool and destination, expires in 120 seconds, and is
 checked in a `PreToolUse` hook outside the model's control; the model never sees it. The
-never-readable set and the `~/.mac-agent/` rule are checked in the same hook. With `confirm_outward = false` the owner delegates the send/post/pay decision to the model's judgement; the dangerous set stays enforced. Group
+never-readable set and the `~/.mac-agent/` rule are checked in the same hook. Independently of that switch, Claude Code's own permission classifier (`permission_mode = "auto"`) runs on every tool call and anything it escalates is put to the owner as a confirmation. With `confirm_outward = false` the owner delegates the send/post/pay decision to the model's judgement; the dangerous set stays enforced. Group
 context is capped (50 messages, 8,000 characters) and wrapped as untrusted. Logs carry ids,
 counts and timings, never text. Tests under `daemon/tests/test_gate_security_audit.py` encode
 the findings of the last internal audit.

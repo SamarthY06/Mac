@@ -111,7 +111,7 @@ CLI: `macctl settings get`, `macctl settings set tts.voice=bm_george tts.speed=1
 ## Configuration
 
 `~/.mac-agent/config.toml` (created with defaults on first run; `MAC_*` env vars override).
-Notable keys: `wake.phrases` (default `["hey mac", "ok mac"]`), `brain.confirm_outward` (false: the model decides when to ask before sending, posting or paying; dangerous actions stay blocked), the `listen.smart_turn` and
+Notable keys: `wake.phrases` (default `["hey mac", "ok mac"]`), `brain.confirm_outward` (false: the model decides when to ask before sending, posting or paying; dangerous actions stay blocked), `brain.permission_mode` (`auto`: Claude Code's own classifier checks every tool call and anything it escalates is asked of you; `bypassPermissions` turns that off), the `listen.smart_turn` and
 `listen.barge_in` settings above, `listen.followup_s`, `tts.voice`, `tts.engine` (`kokoro` | `clone`; the *Voice…* panel sets it), `brain.idle_shutdown_min`, `brain.setting_sources`
 (`["user"]` loads your own `~/.claude` MCP servers, skills and plugins into Mac; `[]` isolates),
 `results_dir` (`~/Documents/Mac`), `remote.enabled`.

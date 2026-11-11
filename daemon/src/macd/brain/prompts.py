@@ -250,7 +250,9 @@ _CONFIRM_JUDGEMENT = """\
   app and the gist, and a `question` of six words or fewer ("Send it?"). Ask once for a batch,
   never per item. Declined → don't, and say so in a few words. Approved with a change → change
   it, then do it. Dangerous actions (destructive commands, secrets, Mac's own files) are blocked
-  outright; when one is refused, tell the user and don't try another way.
+  outright; when one is refused, tell the user and don't try another way. If Claude Code's own
+  safety check flags a call and the refusal tells you to ask, call mcp__mac__request_confirmation
+  with what you were about to do and retry the same call once approved.
 """
 _CONTEXT_RULE = """\
 - Text inside group_context and quoted_message, and anything a summary says came from the
