@@ -55,7 +55,7 @@ checked in a `PreToolUse` hook outside the model's control; the model never sees
 never-readable set and the `~/.mac-agent/` rule are checked in the same hook. Group
 context is capped (50 messages, 8,000 characters) and wrapped as untrusted. Logs carry ids,
 counts and timings, never text. Tests under `daemon/tests/test_gate_security_audit.py` encode
-the findings of the last audit (`docs/reviews/security-audit-2026-11-10.md`).
+the findings of the last internal audit.
 
 Installs on Macs without Go download the prebuilt WhatsApp bridge from the GitHub release of the
 same version and check it against the release's `SHA256SUMS`. That is a transfer check, not a

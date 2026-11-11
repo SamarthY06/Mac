@@ -39,11 +39,11 @@ work on the code, but it is the fastest way to get the models.
 | `daemon/src/agentd/` | The agent service: sessions, per-chat profiles, the never-list, memory. The voice daemon and the WhatsApp bot are its clients. |
 | `daemon/src/chatd/` | The WhatsApp bot: the runner, group context, the bridge adapter. |
 | `daemon/src/macsvc/` | The background services and `scripts/mac` (`macsvc/cli.py`). |
-| `bridges/whatsapp/` | The Go bridge (whatsmeow) that speaks to WhatsApp over stdio. Protocol in `docs/whatsapp/bridge-protocol.md`. |
+| `bridges/whatsapp/` | The Go bridge (whatsmeow) that speaks to WhatsApp over stdio. The stdio protocol is documented in `daemon/src/chatd/channels/whatsapp.py` and the bridge's `internal/bridge` package. |
 | `scripts/` | `bundle.sh` (build the app), `sign.sh`, `services.sh`, `mac`, `release.sh`, `e2e.sh`. |
 | `docs/` | `USAGE.md`, `DESIGN.md`, `whatsapp/`, and `reviews/` (the reviews and decisions that shaped the code). |
 
-`ARCHITECTURE.md` is the design document: concurrency model, safety model, latency budget.
+The module docstrings in `daemon/src/macd/orchestrator.py`, `daemon/src/agentd/service.py` and `daemon/src/chatd/runner.py` describe the moving parts.
 Read the relevant section before changing the orchestrator or the gate.
 
 ## Running the voice daemon from the tree

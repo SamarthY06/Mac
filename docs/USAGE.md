@@ -167,8 +167,7 @@ Desktop or Documents). Allow it, or keep the repo outside those folders.
 
 ## How it works
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) (design, concurrency model, safety model, latency
-budget) and [docs/DESIGN.md](DESIGN.md) (UI). Short version:
+Short version:
 
 ```
 OpenMac.app (Swift)  ── mic w/ echo cancellation ──►  macd (Python)
@@ -196,7 +195,6 @@ cd daemon && uv run pytest -q -m live                         # needs claude log
 uv run macd --audio sounddevice   # headless daemon (permissions attribute to your terminal)
 ```
 
-Reviews that shaped the code (architecture, code quality, simplicity, UX) are in `docs/reviews/`.
 
 ## The mac command
 
