@@ -145,6 +145,7 @@ Then delete `~/OpenMac`. To unlink WhatsApp, remove this Mac under Settings, Lin
 ## More
 
 - [docs/USAGE.md](docs/USAGE.md): every command, settings, Chrome, authentication, the services, memory, development.
+- [docs/FAQ.md](docs/FAQ.md): Intel Macs, Windows, Linux, older macOS, API keys, where audio goes.
 - [CONTRIBUTING.md](CONTRIBUTING.md): dev setup, where things live, review expectations.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability, what is in scope.
 - [CHANGELOG.md](CHANGELOG.md).
