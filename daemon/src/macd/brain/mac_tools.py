@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import logging
 import re
@@ -419,6 +420,7 @@ class MacTools:
                  memory_check: MemoryCheck, on_say: Callable[[str], None],
                  on_confirm: Callable[[str, str, str, str], None],
                  pending_action: Callable[[int], ActionFingerprint | None] | None = None,
+                 confirm_outward: Callable[[], bool] = lambda: True,
                  on_notify: Callable[[str, str, str | None], Any] | None = None,
                  workspace: Path | None = None, memory_path: Path | None = None,
                  results_dir: Path | None = None, confirm_timeout_s: float = 45.0,
@@ -436,6 +438,7 @@ class MacTools:
         self.on_say = on_say
         self.on_confirm = on_confirm  # (summary, target, question, detail) -> emits the CONFIRM event
         self.pending_action = pending_action  # the hook's last denied outward action
+        self.confirm_outward = confirm_outward  # False: the model asks on its own judgement, unbound
         self.on_notify = on_notify  # (title, body, path) -> truthy if the app showed it
         self.workspace = workspace or config.WORKSPACE_DIR
         self.memory_path = memory_path or config.MEMORY_PATH
@@ -474,8 +477,13 @@ class MacTools:
             return _err(ALREADY_PENDING)
         turn = self.current_turn()
         fp = self.pending_action(turn) if self.pending_action else None
-        if fp is None:  # F1: a token is only ever bound to an action the hook has seen and denied
-            return _err(NOTHING_TO_CONFIRM)
+        if fp is None and self.confirm_outward():
+            return _err(NOTHING_TO_CONFIRM)  # F1: a token is only ever bound to an action the hook denied
+        if fp is None:  # confirmations are the model's judgement: ask, no token needed
+            action = f"judgement|{turn}|{hashlib.sha256(summary.encode()).hexdigest()[:12]}"
+            self.on_confirm(summary, "", question, "")
+            approved = await self.gate.request(turn, summary, self.confirm_timeout_s, action)
+            return _ok(APPROVED if approved else DECLINED)
         self.on_confirm(summary, fp.target, question, fp.detail)
         approved = await self.gate.request(turn, summary, self.confirm_timeout_s, fp.key)
         return _ok(APPROVED if approved else DECLINED)
@@ -707,11 +715,11 @@ class MacTools:
                      "announce steps (no \"On it.\", \"Opening X\"). Never internals (ids, fields, tools)."),
              {**obj, "properties": {"text": {"type": "string"}}, "required": ["text"]}, self.say),
             ("request_confirmation",
-             ("Ask the user to approve the outward action the safety check just refused "
+             ("Ask the user to approve an outward action: the one the safety check just refused, or, when confirmations are left to your judgement, an irreversible one the user did not clearly ask for "
               "(send/post/buy/delete/transfer). `summary`: one statement of at most "
               f"{SUMMARY_MAX_WORDS} words naming the recipient/target and the gist. `question`: the action "
               f"as a question of at most {QUESTION_MAX_WORDS} words ending in '?', e.g. 'Send it?', "
-              "'Delete it?', 'Book it?'. Waits for their answer. Only works right after a refusal."),
+              "'Delete it?', 'Book it?'. Waits for their answer."),
              {**obj, "properties": {"summary": {"type": "string"}, "question": {"type": "string"}},
               "required": ["summary", "question"]},
              self.request_confirmation),

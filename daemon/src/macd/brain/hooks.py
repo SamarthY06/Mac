@@ -294,8 +294,10 @@ class PreToolHook:
                  context: GateContext | None = None,
                  restrict: Callable[[str], str | None] | None = None,
                  on_decision: Callable[[HookDecision], None] | None = None,
-                 desktop: DesktopGuard | None = None) -> None:
+                 desktop: DesktopGuard | None = None,
+                 confirm_outward: Callable[[], bool] = lambda: True) -> None:
         self.gate = gate
+        self.confirm_outward = confirm_outward  # False: outward actions are the model's judgement
         self.current_turn = current_turn
         self.is_cancelled = is_cancelled
         self.memory_check = memory_check
@@ -359,6 +361,9 @@ class PreToolHook:
             fp = ActionFingerprint(turn, name, d.code, d.target, d.detail)
             if self.gate.consume(turn, fp.key):
                 self._record(turn, name, tool_use_id, True, d, "confirmed by the user")
+                return True, ""
+            if not self.confirm_outward():
+                self._record(turn, name, tool_use_id, True, d, "outward: the model's judgement")
                 return True, ""
             self.pending_action = fp
             reason = f"{REASON_OUTWARD} (Reason: {d.reason}.)"

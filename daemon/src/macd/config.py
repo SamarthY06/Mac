@@ -83,6 +83,10 @@ class BrainConfig:
     cli_path: str = ""  # empty = autodetect `claude` on PATH / ~/.local/bin
     model: str = ""  # empty = Claude Code default
     chrome: bool = True
+    # True: the hook refuses every outward action (send, post, pay, delete, upload) until the user
+    # says yes to that exact action. False: the model decides when to ask; the hook only blocks
+    # dangerous actions (destructive commands, secrets, Mac's own files, the never-list).
+    confirm_outward: bool = True
     setting_sources: list[str] = field(default_factory=lambda: ["user"])  # load ~/.claude MCP servers/skills/plugins; [] to isolate
     session_idle_rotate_min: int = 180  # after this long idle, handoff() writes memory and the next turn starts a fresh session
     idle_shutdown_min: int = 10  # kill the claude process after this long with no work
@@ -179,7 +183,7 @@ SETTABLE_KEYS: dict[str, type] = {
     "wake.phrases": list, "wake.kws_threshold": float,
     "listen.silence_ms": int, "listen.smart_turn": bool, "listen.turn_max_silence_ms": int, "listen.followup_s": float, "listen.max_utterance_s": float,
     "tts.voice": str, "tts.speed": float, "tts.lang": str, "tts.engine": str,
-    "brain.idle_shutdown_min": int, "brain.model": str, "brain.chrome": bool,
+    "brain.idle_shutdown_min": int, "brain.model": str, "brain.chrome": bool, "brain.confirm_outward": bool,
     "brain.setting_sources": list, "remote.enabled": bool,
 }
 

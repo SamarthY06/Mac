@@ -403,3 +403,30 @@ async def test_desktop_guard_chain_event_lock_then_flock(tmp_path: Path) -> None
     other.release()
     assert await guard.acquire(1, "t", lambda: False) == "ok"
     guard.release()
+
+
+async def test_prompt_and_tool_follow_confirm_outward(tmp_path: Path) -> None:
+    from macd.brain import prompts
+    from macd.brain.gate import ConfirmationGate
+    cfg = config.Config()
+    assert "cannot bypass" in prompts.persona_prompt(cfg)
+    cfg.brain.confirm_outward = False
+    text = prompts.persona_prompt(cfg)
+    assert "judgement call" in text and "cannot bypass" not in text and "once for a batch" in text
+    # with confirmations off, the model may ask without a prior refusal: the question is relayed and answered
+    gate = ConfirmationGate()
+    seen: dict[str, Any] = {}
+    tools = mt.MacTools(gate=gate, current_turn=lambda: 3, memory_check=lambda t, a: (True, "explicit"),
+                        on_say=lambda t: None, on_confirm=lambda s, tg, q, d: seen.update(summary=s, q=q),
+                        pending_action=lambda turn: None, confirm_outward=lambda: False,
+                        workspace=tmp_path, memory_path=tmp_path / "memory.md", results_dir=tmp_path,
+                        confirm_timeout_s=2)
+    task = asyncio.create_task(tools.request_confirmation({"summary": "send the list to Bob", "question": "Send it?"}))
+    for _ in range(50):
+        if gate.pending is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert seen["summary"] == "send the list to Bob" and seen["q"] == "Send it?"
+    gate.resolve(True)
+    res = await task
+    assert not res.get("is_error") and "approved" in str(res).lower()

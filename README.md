@@ -98,7 +98,9 @@ only: no polls, no buttons.
 
 - Irreversible actions wait for your yes to a summary of that exact action. The model can only
   ask. The token is minted when you say yes to the summary, is bound to that tool and
-  destination, and the model never sees it.
+  destination, and the model never sees it. Prefer the model's own judgement? Set
+  `confirm_outward = false` under `[brain]`: it then asks only when it thinks it should (once per
+  batch), and the hook blocks only dangerous actions.
 - Secrets are never readable: `~/.ssh`, keychains, browser profiles, `~/.aws` and similar.
   Tools can write only Mac's own workspace and memory under `~/.mac-agent`; settings, tokens
   and the WhatsApp link are never readable or writable.

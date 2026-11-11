@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `brain.confirm_outward` (default true): set it to false and the model decides when to ask before sending, posting or paying; the hook then blocks only dangerous actions (destructive commands, secrets, Mac's own files, the never-list).
 - "Stop everything" (chat and voice): ends the running task, its background agents and the session at once.
 - Voice: short progress lines every twenty to thirty seconds on long tasks, and mid-task questions answered at once.
 

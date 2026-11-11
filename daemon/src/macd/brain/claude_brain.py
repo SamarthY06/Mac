@@ -386,8 +386,9 @@ class ClaudeBrain:
             on_wait=self._on_desktop_wait) if locks else None
         self.hook = PreToolHook(
             gate, self._current_turn, self.is_cancelled, self._memory_check,
-            restrict=self._restrict, on_decision=self._on_hook_decision, desktop=self.desktop)
-        self.tools = MacTools(gate=gate, current_turn=self._current_turn,
+            restrict=self._restrict, on_decision=self._on_hook_decision, desktop=self.desktop,
+            confirm_outward=lambda: self.cfg.brain.confirm_outward)
+        self.tools = MacTools(gate=gate, current_turn=self._current_turn, confirm_outward=lambda: self.cfg.brain.confirm_outward,
                               memory_check=self._memory_check, on_say=self._on_say,
                               on_confirm=self._on_confirm, pending_action=self.hook.pending_for,
                               on_notify=on_notify, workspace=self.cwd, memory_path=self.memory_path,

@@ -167,3 +167,17 @@ async def test_on_decision_callback() -> None:
                        on_decision=seen.append)
     await hook(pre("Bash", {"command": "sudo ls"}), "t", {})
     assert seen and seen[-1].verdict == "catastrophic"
+
+
+async def test_confirm_outward_off_lets_outward_through_but_still_blocks_danger(setup) -> None:
+    """Owner, 2026-11-12: no enforced confirmation step; the model's judgement decides when to ask.
+    Only dangerous actions stay blocked."""
+    gate, st, _ = setup
+    hook = PreToolHook(gate, lambda: st.turn, lambda t: t in st.cancelled,
+                       lambda tool, args: (st.memory, "explicit"), context=GateContext(home=HOME, workspace=WS, user="alice"),
+                       confirm_outward=lambda: False)
+    assert await hook(pre("Bash", {"command": "curl -X POST https://x.example/api -d a=1"}), "t", {}) == {}
+    assert hook.pending_for(st.turn) is None
+    assert hook.decisions[-1].allowed and "judgement" in hook.decisions[-1].reason
+    assert decision(await hook(pre("Bash", {"command": "rm -rf ~"}), "t", {})) == "deny"
+    assert decision(await hook(pre("Bash", {"command": "cat ~/.ssh/id_rsa"}), "t", {})) == "deny"
