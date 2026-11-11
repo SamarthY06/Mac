@@ -17,10 +17,6 @@ say yes.
 The project is OpenMac; the assistant answers to Mac.
 
 <!-- DEMO -->
-<p align="center">
-  <a href="docs/media/demo.mp4"><img src="docs/media/demo.gif" alt="Demo: Hey Mac finds three trending GitHub repos, puts them in a note, gets interrupted mid-answer and opens the first one" width="900"></a>
-</p>
-<p align="center"><sub>One take, real Claude, synthetic voice for the requests. <a href="docs/media/demo.mp4">Full clip with the WhatsApp send (76 s)</a>.</sub></p>
 
 ## Quickstart
 
