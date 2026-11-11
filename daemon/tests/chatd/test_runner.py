@@ -767,6 +767,25 @@ async def test_shared_chat_binds_unprefixed_replies_on_prompts_only(shared: Worl
     assert shared.brain().confirm_results == [True, True]
 
 
+async def test_shared_chat_takes_unprefixed_replies_to_macs_messages(shared: World) -> None:
+    """Like typing into the CLI mid-task: a reply to Mac's status joins the running task (➕), no
+    "Mac" needed; a reply to Mac's finished answer is the next request."""
+    shared.agent.scripts[CHAT] = script({"go": [fb.say("Working", delay=0.05), *fb_slow(40)],
+                                         "thanks": [fb.text("Welcome.")]})
+    req = await shared.say("Mac, go")
+    status = await until(lambda: next((m for m in shared.ch.sent() if "Working" in m.text), None))
+    add = await shared.say("also check London", reply_to=status.message_id)
+    await until(lambda: shared.brain().steers)
+    await until(lambda: "➕" in shared.ch.reactions.get(add, []))
+    assert "also check London" in str(shared.brain().steers)
+    await shared.say("Mac stop")
+    await shared.done(req, "✋")
+    answer = shared.ch.sent()[-1]
+    nxt = await shared.say("thanks", reply_to=answer.message_id)
+    await shared.done(nxt)
+    assert request(shared.brain().asks[-1][1]) == "thanks"
+
+
 async def test_shared_chat_catch_up_only_counts_prefixed_messages(shared: World) -> None:
     now = time.time()
     await shared.say("chatting with my friend", replayed=True, sent_at=now - 300)

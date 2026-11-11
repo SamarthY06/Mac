@@ -865,7 +865,8 @@ class ChatRunner:
         """The trigger (W9.6), before everything else (catch-up, loop breaker, commands). A chat
         without an enabled profile gets nothing. In a prefix chat (every shared chat) only these
         count: text starting with the profile's prefix word (stripped), and a reply or 👍 on one
-        of Mac's own question prompts (agentd binds it; never a command). The rest is ignored
+        of Mac's own question prompts (agentd binds it; never a command), and a reply to any other
+        message of Mac's (a steer mid-turn, else a follow-up ask). The rest is ignored
         silently: no reaction, no reply, no log line with text, not marked as handled."""
         p = self.profiles.get(msg.chat_id)
         if p is None or msg.channel != self.adapter.name:
@@ -883,6 +884,8 @@ class ChatRunner:
         if on_prompt and msg.text.strip():
             self._unprefixed.add(msg.ref.message_id)
             return msg
+        if msg.reply_to is not None and msg.reply_to.from_mac and (msg.text.strip() or msg.attachments):
+            return msg  # a reply to one of Mac's messages is for Mac: mid-turn it joins the task (➕)
         log.debug("chatd: %s ignored (no prefix)", msg.ref.message_id)
         if msg.text.strip() or msg.attachments:  # your own non-trigger message: context (W10.2)
             media = {"kind": msg.attachments[0].kind, "name": msg.attachments[0].name} if msg.attachments else None
