@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/SamarthY06/OpenMac/blob/main/SECURITY.md
+    about: Found a way past the gate, or a leak? Report it privately. SECURITY.md says how.
+  - name: Usage questions
+    url: https://github.com/SamarthY06/OpenMac/blob/main/docs/USAGE.md
+    about: Commands, settings, Chrome pairing, the services and memory are documented here. If the docs are wrong, open a bug.

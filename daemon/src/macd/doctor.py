@@ -187,7 +187,7 @@ def check_mic() -> Check:
     pcm = np.concatenate(frames)
     if float(np.max(np.abs(pcm))) == 0.0:
         return Check("fail", "microphone", "all-zero input (permission denied?)",
-                     "Grant Microphone access to Mac.app (TCC attributes this probe to the calling process).")
+                     "Grant Microphone access to OpenMac.app (TCC attributes this probe to the calling process).")
     return Check("ok", "microphone (this terminal)", f"{len(pcm)} samples, peak {float(np.max(np.abs(pcm))):.3f}")
 
 
@@ -224,7 +224,7 @@ def daemon_status(timeout: float = 3.0) -> dict | None:  # type: ignore[type-arg
 def check_daemon() -> tuple[Check, dict | None]:  # type: ignore[type-arg]
     st = daemon_status()
     if st is None:
-        return Check("warn", "daemon", f"not reachable at {config.CONTROL_SOCK}", "Start Mac.app or run `macd`."), None
+        return Check("warn", "daemon", f"not reachable at {config.CONTROL_SOCK}", "Start OpenMac.app or run `macd`."), None
     return Check("ok", "daemon", f"state {st.get('state')}, up {st.get('uptime_s')}s"), st
 
 

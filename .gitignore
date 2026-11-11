@@ -12,3 +12,6 @@ dist/
 *.app
 models/
 .DS_Store
+*.wav
+*.aiff
+docs/media/*.mov

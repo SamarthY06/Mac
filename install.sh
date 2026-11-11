@@ -1,20 +1,57 @@
 #!/usr/bin/env bash
-# Mac, installer. Idempotent: safe to re-run after `git pull`.
+# OpenMac installer. Idempotent: safe to re-run after `git pull`.
 #
-#   ./install.sh               interactive install
+#   curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash
+#   curl -fsSL .../install.sh | bash -s -- --yes --no-open      (flags pass through)
+#   ./install.sh               interactive install from a checkout
 #   ./install.sh --yes         non-interactive (assume "yes" to installs, skip optional prompts)
 #   ./install.sh --no-models   skip speech model download
 #   ./install.sh --no-open     don't launch the app at the end
-#   ./install.sh --app-only    only rebuild + reinstall Mac.app (skip uv, models, LiveKit)
-#   ./install.sh --uninstall   remove Mac.app, settings and (optionally) data
+#   ./install.sh --app-only    only rebuild + reinstall OpenMac.app (skip uv, models, LiveKit)
+#   ./install.sh --uninstall   remove OpenMac.app, settings and (optionally) data
 #
-# Env: SIGN_IDENTITY (Developer ID for signing), LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET
+# Env: OPENMAC_DIR (checkout used by the one-liner, default ~/OpenMac), OPENMAC_REPO, OPENMAC_REF,
+#      SIGN_IDENTITY (Developer ID for signing), LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET
 #      (stored into the Keychain when given, also with --yes).
 set -euo pipefail
 
+# ------------------------------------------------------------------------- bootstrap (curl | bash)
+# Nothing before the exec may read stdin: bash runs a piped script as it arrives.
+OPENMAC_REPO="${OPENMAC_REPO:-https://github.com/SamarthY06/OpenMac.git}"
+OPENMAC_DIR="${OPENMAC_DIR:-$HOME/OpenMac}"
+bootstrap() {  # not inside a checkout (curl | bash, bash <(curl), a lone downloaded file): get one, hand over
+  local src="${BASH_SOURCE[0]:-}" a
+  [[ -f "$src" && -d "$(cd "$(dirname "$src")" && pwd)/daemon" ]] && return 0
+  for a in "$@"; do
+    if [[ $a == -h || $a == --help ]]; then
+      echo "usage: curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash -s -- [--yes] [--no-models] [--no-open]"
+      echo "       clones OpenMac into \$OPENMAC_DIR (default ~/OpenMac) and runs its install.sh"
+      exit 0
+    fi
+  done
+  echo "OpenMac: using a checkout in $OPENMAC_DIR"
+  if ! xcode-select -p >/dev/null 2>&1; then            # /usr/bin/git is only a shim without the CLT
+    xcode-select --install >/dev/null 2>&1 || true
+    echo "Install the Command Line Tools from the dialog that just opened (they bring git and Swift), then run this command again." >&2
+    exit 1
+  fi
+  if [[ -d "$OPENMAC_DIR/.git" ]]; then
+    echo "  $(git -C "$OPENMAC_DIR" remote get-url origin 2>/dev/null || echo "no remote") ($(git -C "$OPENMAC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null))"
+    git -C "$OPENMAC_DIR" pull --ff-only -q || echo "  ! could not update $OPENMAC_DIR (offline or local changes); installing what is there" >&2
+  elif [[ -e "$OPENMAC_DIR" ]]; then
+    echo "$OPENMAC_DIR exists and is not an OpenMac checkout. Move it, or set OPENMAC_DIR." >&2; exit 1
+  else
+    git clone --depth 1 ${OPENMAC_REF:+--branch "$OPENMAC_REF"} "$OPENMAC_REPO" "$OPENMAC_DIR"
+  fi
+  [[ -x "$OPENMAC_DIR/install.sh" ]] || { echo "$OPENMAC_DIR has no install.sh" >&2; exit 1; }
+  cd "$OPENMAC_DIR"
+  if { : </dev/tty; } 2>/dev/null; then exec ./install.sh "$@" </dev/tty; else exec ./install.sh "$@"; fi
+}
+bootstrap "$@"
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DAEMON_DIR="$ROOT/daemon"
-APP_DEST="$HOME/Applications/Mac.app"
+APP_DEST="${OPENMAC_APP_DEST:-$HOME/Applications/OpenMac.app}"
 BUNDLE_ID="io.github.macagent.Mac"
 KEYCHAIN_SERVICE="mac-agent"
 
@@ -26,7 +63,7 @@ for a in "$@"; do
     --no-open) OPEN=0 ;;
     --uninstall) UNINSTALL=1 ;;
     --app-only) APP_ONLY=1 ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -44,11 +81,29 @@ ask()  {  # ask "question" default(y|n) → 0 for yes
   ans="${ans:-$def}"; [[ $ans =~ ^[Yy] ]]
 }
 
-quit_app() {
-  if pgrep -f "Mac.app/Contents/MacOS/Mac" >/dev/null 2>&1; then
-    pkill -TERM -f "Mac.app/Contents/MacOS/Mac" || true   # app stops its daemon on SIGTERM
-    for _ in $(seq 1 40); do pgrep -f "Mac.app/Contents/MacOS/Mac" >/dev/null || break; sleep 0.25; done
+stop_app_at() {  # $1: an .app path; only that exact app (other copies may be live on purpose)
+  local exe="$1/Contents/MacOS/Mac"
+  if pgrep -f "$exe" >/dev/null 2>&1; then
+    pkill -TERM -f "$exe" || true   # app stops its daemon on SIGTERM
+    for _ in $(seq 1 40); do pgrep -f "$exe" >/dev/null || break; sleep 0.25; done
   fi
+}
+quit_app() { stop_app_at "$APP_DEST"; }
+
+legacy_app_cleanup() {  # the app was called Mac.app before 0.1.0; same bundle id, so it is ours
+  local p id
+  [[ -z ${OPENMAC_APP_DEST:-} ]] || return 0   # a custom destination (tests) never touches the real apps
+  for p in "/Applications/Mac.app" "$HOME/Applications/Mac.app"; do
+    [[ -d "$p" && "$p" != "$APP_DEST" ]] || continue
+    id="$(defaults read "$p/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+    [[ "$id" == "$BUNDLE_ID" ]] || continue
+    stop_app_at "$p"
+    if ask "Remove the old $p? (it is replaced by $APP_DEST)" y; then
+      rm -rf "$p" && ok "removed $p" || warn "could not remove $p (remove it by hand)"
+    else
+      warn "kept $p; do not run both apps at once"
+    fi
+  done
 }
 
 # ------------------------------------------------------------------------- uninstall
@@ -60,8 +115,10 @@ if [[ $UNINSTALL == 1 ]]; then
   fi
   rm -rf "$APP_DEST" && ok "removed $APP_DEST"
   [[ -L "$HOME/.local/bin/macctl" ]] && rm -f "$HOME/.local/bin/macctl" && ok "removed ~/.local/bin/macctl"
-  defaults delete "$BUNDLE_ID" >/dev/null 2>&1 && ok "removed app preferences" || true
-  tccutil reset All "$BUNDLE_ID" >/dev/null 2>&1 && ok "reset privacy permissions for $BUNDLE_ID" || true
+  if [[ ${OPENMAC_NO_DEFAULTS:-0} != 1 ]]; then
+    defaults delete "$BUNDLE_ID" >/dev/null 2>&1 && ok "removed app preferences" || true
+    tccutil reset All "$BUNDLE_ID" >/dev/null 2>&1 && ok "reset privacy permissions for $BUNDLE_ID" || true
+  fi
   if ask "Delete LiveKit/API secrets from the Keychain (service \"$KEYCHAIN_SERVICE\")?" n; then
     for acct in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET ANTHROPIC_API_KEY; do
       security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$acct" >/dev/null 2>&1 || true
@@ -75,16 +132,16 @@ if [[ $UNINSTALL == 1 ]]; then
     security delete-keychain "$HOME/Library/Keychains/mac-agent-signing.keychain-db" >/dev/null 2>&1 || true
     rm -rf "$HOME/.mac-agent/signing"; ok "removed signing identity"
   fi
-  echo; echo "${G}Mac has been uninstalled.${O} Logs remain in ~/Library/Logs/Mac."
+  echo; echo "${G}OpenMac has been uninstalled.${O} Logs remain in ~/Library/Logs/Mac."
   exit 0
 fi
 
-echo "${B}Mac, an always-on voice agent for macOS, powered by Claude${O}"
+echo "${B}OpenMac, an always-on voice agent for macOS, powered by Claude${O}"
 
 # ------------------------------------------------------------------------- system
 step "Checking your system"
-[[ $(uname -s) == Darwin ]] || die "Mac only runs on macOS."
-[[ $(uname -m) == arm64 ]] || die "Mac requires an Apple silicon Mac (arm64); found $(uname -m)."
+[[ $(uname -s) == Darwin ]] || die "OpenMac only runs on macOS."
+[[ $(uname -m) == arm64 ]] || die "OpenMac requires an Apple silicon Mac (arm64); found $(uname -m)."
 MACOS="$(sw_vers -productVersion)"
 [[ ${MACOS%%.*} -ge 14 ]] || die "macOS 14 (Sonoma) or newer is required; you have $MACOS."
 ok "macOS $MACOS on Apple silicon"
@@ -92,6 +149,11 @@ if ! xcrun --find swift >/dev/null 2>&1; then
   die "Swift toolchain not found. Install the Command Line Tools: xcode-select --install (then re-run)."
 fi
 ok "Swift $(xcrun swift --version 2>/dev/null | sed -n 's/.*Swift version \([0-9.]*\).*/\1/p' | head -1)"
+if command -v go >/dev/null 2>&1; then
+  ok "Go $(go version | awk '{print $3}'): the WhatsApp bridge is built locally"
+else
+  ok "Go not installed: the WhatsApp bridge is downloaded prebuilt by scripts/services.sh"
+fi
 
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 if [[ $APP_ONLY == 0 ]]; then
@@ -149,7 +211,7 @@ if [[ -z $CLAUDE ]]; then
   warn "The 'claude' CLI was not found. Mac uses your Claude Code sign-in."
   echo "    Install it with:  ${B}$CLAUDE_INSTALL_CMD${O}"
   echo "    (alternatives: brew install --cask claude-code  ·  npm install -g @anthropic-ai/claude-code)"
-  if [[ $YES == 0 ]] && ask "Install Claude Code now?" n; then
+  if [[ $YES == 0 && -t 0 ]] && ask "Install Claude Code now?" y; then  # never without a terminal to say no in
     bash -c "$CLAUDE_INSTALL_CMD" || warn "the installer reported an error"
     find_claude
     if [[ -n $CLAUDE ]]; then ok "installed $CLAUDE"
@@ -206,35 +268,40 @@ fi
 fi  # APP_ONLY
 
 # ------------------------------------------------------------------------- app
-step "Building Mac.app"
+step "Building OpenMac.app"
 "$ROOT/scripts/bundle.sh"
+legacy_app_cleanup
 quit_app
 mkdir -p "$HOME/Applications"
 rm -rf "$APP_DEST"
-ditto "$ROOT/build/Mac.app" "$APP_DEST"
+ditto "$ROOT/build/OpenMac.app" "$APP_DEST"
 ok "installed $APP_DEST"
-defaults write "$BUNDLE_ID" daemonDir "$DAEMON_DIR"
-ok "daemonDir = $DAEMON_DIR"
+if [[ ${OPENMAC_NO_DEFAULTS:-0} == 1 ]]; then
+  warn "OPENMAC_NO_DEFAULTS=1: daemonDir not written (test mode)"
+else
+  defaults write "$BUNDLE_ID" daemonDir "$DAEMON_DIR"
+  ok "daemonDir = $DAEMON_DIR"
+fi
 if codesign -dv "$APP_DEST" 2>&1 | grep -q "Signature=adhoc"; then
-  warn "Mac.app is ad-hoc signed: macOS will ask for permissions again after every rebuild."
+  warn "OpenMac.app is ad-hoc signed: macOS will ask for permissions again after every rebuild."
 fi
 
 # First-minute collision: don't launch (and prompt for permissions) while the models are
 # still missing, the app would show "voice unavailable" right away.
 if [[ $OPEN == 1 && ( $MODELS_OK == 1 || $MODELS == 0 || $APP_ONLY == 1 ) ]]; then
   open "$APP_DEST" --args --show
-  ok "Mac is running, look for the waveform icon in the menu bar; the Meet Mac window is open"
+  ok "OpenMac is running, look for the waveform icon in the menu bar; the Meet Mac window is open"
 elif [[ $OPEN == 1 ]]; then
-  warn "not opening Mac.app because the speech models are missing; run 'macctl models', then: open ~/Applications/Mac.app"
+  warn "not opening OpenMac.app because the speech models are missing; run 'macctl models', then: open $APP_DEST"
 fi
 
 echo
 echo "${B}Next steps${O} (the Meet Mac window walks you through them, in this order)"
 echo "  1. Permissions, allow Microphone, Accessibility, Automation, Screen Recording (Notifications optional)."
 echo "  2. Claude, the window shows whether Claude Code is installed and signed in; use its"
-echo "     “Install Claude Code…” / “Sign in…” buttons if not (they open Terminal for you)."
+echo "     “Install Claude Code…” / “Sign in…” buttons if not, or run 'claude' in a terminal once and sign in."
 echo "  3. Chrome (optional, for browser tasks), “Install extension…” then “Connect Chrome…”:"
 echo "     press Enter at the dialog, type /chrome, choose “Enabled by default”, then /exit."
 echo "  4. Try it, say ${B}“Hey Mac, what can you do?”${O} , or press ${B}⌥Space${O} to talk."
 echo "  Settings: ~/.mac-agent/config.toml   Logs: ~/Library/Logs/Mac/   CLI: macctl status"
-echo "  Menu bar icon → Permissions… reopens the Meet Mac window; so does double-clicking Mac.app."
+echo "  Menu bar icon → Permissions… reopens the Meet Mac window; so does double-clicking OpenMac.app."

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Build Mac.app:  swift build -c release → build/Mac.app → sign (scripts/sign.sh)
+# Build OpenMac.app:  swift build -c release → build/OpenMac.app → sign (scripts/sign.sh)
 #   scripts/bundle.sh [--debug]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG=release
 [[ ${1:-} == --debug ]] && CONFIG=debug
-VERSION="${MAC_VERSION:-0.1.0}"
+VERSION="${MAC_VERSION:-$(tr -d '[:space:]' <"$ROOT/VERSION")}"
 BUILD_NUM="${MAC_BUILD:-$(date +%Y%m%d%H%M)}"
 OUT="$ROOT/build"
-APP="$OUT/Mac.app"
+APP="$OUT/OpenMac.app"
 
 g=$'\033[32m'; o=$'\033[0m'
 step() { echo "${g}==>${o} $*"; }
@@ -43,8 +43,8 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleExecutable</key><string>Mac</string>
 	<key>CFBundleIdentifier</key><string>io.github.macagent.Mac</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-	<key>CFBundleName</key><string>Mac</string>
-	<key>CFBundleDisplayName</key><string>Mac</string>
+	<key>CFBundleName</key><string>OpenMac</string>
+	<key>CFBundleDisplayName</key><string>OpenMac</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$BUILD_NUM</string>
@@ -54,7 +54,7 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
-	<key>NSHumanReadableCopyright</key><string>MIT License. Copyright © Mac contributors.</string>
+	<key>NSHumanReadableCopyright</key><string>MIT License. Copyright © OpenMac contributors.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Mac listens for “Hey Mac” and your spoken requests. Audio is processed on this Mac.</string>
 	<key>NSAppleEventsUsageDescription</key>

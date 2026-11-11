@@ -1,8 +1,8 @@
 .PHONY: app install test daemon-test app-test e2e clean run
 
-APP := build/Mac.app
+APP := build/OpenMac.app
 
-app:            ## build + sign build/Mac.app
+app:            ## build + sign build/OpenMac.app
 	scripts/bundle.sh
 
 install:        ## full install (deps, models, app → ~/Applications)

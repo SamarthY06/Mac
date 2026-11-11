@@ -3,8 +3,9 @@
 # They start at login, restart after a crash and need no open terminal.
 #
 # The service never runs the working tree. install and update take a frozen snapshot of a commit
-# (git archive of HEAD) into ~/.mac-agent/release/<sha>, build the WhatsApp bridge from it, copy
-# the bridge to ~/.mac-agent/bin/wa-bridge, and point the LaunchAgent at that snapshot's code.
+# (git archive of HEAD) into ~/.mac-agent/release/<sha>, build the WhatsApp bridge from it (or,
+# without Go, download the prebuilt bridge of the snapshot's VERSION from the GitHub release),
+# copy the bridge to ~/.mac-agent/bin/wa-bridge, and point the LaunchAgent at that snapshot's code.
 # Edits in the repo change nothing until the next update.
 #
 #   scripts/services.sh install  [--allow-dirty]   snapshot HEAD, write the LaunchAgent, start it
@@ -28,6 +29,8 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOGS="$HOME/Library/Logs/Mac"
 STATUS="$MAC_DIR/run/services.json"
 KEEP=3
+BRIDGE_ASSET="wa-bridge-darwin-arm64"
+RELEASES_URL="${OPENMAC_RELEASES_URL:-https://github.com/SamarthY06/OpenMac/releases/download}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 DOMAIN="gui/$(id -u)"
 
@@ -77,7 +80,36 @@ Commit them first, or run again with --allow-dirty to use the last commit anyway
   [[ -x "$PY" ]] || die "The Python environment is missing ($PY). Run install.sh first."
 }
 
-# Snapshot HEAD into $RELEASES/<sha> with a built bridge. Prints the sha.
+# Leaves wa-bridge at $1/bridges/whatsapp/bin/wa-bridge. Built with Go when installed (MAC_BRIDGE=build
+# forces it), else downloaded for the snapshot's VERSION with a checksum check (MAC_BRIDGE=download).
+provide_bridge() {
+  local snap="$1" out="$1/bridges/whatsapp/bin/wa-bridge" mode="${MAC_BRIDGE:-auto}" ver tmp want have
+  if [[ "$mode" == auto ]]; then
+    if command -v go >/dev/null 2>&1; then mode=build; else mode=download; fi
+  fi
+  if [[ "$mode" == build ]]; then
+    make -s -C "$snap/bridges/whatsapp" build >&2 || return 1
+  else
+    ver="$(tr -d '[:space:]' <"$snap/VERSION" 2>/dev/null || true)"
+    [[ -n "$ver" ]] || { echo "This commit has no VERSION file and Go is not installed." >&2; return 1; }
+    tmp="$(mktemp -d "$snap/.bridge.XXXXXX")"
+    echo "Downloading the WhatsApp bridge v$ver (Go is not installed) ..." >&2
+    if ! curl -fsSL --proto '=https,file' --tlsv1.2 --retry 3 -o "$tmp/$BRIDGE_ASSET" "$RELEASES_URL/v$ver/$BRIDGE_ASSET" ||
+       ! curl -fsSL --proto '=https,file' --tlsv1.2 --retry 3 -o "$tmp/SHA256SUMS" "$RELEASES_URL/v$ver/SHA256SUMS"; then
+      rm -rf "$tmp"; return 1
+    fi
+    want="$(awk -v f="$BRIDGE_ASSET" '$2==f{print $1}' "$tmp/SHA256SUMS")"
+    have="$(shasum -a 256 "$tmp/$BRIDGE_ASSET" | awk '{print $1}')"
+    if [[ -z "$want" || "$want" != "$have" ]]; then
+      rm -rf "$tmp"; echo "checksum mismatch for $BRIDGE_ASSET" >&2; return 1
+    fi
+    mkdir -p "$(dirname "$out")" && install -m 0755 "$tmp/$BRIDGE_ASSET" "$out" && rm -rf "$tmp"
+    echo "v$ver" >"$(dirname "$out")/.source"
+  fi
+  [[ -x "$out" ]]
+}
+
+# Snapshot HEAD into $RELEASES/<sha> with a bridge. Prints the sha.
 snapshot() {
   local sha dir tmp
   sha="$(git -C "$REPO" rev-parse HEAD)"
@@ -86,11 +118,10 @@ snapshot() {
     mkdir -p "$RELEASES"
     tmp="$(mktemp -d "$RELEASES/.new.XXXXXX")"
     git -C "$REPO" archive --format=tar HEAD | tar -x -C "$tmp"
-    if ! make -s -C "$tmp/bridges/whatsapp" build >&2; then
+    if ! provide_bridge "$tmp"; then
       rm -rf "$tmp"
-      die "The WhatsApp bridge did not build from commit ${sha:0:12}. Is Go installed?"
+      die "The WhatsApp bridge did not build from commit ${sha:0:12}. Install Go (brew install go) or check the network, then try again."
     fi
-    [[ -x "$tmp/bridges/whatsapp/bin/wa-bridge" ]] || { rm -rf "$tmp"; die "The bridge build made no binary."; }
     touch "$tmp/.complete"
     rm -rf "$dir"
     mv "$tmp" "$dir"

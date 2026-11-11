@@ -216,7 +216,7 @@ struct OnboardingView: View {
     /// Shown when the menu bar icon is hidden by the notch / menu-bar overflow (Builder C sets it).
     private var hiddenHint: some View {
         Label {
-            Text("Mac’s menu bar icon is hidden by the notch. Close a few menu bar apps, or open this window any time by double-clicking Mac.app.")
+            Text("Mac’s menu bar icon is hidden by the notch. Close a few menu bar apps, or open this window any time by double-clicking OpenMac.app.")
                 .font(.callout).fixedSize(horizontal: false, vertical: true)
         } icon: {
             Image(systemName: "eye.slash").foregroundStyle(.orange).accessibilityHidden(true)

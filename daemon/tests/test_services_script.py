@@ -45,7 +45,7 @@ class World:
         (self.stub / "launchctl").write_text(LAUNCHCTL)
         (self.stub / "launchctl").chmod(0o755)
         env = {k: v for k, v in os.environ.items() if k not in ("MAC_HOME", "PYTHONPATH")}
-        self.env = {**env, "HOME": str(self.home), "LAUNCHCTL": str(self.stub / "launchctl"),
+        self.env = {**env, "HOME": str(self.home), "LAUNCHCTL": str(self.stub / "launchctl"), "MAC_BRIDGE": "build",
                     "STUB_DIR": str(self.stub), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
                     # isolated from the user's git config (signing, hooks, templates)
@@ -58,7 +58,8 @@ class World:
         return subprocess.run(["git", "-C", str(self.repo), *args], env=self.env, check=True,
                               capture_output=True, text=True).stdout.strip()
 
-    def commit(self, version: str) -> str:
+    def commit(self, version: str, release: str = "0.1.0") -> str:
+        (self.repo / "VERSION").write_text(f"{release}\n")
         (self.repo / "daemon" / "src" / "chatd" / "__init__.py").write_text(f"VERSION = {version!r}\n")
         (self.repo / "bridges" / "whatsapp" / "version.txt").write_text(f"bridge {version}\n")
         self.git("add", "-A")
@@ -163,6 +164,46 @@ def test_a_failed_bridge_build_switches_nothing(w: World) -> None:
     assert r.returncode == 1 and "did not build" in r.stderr
     assert w.current() == sha and w.snapshots() == {sha}
     assert not any(p.name.startswith(".new.") for p in w.releases.iterdir())
+
+
+def _fake_release(w: World, release: str, body: str, *, corrupt: bool = False) -> str:
+    """A file:// stand-in for github.com/<owner>/OpenMac/releases/download/v<release>/."""
+    d = w.root / "rel" / f"v{release}"
+    d.mkdir(parents=True)
+    asset = d / "wa-bridge-darwin-arm64"
+    asset.write_text(body)
+    asset.chmod(0o755)
+    digest = subprocess.run(["shasum", "-a", "256", str(asset)], capture_output=True, text=True, check=True).stdout.split()[0]
+    if corrupt:
+        digest = "0" * 64
+    (d / "SHA256SUMS").write_text(f"{digest}  wa-bridge-darwin-arm64\n")
+    return "file://" + str(w.root / "rel")
+
+
+def test_without_go_the_bridge_is_downloaded_for_the_snapshots_version(w: World) -> None:
+    sha = w.commit("v1", release="0.1.0")
+    w.env["MAC_BRIDGE"] = "download"
+    w.env["OPENMAC_RELEASES_URL"] = _fake_release(w, "0.1.0", "#!/bin/sh\necho prebuilt 0.1.0\n")
+    r = w.run("install")
+    assert r.returncode == 0, r.stderr
+    assert w.current() == sha and w.bridge() == "#!/bin/sh\necho prebuilt 0.1.0\n"
+    assert (w.releases / sha / "bridges" / "whatsapp" / "bin" / ".source").read_text() == "v0.1.0\n"
+    assert "Downloading the WhatsApp bridge v0.1.0" in r.stderr
+
+
+def test_a_bad_checksum_or_missing_release_switches_nothing(w: World) -> None:
+    sha = w.commit("v1")
+    assert w.run("install").returncode == 0  # built (MAC_BRIDGE=build)
+    w.env["MAC_BRIDGE"] = "download"
+    w.env["OPENMAC_RELEASES_URL"] = _fake_release(w, "0.2.0", "tampered\n", corrupt=True)
+    w.commit("v2", release="0.2.0")
+    r = w.run("update")
+    assert r.returncode == 1 and "checksum mismatch" in r.stderr and "Install Go" in r.stderr
+    assert w.current() == sha and w.snapshots() == {sha} and w.bridge() == "bridge v1\n"
+    assert not any(p.name.startswith(".new.") for p in w.releases.iterdir())
+    w.env["OPENMAC_RELEASES_URL"] = "file://" + str(w.root / "nowhere")
+    r = w.run("update")
+    assert r.returncode == 1 and w.current() == sha and w.snapshots() == {sha}
 
 
 def test_rollback_without_an_earlier_snapshot_and_uninstall(w: World) -> None:

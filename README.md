@@ -1,33 +1,60 @@
-# Hey Mac
+# OpenMac
 
-**Stop touching your Mac. Just talk to it.**
+**Talk to your Mac. It does the work, in your apps, and asks before anything leaves the machine.**
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](#quickstart)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black.svg)](#quickstart)
+[![CI](https://github.com/SamarthY06/OpenMac/actions/workflows/ci.yml/badge.svg)](https://github.com/SamarthY06/OpenMac/actions/workflows/ci.yml)
 
 Say *"Hey Mac, find three trending repos, put them in a note and send the list to my team on
-WhatsApp"* and it does it, across apps, while you sit back. It answers in a human voice, tells
-you what it found, and asks before anything leaves your machine. It also works from your
-WhatsApp groups: start a message with "Mac" and it does the job.
+WhatsApp"* and it does it, across apps, while you sit back. The brain is Claude (the full Claude
+Code agent loop through the Claude Agent SDK) with your own Claude login; the wake word, speech
+recognition, end-of-turn detection and voice run locally on your Mac. It also answers in the
+WhatsApp groups you add, and a deterministic safety gate blocks anything irreversible until you
+say yes.
+
+The project is OpenMac; the assistant answers to Mac.
 
 <!-- DEMO -->
 
-## Setup
+## Quickstart
 
-**You need:** an Apple Silicon Mac (macOS 14+), [Claude Code](https://code.claude.com/docs/en/quickstart)
-installed and signed in (`claude`, then `/login`), [uv](https://docs.astral.sh/uv/) (the installer
-gets it if missing) and, for WhatsApp, [Go](https://go.dev/dl/) (`brew install go`).
+You need an Apple Silicon Mac on macOS 14 or newer, [Claude Code](https://code.claude.com/docs/en/quickstart)
+installed and signed in (`claude`, then `/login`), and the Xcode Command Line Tools
+(`xcode-select --install`).
 
 ```bash
-git clone https://github.com/SamarthY06/Mac.git && cd Mac
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash
 ```
 
-The installer sets up Python, downloads the speech models (~700 MB), builds `Mac.app` and opens
-it. The **Meet Mac** window walks you through the permissions and pairing Chrome. Then say
-*"Hey Mac, what can you do?"*
+This clones the repo into `~/OpenMac`, installs [uv](https://docs.astral.sh/uv/) if needed, sets
+up Python, downloads the speech models (about 700 MB), builds `OpenMac.app` and opens it. The
+**Meet Mac** window walks you through the permissions and Chrome pairing.
 
-**Optional keys**, to talk to Mac from your phone over LiveKit or to use an Anthropic API key
-instead of your Claude login: store each one in the Keychain with `macctl secret set <NAME>`
-(the names are in `.env.example`). A `.env` file in the repo also works for the app; git
-ignores it.
+Then say: **"Hey Mac, what can you do?"**
+
+Flags pass through as `| bash -s -- --yes --no-open`. If you would rather look first:
+`git clone https://github.com/SamarthY06/OpenMac.git ~/OpenMac && cd ~/OpenMac && ./install.sh`.
+
+## What it can do
+
+- **Works across your apps**: Chrome (your own logged-in browser), Mail, WhatsApp, Notes,
+  Calendar, Reminders, Finder, Terminal. "Draft an email to Sam", "paste it in WhatsApp",
+  "looks good, send it".
+- **Holds a conversation**: talk over Mac and it pauses within a third of a second. A short
+  "yeah" lets it continue; real words stop it and become your next request, and Mac knows
+  which part of its answer you did and did not hear.
+- **Knows when you have finished a sentence**: a thinking pause mid-sentence does not end your
+  turn (Pipecat Smart Turn v3.2). You can keep talking during a task without the wake word.
+- **Sees your screen**: "what's this error?" and it looks. Works with the screen off or locked.
+- **Talks like a person**: short answers, one natural voice. 54 voices in 9 languages, or clone
+  your own voice locally. "Teach me consistent hashing" turns it into a tutor.
+- **Remembers you**: your name, preferences and projects, in a plain `memory.md` you can read.
+- **Safe by design**: anything irreversible (send, post, pay, delete, upload) is blocked by a
+  hook until you say "yes" to a spoken summary of that exact action.
+- **Light**: the app idles at about 1 % CPU; Claude starts on the wake word and shuts down after
+  10 quiet minutes. A real Off switch releases the microphone.
 
 ## Voice
 
@@ -35,7 +62,10 @@ ignores it.
 |---|---|
 | "Hey Mac, what's on my calendar tomorrow?" | answers by voice |
 | "Hey Mac, find 20 product managers in Bangalore on LinkedIn" | drives your Chrome, saves the list to `~/Documents/Mac/` |
-| "Hey Mac, draft an email to Sam" → "send it" | the send waits for your spoken **yes** |
+| "Hey Mac, draft an email to Sam", then "send it" | the send waits for your spoken **yes** |
+| "...and make it two sentences" (over Mac's voice) | pauses, drops the rest of its answer, takes the new request |
+| "also check Friday" (during a task, no wake word) | hears it and folds it into the running task |
+| "Hey Mac, give me one fun fact about... octopuses" | waits through the pause, answers once |
 | "stop" | stops at once |
 
 Menu bar: push-to-talk (⌥Space), Stop, Turn Off, Settings. Command line: `macctl`.
@@ -50,39 +80,31 @@ scripts/services.sh install        # run it in the background, at every login
 scripts/mac chats add "Family"     # add another group later
 ```
 
-**In a group**, Mac acts only on your own messages that start with "Mac" ("Mac, find me 20
-jobs"). Reply to a message with your request and Mac sees that message. Mac can tag people.
-It reads the group's last 50 messages, other members' included, so it can follow the
-conversation. Those messages go to Claude as context and are never treated as instructions.
-
-**Turning things off:**
-
-```bash
-scripts/mac chats                              # each group and what it may use
-scripts/mac chats deny "Family" reading group messages, the web
-scripts/mac chats off "Family"                 # Mac ignores the group
-scripts/mac chats remove "Family"              # forget it
-```
-
-You can also send "Mac, disallow reading group messages" in the group, or say "stop" to stop
-a task.
+In a group, only your own messages that start with "Mac" are requests ("Mac, find me 20 jobs").
+Reply to any of Mac's messages and the prefix is not needed. It reads the group's last 50
+messages (8,000 characters at most) so it can follow the conversation; those go to Claude as
+context and are never treated as instructions. Each group has its own persona and permissions
+(`scripts/mac chats deny "Family" Chrome, the web`, `chats off`, `chats remove`), and a
+never-list of chats Mac will never read or write (`never_chats` in the chat config). Plain text
+only: no polls, no buttons.
 
 ## Safety
 
-- Anything irreversible (send, post, pay, delete, upload) waits for your yes to a summary of
-  that exact action.
-- Mac never reads or writes the "Timetable" group. That never-list wins over every setting.
+- Irreversible actions wait for your yes to a summary of that exact action. The token is minted
+  from your words, bound to that one action, and the model never holds it.
+- Secrets are never readable: `~/.ssh`, keychains, browser profiles, `~/.aws` and similar.
+  Nothing under `~/.mac-agent` is writable by tools.
 - In WhatsApp, only your own messages are requests. Everyone else's are context.
-- The safety check is a rule-based filter, not a sandbox. Add only groups whose members you
-  trust, and deny writing files where you don't need it.
+- The gate is a rule-based filter, not a sandbox. Add only groups whose members you trust, and
+  deny writing files where you do not need it.
 
 ## Updates
 
 ```bash
-git pull && ./install.sh           # the app and the Python environment
-scripts/services.sh update         # the background services, from the commit you have checked out
-scripts/services.sh rollback       # back to the commit that ran before
-scripts/mac status                 # what is running, and whether WhatsApp is connected
+cd ~/OpenMac && git pull && ./install.sh   # the app and the Python environment (the one-liner also pulls)
+scripts/services.sh update                 # the background WhatsApp services
+scripts/services.sh rollback               # back to the commit that ran before
+scripts/mac status                         # what is running, and whether WhatsApp is connected
 ```
 
 The services run a frozen copy of a commit, so editing the repo never changes what runs.
@@ -101,10 +123,16 @@ scripts/services.sh uninstall      # stop the background services
 ./install.sh --uninstall           # remove the app, settings and (if you say so) data
 ```
 
-To unlink WhatsApp, remove this Mac under Settings ▸ Linked devices in WhatsApp on your phone.
+To unlink WhatsApp, remove this Mac under Settings, Linked devices in WhatsApp on your phone.
 
 ## More
 
-[docs/USAGE.md](docs/USAGE.md) has the details: every command, settings, Chrome, authentication,
-the services, memory and development. Design: [ARCHITECTURE.md](ARCHITECTURE.md). License: MIT
-([LICENSE](LICENSE)); the speech models carry their own licenses (see docs/USAGE.md).
+- [docs/USAGE.md](docs/USAGE.md): every command, settings, Chrome, authentication, the services, memory, development.
+- [ARCHITECTURE.md](ARCHITECTURE.md): design, concurrency model, safety model, latency budget.
+- [CONTRIBUTING.md](CONTRIBUTING.md): dev setup, where things live, review expectations.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability, what is in scope.
+- [CHANGELOG.md](CHANGELOG.md).
+
+License: MIT ([LICENSE](LICENSE)). The speech models carry their own licenses: sherpa-onnx
+Apache-2.0, Parakeet CC-BY-4.0, Kokoro Apache-2.0, Silero VAD MIT, Pipecat Smart Turn v3.2
+BSD-2-Clause, Kyutai Pocket TTS weights CC-BY-4.0.
