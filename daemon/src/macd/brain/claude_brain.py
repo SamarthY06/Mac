@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -52,6 +53,9 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -87,6 +91,9 @@ _SILENT_TOOLS = {SAY_TOOL, CONFIRM_TOOL}
 _SWITCH_TOOL = "mcp__mac__switch_workspace"
 HANDOFF_TURN = -1  # turn id of the silent session-handoff query (never emitted)
 PROBE_TURN = -2  # turn id of the silent connect_check probe query (never emitted)
+# Claude Code starts a query of its own when a background task (an Agent, a background Bash) it
+# launched finishes. Those turns get ids from here up; agentd delivers them as a new answer.
+WAKE_TURN_BASE = 1_000_000
 STEER_REPLY_TIMEOUT_S = 15.0
 PROBE_PROMPT = "Reply with exactly the word OK and nothing else. Do not use any tools."
 CONNECT_CHECK_TIMEOUT_S = 25.0
@@ -307,6 +314,9 @@ class ClaudeBrain:
         self._handoff_enabled = handoff_enabled
         self._announce_fallback = on_resume_fallback == "status"
         self._max_turn_arg = max_turn_s
+        self._bg_tasks: set[str] = set()  # background tasks the CLI reported as running
+        self._wake_ok = False  # a task finished with no turn running: the CLI's next query is its own
+        self._wakes = 0
         self._write_claude_md = write_claude_md
         self._sources_arg = setting_sources
         self._channel = channel
@@ -677,7 +687,9 @@ class ClaudeBrain:
         return self._frontmost() or self.tools.registry.current_app
 
     def is_cancelled(self, turn_id: int) -> bool:
-        if not turn_id or turn_id in self._cancelled:
+        if not turn_id:  # no turn: only a background task the CLI still runs may act (normal gate)
+            return not self._bg_tasks
+        if turn_id in self._cancelled:
             return True
         a = self._active
         return bool(a and a.turn_id == turn_id and a.draining)
@@ -956,6 +968,8 @@ class ClaudeBrain:
         reader, client = self._reader, self._client
         self._reader, self._client = None, None
         self._gen += 1  # anything still queued from the old reader is stale
+        self._bg_tasks.clear()  # they die with the CLI
+        self._wake_ok = False
         if client is not None:
             self._report_alive(False)
         await self._close_client(client, reader)
@@ -1217,6 +1231,8 @@ class ClaudeBrain:
         now = self._clock()
         if a is None:
             limit = self.cfg.brain.idle_shutdown_min * 60
+            if self._bg_tasks:
+                self._idle_at = now  # never idle while a background task runs: sleeping would kill it
             if self._client is not None and limit > 0 and now - self._idle_at >= limit:
                 log.info("brain: idle for %d min; shutting the CLI down", self.cfg.brain.idle_shutdown_min)
                 rotate = self._rotate_min()
@@ -1308,6 +1324,8 @@ class ClaudeBrain:
                 self._rate_reset_at = msg.rate_limit_info.resets_at
             return
         a = self._active
+        if a is None and self._wake_ok and isinstance(msg, (AssistantMessage, StreamEvent, UserMessage)):
+            a = self._start_wake_turn()
         if a is None:
             log.debug("brain: dropping %s with no active turn", type(msg).__name__)
             return
@@ -1324,7 +1342,31 @@ class ClaudeBrain:
         elif isinstance(msg, UserMessage):
             self._on_user(a, msg)
 
+    def _start_wake_turn(self) -> _Turn:
+        """A background task finished after the turn ended, and the CLI answers it on its own (a
+        task notification). That query is a turn like any other; agentd posts it as a new answer."""
+        self._wake_ok = False
+        self._wakes += 1
+        self._active = _Turn(WAKE_TURN_BASE + self._wakes, self._clock() + self._max_turn_s())
+        log.info("brain: a background task finished; Claude is reporting back (turn %d)", self._active.turn_id)
+        return self._active
+
+    def _on_task(self, msg: SystemMessage) -> None:
+        if isinstance(msg, TaskStartedMessage):
+            self._bg_tasks.add(msg.task_id)
+            return
+        if isinstance(msg, TaskUpdatedMessage):
+            patch = msg.patch if isinstance(msg.patch, dict) else {}
+            if (msg.status or patch.get("status")) not in TERMINAL_TASK_STATUSES:
+                return
+        self._bg_tasks.discard(msg.task_id)
+        if isinstance(msg, TaskNotificationMessage) and self._active is None:
+            self._wake_ok = True
+
     def _on_system(self, msg: SystemMessage) -> None:
+        if isinstance(msg, (TaskStartedMessage, TaskNotificationMessage, TaskUpdatedMessage)):
+            self._on_task(msg)
+            return
         if msg.subtype == "compact_boundary":
             self._on_compacted(msg.data or {})
             return

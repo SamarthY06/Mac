@@ -669,3 +669,22 @@ async def test_brain_on_alive_callback_pushes_status(agent):
     b.alive = False  # ClaudeBrain's idle shutdown, reported through on_alive
     b.spec.on_alive(False)
     assert (await c.event("status", pred=alive))["data"] == {"alive": False}
+
+
+async def test_chat_brain_reporting_back_after_a_background_task_is_a_new_turn(agent):
+    """Claude answers a finished background task on its own (WAKE_TURN_BASE ids): a new turn with
+    its own uid, so chatd adopts it and posts it as a new message (live 2026-11-11)."""
+    from macd.brain.claude_brain import WAKE_TURN_BASE
+    from macd.contracts import BrainEvent, BrainEventKind
+
+    c = await agent.client(CHAT_TOKEN, [CHAT])
+    uid = (await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "scan in the background"}))["data"]["turn_uid"]
+    await c.event("done")
+    conv = agent.svc.convs[CHAT]
+    wake = WAKE_TURN_BASE + 1
+    await conv.brain._out.put(BrainEvent(BrainEventKind.TEXT, wake, text="Found 3 roles."))
+    await conv.brain._out.put(BrainEvent(BrainEventKind.DONE, wake))
+    ev = await c.event("text", pred=lambda e: e["text"] == "Found 3 roles.")
+    assert ev["turn_uid"] != uid
+    assert (await c.event("done"))["turn_uid"] == ev["turn_uid"]
+    assert conv.running() is None and conv.record.running is None

@@ -68,8 +68,11 @@ def test_f14_old_prompts_never_bind():
     assert not bind(None, reply(text="yes"), NOW).bound
 
 
-def test_folder_approval_needs_quote_or_reaction():
-    assert not bind(q(K.FOLDER_APPROVAL), reply(text="yes"), NOW).bound
+def test_folder_approval_takes_an_exact_yes_or_no():
+    assert bind(q(K.FOLDER_APPROVAL), reply(text="yes"), NOW).outcome is s.ReplyOutcome.APPROVED
+    assert bind(q(K.FOLDER_APPROVAL), reply(text="no"), NOW).outcome is s.ReplyOutcome.DENIED
+    assert not bind(q(K.FOLDER_APPROVAL), reply(text="sure thing buddy"), NOW).bound
+    assert not bind(q(K.PROFILE), reply(text="yes"), NOW).bound  # profile changes stay quote-only
     assert bind(q(K.FOLDER_APPROVAL), reply(text="yes", quoted_ref="p1"), NOW).outcome is s.ReplyOutcome.APPROVED
     assert bind(q(K.FOLDER_APPROVAL), reply(reaction="\U0001F44D", reaction_on="p1"), NOW).bound
     assert not bind(q(K.FOLDER_APPROVAL), reply(text="sure thing buddy", quoted_ref="p1"), NOW).bound

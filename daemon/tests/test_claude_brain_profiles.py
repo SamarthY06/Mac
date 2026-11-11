@@ -485,3 +485,53 @@ async def test_error_without_known_reset_has_no_reset_at(make) -> None:
     await brain.close()
     assert err.error_kind is not None and err.error_kind.value == "rate_limit"
     assert "reset_at" not in err.data
+
+
+# ----------------------------------------------------------------------------- background tasks
+
+
+def _task_started(tid: str = "bg1") -> Any:
+    from claude_agent_sdk import TaskStartedMessage
+    return TaskStartedMessage(subtype="task_started", data={}, task_id=tid, description="scan", uuid="u1",
+                              session_id="sess-1")
+
+
+def _task_done(tid: str = "bg1") -> Any:
+    from claude_agent_sdk import TaskNotificationMessage
+    return TaskNotificationMessage(subtype="task_notification", data={}, task_id=tid, status="completed",
+                                   output_file="", summary="done", uuid="u2", session_id="sess-1")
+
+
+async def test_background_task_keeps_working_and_reports_back_as_a_new_turn(make) -> None:
+    """Live 2026-11-11: the turn ended, the background agent's next tool was denied as "the user
+    cancelled", and Claude's report after the task finished was dropped."""
+    def r(c: MockClient, p: str) -> None:
+        c.push(init(), _task_started(), delta("Scanning in the background."), result())
+    brain = make(r, chat=True)
+    await brain.start()
+    await brain.ask(1, "scan the list")
+    evs = await collect(brain)
+    assert evs[-1].kind == K.DONE and evs[-1].turn_id == 1
+    allowed = await brain.hook(pre("Bash", {"command": "ls"}), "b")  # the background agent, no turn
+    assert allowed == {}
+    assert not brain.is_cancelled(0)
+    c = MockClient.instances[0]
+    c.push(_task_done(), assistant(cb.TextBlock("Found 3 roles.")), result())  # the CLI's own query
+    wake = await collect(brain)
+    await brain.close()
+    assert {e.turn_id for e in wake} == {cb.WAKE_TURN_BASE + 1}
+    assert [e.text for e in wake if e.kind == K.TEXT] == ["Found 3 roles."] and wake[-1].kind == K.DONE
+    assert brain.is_cancelled(0)  # nothing runs any more: a stray call with no turn stays refused
+
+
+async def test_late_messages_without_a_finished_task_are_still_dropped(make) -> None:
+    def r(c: MockClient, p: str) -> None:
+        c.push(init(), delta("Hi."), result())
+    brain = make(r, chat=True)
+    await brain.start()
+    await brain.ask(1, "hi")
+    await collect(brain)
+    MockClient.instances[0].push(assistant(cb.TextBlock("stray")), result())
+    await asyncio.sleep(0.1)
+    await brain.close()
+    assert brain._active is None and brain._wakes == 0

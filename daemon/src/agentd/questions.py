@@ -26,7 +26,10 @@ YES = frozenset({"yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "send i
 NO = frozenset({"no", "n", "nope", "cancel", "don't", "dont", "do not", "no thanks", "don't send it",
                 "dont send it", "deny", "skip"})
 # a change to what Mac may do or where: a quoted yes or a 👍 on the prompt only, exact words (M5, N7)
-_QUOTE_ONLY = frozenset({s.QuestionKind.FOLDER_APPROVAL, s.QuestionKind.PROFILE})
+_QUOTE_ONLY = frozenset({s.QuestionKind.PROFILE})
+# exact yes/no only. Folder approval binds the owner's plain "yes" too: needing a swipe-reply left
+# every ask waiting out the 10-minute timeout in groups (live 2026-11-11)
+_STRICT = frozenset({s.QuestionKind.FOLDER_APPROVAL, s.QuestionKind.PROFILE})
 _THUMBS = re.compile("^\U0001F44D[\U0001F3FB-\U0001F3FF]?️?$")
 
 
@@ -98,7 +101,7 @@ def bind(q: Question | None, reply: s.Reply, now: float) -> Binding:
                 return Binding(False)
         elif q.kind in _QUOTE_ONLY:
             return Binding(False)
-        answer = yes_no(text, strict=q.kind in _QUOTE_ONLY)
+        answer = yes_no(text, strict=q.kind in _STRICT)
     k = q.kind
     if k is s.QuestionKind.CONFIRM:
         if answer == "yes":
@@ -106,7 +109,7 @@ def bind(q: Question | None, reply: s.Reply, now: float) -> Binding:
         if answer == "no":
             return Binding(True, s.ReplyOutcome.DENIED)
         return Binding(True, s.ReplyOutcome.CHANGED, steer_text=text)
-    if k in _QUOTE_ONLY:
+    if k in _STRICT:
         if answer is None:
             return Binding(False)
         return Binding(True, s.ReplyOutcome.APPROVED if answer == "yes" else s.ReplyOutcome.DENIED)

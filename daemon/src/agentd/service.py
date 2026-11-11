@@ -56,6 +56,7 @@ from agentd.workspaces import (
     resolve_user_path,
     under,
 )
+from macd.brain.claude_brain import WAKE_TURN_BASE
 from macd.brain.gate import ConfirmationGate
 from macd.contracts import Brain, BrainEvent, BrainEventKind
 from macd.settings import rename_refusal
@@ -419,7 +420,12 @@ class Conversation:
 
     def _resumed(self, ev: BrainEvent) -> Turn | None:
         """Voice: a steer that crossed the turn's DONE makes the brain run a new query on the
-        same turn (local ClaudeBrain semantics). Its events continue that turn, as in local mode."""
+        same turn (local ClaudeBrain semantics). Its events continue that turn, as in local mode.
+        Chat: Claude reporting back on its own after a background task finished is a new turn."""
+        if not self.voice:
+            if ev.turn_id < WAKE_TURN_BASE or self.running() is not None:
+                return None
+            return self.svc.wake_turn(self, ev.turn_id)
         last = self.last_finished
         if not self.voice or last is None or last.internal != ev.turn_id or last.stopping or self.running():
             return None
@@ -1214,6 +1220,19 @@ class Service:
         if path == current and session == "same":
             return "the request is already in that folder"
         return path, session
+
+    def wake_turn(self, c: Conversation, internal: int) -> Turn:
+        """The brain's own query (a background task finished): a turn with a new uid, so chatd
+        adopts it and posts the answer as a new message."""
+        uid = s.turn_uid(self.boot, c.conv, AGENTD_EPOCH, internal)
+        t = Turn(internal, uid, AGENTD_EPOCH, internal, "", time.monotonic())
+        t.in_brain = True
+        c.uids.add(uid)
+        c.turn = t
+        c.turns[internal] = t
+        c.record.running = RunningTurn(t.uid, t.text, self.clock())
+        self.save_soon()
+        return t
 
     def next_internal(self) -> int:
         self._next_internal += 1

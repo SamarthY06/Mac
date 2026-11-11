@@ -75,7 +75,7 @@ def test_scan_details_and_prompt(tree):
     assert "home:Desktop/CLAUDE.md" in scan.files and "folder:scripts/check.py" in scan.files
     text = approval_text("Resume", scan)
     assert text.startswith("Resume has its own Claude setup (skills: ai-job-hunt; hooks: ")
-    assert text.endswith("Use Resume as a workspace? Reply to this message with yes.")
+    assert text.endswith("Use Resume as a workspace? Say yes or no.")
     assert "—" not in text
 
 
@@ -130,15 +130,15 @@ def _proj(agent) -> Path:
     return proj
 
 
-async def test_chat_folder_approval_needs_quote_then_loads_project_settings(agent):
+async def test_chat_folder_approval_plain_yes_then_loads_project_settings(agent):
     proj = _proj(agent)
     c = await agent.client(CHAT_TOKEN, [CHAT])
     await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "find jobs in the Resume folder"})
     q = await c.event("question")
     assert q["kind"] == "folder_approval" and q["text"].startswith("Resume has its own Claude setup")
     await c.call({"op": "question_posted", "conv": CHAT, "question_id": q["question_id"], "msg_ref": "p1"})
-    assert (await c.call({"op": "reply", "conv": CHAT, "text": "yes"}))["data"] == {"bound": False}
-    r = await c.call({"op": "reply", "conv": CHAT, "text": "yes", "quoted_ref": "p1"})
+    assert (await c.call({"op": "reply", "conv": CHAT, "text": "maybe later"}))["data"] == {"bound": False}
+    r = await c.call({"op": "reply", "conv": CHAT, "text": "yes"})
     assert r["data"] == {"bound": True, "outcome": "approved"}
     await c.event("done")
     spec = agent.brain(CHAT).spec

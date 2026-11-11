@@ -250,7 +250,7 @@ def approval_text(name: str, scan: SettingsScan) -> str:
              f"hooks: {'; '.join(c[:80] for c in scan.hooks)}" if scan.hooks else "no hooks",
              f"servers: {'; '.join(x[:80] for x in scan.servers)}" if scan.servers else "no extra servers"]
     return (f"{name} has its own Claude setup ({'; '.join(parts)}). Use {name} as a workspace? "
-            "Reply to this message with yes.")
+            "Say yes or no.")
 
 
 # ----------------------------------------------------------------------------- Spotlight (N-a)
