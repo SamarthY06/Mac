@@ -271,6 +271,12 @@ _AS_DO_SHELL = re.compile(r"do\s+shell\s+script\s+\"((?:[^\"\\]|\\.)*)\"")
 _FORK_BOMB = re.compile(r"(\S+)\s*\(\s*\)\s*\{[^}]*\1\s*\|\s*\1\s*&[^}]*\}")
 _FORK_BOMB_LITERAL = re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}")
 
+# A string literal inside a script is re-read as a shell command line only when it starts like
+# one (a command name or a path, possibly after a substitution): `cat ~/.ssh/id_rsa`, `/bin/sh -c`.
+# Regexes (`(?is)<(script|style)[^>]*>.*?</\\1>`, `[\\s\\S]*?`) and globs are not command lines;
+# parsed as one, `<` became an input redirect from the "file" `.*?`, which as a glob matches
+# `.env` (live 2026-11-11: job-hunt HTML stripping denied as a credential read).
+_COMMAND_LIKE = re.compile(r"^\s*(\$\(|`|[\w./~-]+(\s|$))")
 _INTERP_DELETE = re.compile(r"rmtree|os\.remove|os\.unlink|unlink(sync)?\s*\(|rmdir|rm_rf|rimraf|"
                             r"fs\.rm|shutil\.move|file\.delete|remove_dir_all")
 _INTERP_UPLOAD = re.compile(
@@ -720,7 +726,8 @@ class _BashAnalyzer:
         found: list[GateDecision] = []
         literals = [m.group(2) for m in _STRING_LITERAL.finditer(payload)]
         for lit in literals:
-            found.append(self.analyze(lit, depth + 1))
+            if _COMMAND_LIKE.match(lit):
+                found.append(self.analyze(lit, depth + 1))
             reason = self.p.sensitive_reason(lit, self.cwd)
             if reason and ("/" in lit or lit.startswith("~")):
                 found.append(GateDecision("sensitive_read", "sensitive_path", reason))

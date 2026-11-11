@@ -1004,6 +1004,9 @@ class ClaudeBrain:
             self._cancelled.discard(cmd.turn_id)
             return
         a = self._active
+        if a is not None and a.turn_id >= WAKE_TURN_BASE and not a.draining and self._client is not None:
+            await self._join_wake_turn(a, cmd)
+            return
         if a is not None:
             if not a.draining:
                 log.info("brain: new ask %d supersedes running turn %d", cmd.turn_id, a.turn_id)
@@ -1011,6 +1014,23 @@ class ClaudeBrain:
             self._pending.append(cmd)
             return
         await self._start_turn(cmd)
+
+    async def _join_wake_turn(self, a: _Turn, cmd: _Cmd) -> None:
+        """A message arrived while Claude was reporting back on a finished background task, before
+        that report reached agentd (so agentd saw nothing running and sent an ask). Interrupting
+        would cut the report and, if the interrupt stalls, reconnect and kill every background
+        agent still running (live 2026-11-11, Job Hunt). Instead the message joins that query like
+        a steer and the query becomes this ask's turn: one reply covers both."""
+        log.info("brain: ask %d joins Claude's report-back (turn %d); background work keeps running", cmd.turn_id, a.turn_id)
+        a.turn_id = cmd.turn_id
+        a.texts.append(cmd.text)
+        a.queries += 1
+        self._last_activity = self._wall()
+        assert self._client is not None
+        try:
+            await self._client.query(cmd.text)
+        except Exception as e:  # noqa: BLE001
+            await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
 
     async def _ensure_connected(self) -> errors.ClassifiedError | None:
         """Lazy connect (ask/warm). Rotates the session if idle for too long (voice profile), and

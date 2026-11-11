@@ -226,6 +226,15 @@ class ListenerImpl:
         self._phrases = phrases
 
     def set_speaking(self, speaking: bool, current_text: str = "") -> None:
+        c = self._capture
+        if (speaking and not self.speaking and c is not None and (not c.woke or c.produced_text)
+                and c.window is not WindowReason.SPEAKING and c.speech_seen and self.aec and self._cfg.listen.barge_in):
+            # Mac starts talking while the user is still mid-utterance (live 2026-11-11: Smart Turn
+            # kept a thinking pause open, the reply started and talked over them). The capture
+            # becomes a barge-in: the next voiced frames pause Mac, and the words are judged as
+            # speech over Mac (merged, steered or a new turn, as for any barge-in). A wake capture
+            # that already yielded its command (kept open for a follow-on) is the same case.
+            c.window, c.barge, c.onset_sent, c.woke = WindowReason.SPEAKING, True, False, False
         if self.speaking and not speaking:
             if not self.aec:
                 self._guard_until = self._pos + self._tail_guard

@@ -535,3 +535,43 @@ async def test_late_messages_without_a_finished_task_are_still_dropped(make) -> 
     await asyncio.sleep(0.1)
     await brain.close()
     assert brain._active is None and brain._wakes == 0
+
+
+async def test_message_during_report_back_joins_it_and_never_kills_background_work(make) -> None:
+    """Live 2026-11-11 (Job Hunt): a message arrived while Claude was reporting back on one finished
+    background agent. It superseded that query, the interrupt stalled, the brain reconnected and
+    every other background search died ("The user cancelled this request")."""
+    def r(c: MockClient, p: str) -> None:
+        if p == "find 20 jobs":
+            c.push(init(), _task_started("a"), _task_started("b"), delta("Searching."), result())
+    brain = make(r, chat=True)
+    await brain.start()
+    await brain.ask(1, "find 20 jobs")
+    await collect(brain)
+    c = MockClient.instances[0]
+    c.push(_task_done("a"))  # agent "a" finished: the CLI starts reporting back (still thinking)
+    for _ in range(50):
+        if brain._wake_ok:
+            break
+        await asyncio.sleep(0.01)
+    from claude_agent_sdk import ThinkingBlock
+    c.push(assistant(ThinkingBlock("thinking", "sig")))  # first message of the report-back query
+    for _ in range(50):
+        if brain._active is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert brain._active is not None and brain._active.turn_id == cb.WAKE_TURN_BASE + 1
+    await brain.ask(2, "how many so far?")  # agentd saw nothing running: an ask, not a steer
+    await asyncio.sleep(0.05)
+    assert c.interrupts == 0 and not c.disconnected
+    assert c.queries[-1] == "how many so far?" and brain._active.turn_id == 2
+    # the CLI ends the report-back query, then answers the joined message (one result per query)
+    c.push(assistant(cb.TextBlock("Agent a found 12 roles.")), result(),
+           assistant(cb.TextBlock("12 so far; b is still searching.")), result())
+    evs = await collect(brain)
+    assert [e.text for e in evs if e.kind == K.TEXT and e.text.strip()] == ["Agent a found 12 roles.", "12 so far; b is still searching."]
+    assert {e.turn_id for e in evs} == {2} and evs[-1].kind == K.DONE
+    assert "b" in brain._bg_tasks and not brain.is_cancelled(0)  # agent b still allowed to work
+    allowed = await brain.hook(pre("Bash", {"command": "ls"}), "b")
+    assert allowed == {}
+    await brain.close()

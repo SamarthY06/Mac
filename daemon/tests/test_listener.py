@@ -419,3 +419,113 @@ async def test_smart_turn_skips_no_aec_stop_word_captures():
     kinds, _, _ = await run(audio((1.0, 1.4), total_s=4.0), wake_at=None, stt=FakeSTT("stop"), turn=turn,
                                  before=lambda l: l.set_speaking(True, "a long answer"))
     assert K.UTTERANCE in kinds and turn.seen == []
+
+
+
+async def test_mac_starting_to_speak_mid_utterance_turns_it_into_a_barge_in():
+    """Live 2026-11-11: the user was still talking (Smart Turn held a thinking pause open) when
+    the reply started; the open capture was a TURN capture, so Mac never paused and talked over
+    them. Now the capture becomes a barge-in: BARGE_IN on the next voiced frames, window SPEAKING."""
+    lis_box = []
+
+    class SpeakAt(FakeVAD):
+        spoke = False
+
+        def accept(self, frame):
+            if not SpeakAt.spoke and lis_box[0]._pos >= 2.4 * SAMPLE_RATE:  # Mac's reply starts in the pause
+                SpeakAt.spoke = True
+                lis_box[0].set_speaking(True, "The best people to connect with")
+            return super().accept(frame)
+
+    cfg = Config()
+    src = FileInput(audio((1.0, 2.0), (2.6, 3.4), total_s=6.0), trailing_silence_s=0.5)
+    lis = ListenerImpl(src, None, SpeakAt(), FakeSTT("you can get my profile from the resume folder"), cfg,
+                       aec=True, turn=FakeTurn(0.05, 0.9))
+    lis_box.append(lis)
+    lis.open_window(3600, WindowReason.TURN)
+    events = []
+
+    async def collect():
+        async for ev in lis.events():
+            events.append(ev)
+
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
+    kinds = [e.kind for e in events]
+    assert kinds == [K.SPEECH_START, K.BARGE_IN, K.UTTERANCE], kinds
+    (utt,) = [e.utterance for e in events if e.utterance]
+    assert utt.window is WindowReason.SPEAKING and "resume folder" in utt.text
+
+
+async def test_mid_utterance_speech_start_without_aec_keeps_the_turn_capture():
+    lis_box = []
+
+    class SpeakAt(FakeVAD):
+        spoke = False
+
+        def accept(self, frame):
+            if not SpeakAt.spoke and lis_box[0]._pos >= 1.5 * SAMPLE_RATE:
+                SpeakAt.spoke = True
+                lis_box[0].set_speaking(True, "x")
+            return super().accept(frame)
+
+    src = FileInput(audio((1.0, 2.0), total_s=4.0), trailing_silence_s=0.5)
+    lis = ListenerImpl(src, None, SpeakAt(), FakeSTT("hello there"), Config(), aec=False)
+    lis_box.append(lis)
+    lis.open_window(3600, WindowReason.TURN)
+    events = []
+
+    async def collect():
+        async for ev in lis.events():
+            events.append(ev)
+
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
+    assert K.BARGE_IN not in [e.kind for e in events]
+    assert [e.utterance.window for e in events if e.utterance] == [WindowReason.TURN]
+
+
+async def test_mac_speaking_over_a_follow_on_after_the_wake_command_is_a_barge_in():
+    """Short question, fast answer: the wake capture is still open (5 s no-speech deadline) when
+    the user goes on and Mac's reply starts. The follow-on becomes a barge-in, not a talk-over."""
+    lis_box = []
+    resumed = asyncio.Event()  # the user's follow-on has begun (3.0 s): the first STT returns after it
+
+    class SpeakAt(FakeVAD):
+        spoke = False
+
+        def accept(self, frame):
+            t = lis_box[0]._pos / SAMPLE_RATE
+            if t >= 3.2:
+                resumed.set()
+            if not SpeakAt.spoke and t >= 3.5:
+                SpeakAt.spoke = True
+                lis_box[0].set_speaking(True, "The capital of France is Paris.")
+            return super().accept(frame)
+
+    stt = FakeSTT("hey mac what is the capital of france")
+    orig = stt.transcribe
+
+    async def transcribe(pcm):
+        n = len(stt.calls)  # call 0 verifies the wake phrase, call 1 is the command, call 2 the follow-on
+        if n == 1:
+            await resumed.wait()  # Parakeet is still on the command when the user goes on
+        if n >= 2:
+            return "and also tell me about germany"
+        return await orig(pcm)
+
+    stt.transcribe = transcribe  # type: ignore[method-assign]
+    src = FileInput(audio((1.0, 2.0), (3.0, 4.2), total_s=7.0), trailing_silence_s=0.5)
+    lis = ListenerImpl(src, FakeWake(int(1.5 * SAMPLE_RATE)), SpeakAt(), stt, Config(), aec=True, turn=FakeTurn(0.9, 0.9))
+    lis_box.append(lis)
+    events = []
+
+    async def collect():
+        async for ev in lis.events():
+            events.append(ev)
+
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
+    kinds = [e.kind for e in events]
+    assert kinds[:3] == [K.WAKE, K.SPEECH_START, K.UTTERANCE] and kinds[-1] is K.UTTERANCE, kinds
+    assert sorted(k.value for k in kinds[3:-1]) == ["barge_in", "speech_start"], kinds  # BARGE_IN bypasses the STT chain
+    first, second = [e.utterance for e in events if e.utterance]
+    assert first.woke and first.window is None
+    assert not second.woke and second.window is WindowReason.SPEAKING and "germany" in second.text
