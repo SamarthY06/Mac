@@ -6,8 +6,8 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/SamarthY06/Mac/bridges/whatsapp/internal/bridge"
-	"github.com/SamarthY06/Mac/bridges/whatsapp/internal/wa"
+	"github.com/SamarthY06/OpenMac/bridges/whatsapp/internal/bridge"
+	"github.com/SamarthY06/OpenMac/bridges/whatsapp/internal/wa"
 )
 
 func main() {

@@ -27,8 +27,8 @@ In scope, and worth reporting:
   act as an instruction that reaches the gate's allow path.
 - A way to read anything under the never-readable set: `~/.ssh`, `~/.gnupg`, keychains,
   browser profiles, `~/.aws` and similar credential stores.
-- A way for a tool to write under `~/.mac-agent/` (config, profiles, pairing, the services'
-  frozen copies, the app token).
+- A way for a tool to read or write anything under `~/.mac-agent/` other than Mac's own
+  workspace and memory (config, profiles, pairing, the services' frozen copies, the app token).
 - A way for someone other than the owner to trigger a turn in a WhatsApp group, or for a
   never-listed chat to be read or written.
 - Message text or audio reaching logs, the repo, or any destination other than Anthropic as
@@ -49,9 +49,10 @@ Out of scope, by design:
 
 ## What the project does to stay safe
 
-The confirmation token is minted by the orchestrator from the owner's words, bound to one
-action, expires in 120 seconds, and is checked in a `PreToolUse` hook the model cannot bypass.
-The never-readable set and the `~/.mac-agent/` write block are checked in the same hook. Group
+The model can only ask. The confirmation token is minted by the orchestrator when the owner
+says yes to the summary, is bound to that tool and destination, expires in 120 seconds, and is
+checked in a `PreToolUse` hook outside the model's control; the model never sees it. The
+never-readable set and the `~/.mac-agent/` rule are checked in the same hook. Group
 context is capped (50 messages, 8,000 characters) and wrapped as untrusted. Logs carry ids,
 counts and timings, never text. Tests under `daemon/tests/test_gate_security_audit.py` encode
 the findings of the last audit (`docs/reviews/security-audit-2026-11-10.md`).

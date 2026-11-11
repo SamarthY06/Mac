@@ -6,20 +6,20 @@ body:
   - type: markdown
     attributes:
       value: |
-        Describe the situation first, then the behaviour you want. Mac is model-driven: many "features" are a prompt or a setting rather than new code, and it helps to know which you expect.
+        Describe the situation first, then the behavior you want. Mac is model-driven: many "features" are a prompt or a setting rather than new code, and it helps to know which you expect.
   - type: textarea
     id: situation
     attributes:
       label: The situation
       description: What you were trying to do, and what Mac does today.
-      placeholder: I ask Mac to summarise a long thread in a group and it reads the whole thing back to me.
+      placeholder: I ask Mac to summarize a long thread in a group and it reads the whole thing back to me.
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
       label: What you want instead
-      description: The behaviour, as a user would see or hear it. A sample exchange is ideal.
+      description: The behavior, as a user would see or hear it. A sample exchange is ideal.
       placeholder: |
         Me: "Mac, what did I miss?"
         Mac: three lines, newest first, no quotes.
@@ -30,7 +30,7 @@ body:
     attributes:
       label: Kind of change
       options:
-        - Behaviour (prompt, model judgement)
+        - Behavior (prompt, model judgment)
         - Setting (config.toml, Settings window, scripts/mac)
         - New capability (new tool, app, integration)
         - Safety gate (allow, deny, confirm)

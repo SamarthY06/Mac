@@ -7,7 +7,8 @@ and what a pull request needs. Issues and feature ideas go through the templates
 
 You need the same things as a user: an Apple Silicon Mac on macOS 14 or newer, Claude Code
 signed in, the Xcode Command Line Tools, and [uv](https://docs.astral.sh/uv/). Go is optional
-(see the bridge rule below).
+(see the bridge rule below). The Command Line Tools are enough for `make app`; `swift test`
+(the Swift unit tests in `make test`) needs full Xcode, because XCTest ships with it.
 
 ```bash
 git clone https://github.com/SamarthY06/OpenMac.git ~/OpenMac && cd ~/OpenMac
@@ -39,7 +40,7 @@ work on the code, but it is the fastest way to get the models.
 | `daemon/src/chatd/` | The WhatsApp bot: the runner, group context, the bridge adapter. |
 | `daemon/src/macsvc/` | The background services and `scripts/mac` (`macsvc/cli.py`). |
 | `bridges/whatsapp/` | The Go bridge (whatsmeow) that speaks to WhatsApp over stdio. Protocol in `docs/whatsapp/bridge-protocol.md`. |
-| `scripts/` | `bundle.sh` (build the app), `services.sh`, `mac`, `e2e.sh`. |
+| `scripts/` | `bundle.sh` (build the app), `sign.sh`, `services.sh`, `mac`, `release.sh`, `e2e.sh`. |
 | `docs/` | `USAGE.md`, `DESIGN.md`, `whatsapp/`, and `reviews/` (the reviews and decisions that shaped the code). |
 
 `ARCHITECTURE.md` is the design document: concurrency model, safety model, latency budget.
@@ -69,9 +70,9 @@ leaves those installs running the old bridge against new Python code.
 ## Pull requests
 
 - Small PRs, one change each. Say what and why in the description; the template asks.
-- Tests for behaviour changes. The gate (`daemon/tests/test_gate*.py`,
+- Tests for behavior changes. The gate (`daemon/tests/test_gate*.py`,
   `test_confirmation_gate.py`, `test_hooks*.py`) is covered by security-audit tests; a change
-  there needs a test that shows the old behaviour and the new one.
+  there needs a test that shows the old behavior and the new one.
 - Run `make test` and `uv run ruff check src tests` before pushing. CI runs the same.
 - **No message text in logs.** Logs under `~/Library/Logs/Mac/` never contain what the user
   said, what a group said, or what Mac replied. Log ids, counts and timings.

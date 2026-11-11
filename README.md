@@ -8,7 +8,7 @@
 [![CI](https://github.com/SamarthY06/OpenMac/actions/workflows/ci.yml/badge.svg)](https://github.com/SamarthY06/OpenMac/actions/workflows/ci.yml)
 
 Say *"Hey Mac, find three trending repos, put them in a note and send the list to my team on
-WhatsApp"* and it does it, across apps, while you sit back. The brain is Claude (the full Claude
+WhatsApp"* and it does it, across apps, while you sit back, and it asks before the send. The brain is Claude (the full Claude
 Code agent loop through the Claude Agent SDK) with your own Claude login; the wake word, speech
 recognition, end-of-turn detection and voice run locally on your Mac. It also answers in the
 WhatsApp groups you add, and a deterministic safety gate blocks anything irreversible until you
@@ -29,7 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh 
 ```
 
 This clones the repo into `~/OpenMac`, installs [uv](https://docs.astral.sh/uv/) if needed, sets
-up Python, downloads the speech models (about 700 MB), builds `OpenMac.app` and opens it. The
+up Python (about 600 MB), downloads the speech models (about 1 GB on disk), builds `OpenMac.app`
+and opens it. If Claude Code is missing, the installer offers to install it and sign you in. The
 **Meet Mac** window walks you through the permissions and Chrome pairing.
 
 Then say: **"Hey Mac, what can you do?"**
@@ -47,9 +48,11 @@ Flags pass through as `| bash -s -- --yes --no-open`. If you would rather look f
   which part of its answer you did and did not hear.
 - **Knows when you have finished a sentence**: a thinking pause mid-sentence does not end your
   turn (Pipecat Smart Turn v3.2). You can keep talking during a task without the wake word.
-- **Sees your screen**: "what's this error?" and it looks. Works with the screen off or locked.
-- **Talks like a person**: short answers, one natural voice. 54 voices in 9 languages, or clone
-  your own voice locally. "Teach me consistent hashing" turns it into a tutor.
+- **Sees your screen**: "what's this error?" and it looks. Works with the screen off;
+  screenshots and clicks need the Mac unlocked.
+- **Talks like a person**: short answers, one natural voice. 54 voices in 8 languages (US and
+  UK English, Spanish, French, Hindi, Italian, Japanese, Portuguese, Mandarin), or clone your
+  own voice locally. "Teach me consistent hashing" turns it into a tutor.
 - **Remembers you**: your name, preferences and projects, in a plain `memory.md` you can read.
 - **Safe by design**: anything irreversible (send, post, pay, delete, upload) is blocked by a
   hook until you say "yes" to a spoken summary of that exact action.
@@ -75,6 +78,7 @@ Menu bar: push-to-talk (⌥Space), Stop, Turn Off, Settings. Command line: `macc
 Mac links to your own WhatsApp as a linked device, like WhatsApp Web.
 
 ```bash
+cd ~/OpenMac
 scripts/mac whatsapp link          # scan the QR code with your phone, then pick groups
 scripts/services.sh install        # run it in the background, at every login
 scripts/mac chats add "Family"     # add another group later
@@ -90,10 +94,12 @@ only: no polls, no buttons.
 
 ## Safety
 
-- Irreversible actions wait for your yes to a summary of that exact action. The token is minted
-  from your words, bound to that one action, and the model never holds it.
+- Irreversible actions wait for your yes to a summary of that exact action. The model can only
+  ask. The token is minted when you say yes to the summary, is bound to that tool and
+  destination, and the model never sees it.
 - Secrets are never readable: `~/.ssh`, keychains, browser profiles, `~/.aws` and similar.
-  Nothing under `~/.mac-agent` is writable by tools.
+  Tools can write only Mac's own workspace and memory under `~/.mac-agent`; settings, tokens
+  and the WhatsApp link are never readable or writable.
 - In WhatsApp, only your own messages are requests. Everyone else's are context.
 - The gate is a rule-based filter, not a sandbox. Add only groups whose members you trust, and
   deny writing files where you do not need it.
@@ -101,10 +107,11 @@ only: no polls, no buttons.
 ## Updates
 
 ```bash
-cd ~/OpenMac && git pull && ./install.sh   # the app and the Python environment (the one-liner also pulls)
-scripts/services.sh update                 # the background WhatsApp services
-scripts/services.sh rollback               # back to the commit that ran before
-scripts/mac status                         # what is running, and whether WhatsApp is connected
+cd ~/OpenMac
+git pull && ./install.sh           # the app and the Python environment (the one-liner also pulls)
+scripts/services.sh update         # the background WhatsApp services
+scripts/services.sh rollback       # back to the commit that ran before
+scripts/mac status                 # what is running, and whether WhatsApp is connected
 ```
 
 The services run a frozen copy of a commit, so editing the repo never changes what runs.
@@ -113,17 +120,25 @@ The services run a frozen copy of a commit, so editing the repo never changes wh
 
 Everything lives on your Mac, never in git: settings, memory and the WhatsApp link in
 `~/.mac-agent/`, secrets in the Keychain, logs in `~/Library/Logs/Mac/` (no message text).
-Audio never leaves your Mac. Your requests and what Mac reads for them go to Anthropic as part
-of your Claude session.
+Audio never leaves your Mac, unless you turn on the optional phone feature, which relays audio
+through LiveKit. Your requests and what Mac reads for them go to Anthropic as part of your
+Claude session.
+
+Mac runs your installed `claude` with your own login. Anthropic's Agent SDK terms say
+third-party products may not offer claude.ai login to their users without approval; Mac is an
+open-source tool you install on your own machine with your own account, and if you distribute
+a build to others, read those terms. An API key works too (`auth = "api_key"`, see
+[docs/USAGE.md](docs/USAGE.md)).
 
 ## Uninstall
 
 ```bash
+cd ~/OpenMac
 scripts/services.sh uninstall      # stop the background services
 ./install.sh --uninstall           # remove the app, settings and (if you say so) data
 ```
 
-To unlink WhatsApp, remove this Mac under Settings, Linked devices in WhatsApp on your phone.
+Then delete `~/OpenMac`. To unlink WhatsApp, remove this Mac under Settings, Linked devices in WhatsApp on your phone.
 
 ## More
 

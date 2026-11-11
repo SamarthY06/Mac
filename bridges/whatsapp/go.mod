@@ -1,4 +1,4 @@
-module github.com/SamarthY06/Mac/bridges/whatsapp
+module github.com/SamarthY06/OpenMac/bridges/whatsapp
 
 go 1.26.4
 

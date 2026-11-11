@@ -6,7 +6,8 @@ This page has the rest. One extra: you can talk to your Mac from your phone over
 
 The brain is **Claude** (the full Claude Code agent loop, through the Claude Agent SDK) with
 your own login. Wake word (sherpa-onnx), speech recognition (Parakeet) and voice (Kokoro,
-Kyutai Pocket TTS for cloning) run **locally and free**. Audio never leaves your Mac.
+Kyutai Pocket TTS for cloning) run **locally and free**. Audio never leaves your Mac, unless
+you turn on the optional phone feature, which relays audio through LiveKit.
 
 ## Connect Claude and Chrome
 
@@ -87,7 +88,8 @@ Menu bar → **Settings…** (⌘,), also shown right after onboarding:
 - **General**, Mac's name (the wake word follows it: "Hey Jarvis"), your name, the language Mac
   speaks (English US/UK, Spanish, French, Hindi, Italian, Japanese, Portuguese, Chinese, you
   still speak English for now), idle shutdown, follow-up window, launch at login.
-- **Voice**, 54 built-in voices with ▶ preview, speed, and your cloned voice.
+- **Voice**, 54 built-in voices in 8 languages (US and UK English, Spanish, French, Hindi,
+  Italian, Japanese, Portuguese, Mandarin) with ▶ preview, speed, and your cloned voice.
 - **Appearance**, your picture (Mac's portrait), HUD position.
 - **Permissions**, **Phone**, **Advanced** (Chrome, your own Claude MCP servers/skills, results
   folder, config and logs).
@@ -179,7 +181,8 @@ Everything irreversible goes through a `PreToolUse` hook that classifies each to
 (shell commands are parsed, script files are read, the frontmost app and current browser tab
 are checked). An outward action is refused until the orchestrator has heard you say "yes" to a
 spoken summary; the resulting token is bound to that one action and expires in 120 s.
-Prompt injection from web pages cannot bypass it, because the model never holds the token.
+The model can only ask: the token is minted when you say yes, bound to that tool and
+destination, and the model never sees it, so prompt injection from a web page cannot mint one.
 
 ## Development
 

@@ -16,7 +16,7 @@ permissions:
 jobs:
   python:
     name: Python (ruff + fast tests)
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: daemon
@@ -35,7 +35,7 @@ jobs:
 
   swift:
     name: Swift (app)
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: app
@@ -69,4 +69,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: bash -n
-        run: bash -n install.sh scripts/*.sh
+        run: bash -n install.sh scripts/*.sh scripts/mac

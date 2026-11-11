@@ -7,7 +7,7 @@ First public release, under the name OpenMac. The assistant is still called Mac.
 ### Voice
 
 - Wake word ("Hey Mac", "OK Mac"), local speech recognition (Parakeet) and local voices
-  (Kokoro, 54 voices in 9 languages; Kyutai Pocket TTS for cloning your own voice).
+  (Kokoro, 54 voices in 8 languages; Kyutai Pocket TTS for cloning your own voice).
 - Barge-in: talking over Mac pauses it within 300 ms. Backchannels and echoes let it resume;
   real words stop it, become the next request or a steer, and Claude is told what was and was
   not heard. "stop" always stops.
@@ -35,8 +35,9 @@ First public release, under the name OpenMac. The assistant is still called Mac.
 - Rule-based gate in a `PreToolUse` hook: irreversible actions (send, post, pay, delete,
   upload) need a yes to a summary of that exact action; the token is bound to the action and
   expires in 120 seconds.
-- Never-readable set (`~/.ssh`, keychains, browser profiles, `~/.aws` and similar); nothing
-  under `~/.mac-agent/` is writable by tools.
+- Never-readable set (`~/.ssh`, keychains, browser profiles, `~/.aws` and similar). Tools can
+  write only Mac's own workspace and memory under `~/.mac-agent/`; settings, tokens and the
+  WhatsApp link are never readable or writable.
 - Scripts are re-analysed as command lines only when they look like one, after the gate
   blocked harmless HTML-to-text helpers as credential reads.
 - Security audit of 2026-11-10 folded into tests.

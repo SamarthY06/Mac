@@ -21,7 +21,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite" // pure-Go driver "sqlite", no cgo
 
-	"github.com/SamarthY06/Mac/bridges/whatsapp/internal/bridge"
+	"github.com/SamarthY06/OpenMac/bridges/whatsapp/internal/bridge"
 )
 
 // DeviceName is what the phone shows under Linked devices (W5.6).
