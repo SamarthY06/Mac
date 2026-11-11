@@ -687,6 +687,8 @@ class Orchestrator:
         if (turn is None or turn.confirming or not self.cfg.listen.barge_in or not self._is_partner(turn, ev.source)
                 or self.speech.playing_turn != turn.id):
             return
+        if self._barge == turn.id and self.speech.paused:
+            return  # the listener repeats BARGE_IN at each item start while the user talks on
         if self.speech.pause():
             self._barge = turn.id
             self.metrics.incr("barge_pauses")

@@ -529,3 +529,35 @@ async def test_mac_speaking_over_a_follow_on_after_the_wake_command_is_a_barge_i
     first, second = [e.utterance for e in events if e.utterance]
     assert first.woke and first.window is None
     assert not second.woke and second.window is WindowReason.SPEAKING and "germany" in second.text
+
+
+async def test_barge_in_repeats_at_each_item_start_while_the_user_talks_on():
+    """Live G2: the first BARGE_IN landed on a thinking earcon (system speech, not paused by the
+    orchestrator); the answer that started a few seconds later then played over the user. The
+    converted capture re-sends BARGE_IN at every item start while it is open."""
+    lis_box = []
+
+    class SpeakAt(FakeVAD):
+        starts = 0
+
+        def accept(self, frame):
+            t = lis_box[0]._pos / SAMPLE_RATE
+            if (SpeakAt.starts == 0 and t >= 1.5) or (SpeakAt.starts == 1 and t >= 2.2):  # earcon, then the answer
+                SpeakAt.starts += 1
+                lis_box[0].set_speaking(True, "")
+            return super().accept(frame)
+
+    src = FileInput(audio((1.0, 3.0), total_s=5.0), trailing_silence_s=0.5)
+    lis = ListenerImpl(src, None, SpeakAt(), FakeSTT("and the number for the second one"), Config(), aec=True, turn=FakeTurn(0.9))
+    lis_box.append(lis)
+    lis.open_window(3600, WindowReason.TURN)
+    events = []
+
+    async def collect():
+        async for ev in lis.events():
+            events.append(ev)
+
+    await asyncio.wait_for(asyncio.gather(lis.run(), collect()), 10)
+    kinds = [e.kind for e in events]
+    assert kinds == [K.SPEECH_START, K.BARGE_IN, K.BARGE_IN, K.UTTERANCE], kinds
+    assert events[-1].utterance.window is WindowReason.SPEAKING
