@@ -858,6 +858,9 @@ class ClaudeBrain:
         opts = ClaudeAgentOptions(
             system_prompt=system_prompt,  # type: ignore[arg-type]
             permission_mode="bypassPermissions",
+            # The SDK's default 1 MB line limit kills the stream on a big tool result (live 2026-11-12:
+            # a LinkedIn page read ended the turn with "exceeded maximum buffer size").
+            max_buffer_size=64 * 1024 * 1024,
             hooks=self.hook_matchers(),
             mcp_servers={"mac": self.tools.server()},
             cwd=str(self.cwd),
