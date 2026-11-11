@@ -4,237 +4,107 @@
 
 Say *"Hey Mac, find three trending repos, put them in a note and send the list to my team on
 WhatsApp"* and it does it, across apps, while you sit back. It answers in a human voice, tells
-you what it found, and asks before anything leaves your machine.
+you what it found, and asks before anything leaves your machine. It also works from your
+WhatsApp groups: start a message with "Mac" and it does the job.
 
 <!-- DEMO -->
 
-> Requires an Apple Silicon Mac (macOS 14+) and a [Claude Code](https://docs.claude.com/claude-code)
-> login. Free and open source (MIT). Wake word, speech recognition and voice run on your Mac.
+## Setup
 
-```bash
-git clone https://github.com/SamarthY06/Mac.git && cd Mac && ./install.sh
-```
-
-## What it can do
-
-- **Works across your apps**: Chrome (your own logged-in browser), Mail, WhatsApp, Notes,
-  Calendar, Reminders, Finder, Terminal. "Draft an email to Sam" → "paste it in WhatsApp" →
-  "looks good, send it".
-- **Sees your screen**: "what's this error?" and it looks.
-- **Works with the screen off or locked**: voice, Chrome, files and app automation keep going.
-- **Talks like a person**: short answers, no step-by-step chatter, one natural voice. Pick from
-  54 voices in 9 languages, or clone your own voice locally.
-- **Teaches**: "Hey Mac, teach me consistent hashing" turns it into a conversational tutor.
-- **Remembers you**: your name, preferences and projects, in a plain `memory.md` you can read.
-- **Safe by design**: anything irreversible (send, post, pay, delete, upload) is blocked by a
-  hook until you say "yes" to a spoken summary of that exact action.
-- **Light**: the app idles at about 1 % CPU; Claude starts when you say the wake word and
-  shuts down after 10 quiet minutes. A real Off switch releases the microphone.
-- **Optional**: talk to your Mac from your phone over LiveKit (QR code, spoken PIN).
-
-The brain is **Claude** (the full Claude Code agent loop, through the Claude Agent SDK) with
-your own login. Wake word (sherpa-onnx), speech recognition (Parakeet) and voice (Kokoro,
-Kyutai Pocket TTS for cloning) run **locally and free**. Audio never leaves your Mac.
-
-## Requirements
-
-- Apple Silicon Mac, macOS 14 or newer (built and tested on macOS 26).
-- [Claude Code](https://docs.claude.com/claude-code) installed and signed in (`claude`), **or**
-  an Anthropic API key (see *Authentication*).
-- Google Chrome with the **Claude in Chrome** extension paired (for browser tasks; optional).
-- ~800 MB disk for speech models (downloaded on install), ~1.8 GB RAM while running.
-- If you want Mac to answer while the display is off, set *Prevent automatic sleeping when the
-  display is off* in System Settings → Battery/Energy (`macctl doctor` warns if system sleep is on).
-
-## Install
+**You need:** an Apple Silicon Mac (macOS 14+), [Claude Code](https://code.claude.com/docs/en/quickstart)
+installed and signed in (`claude`, then `/login`), [uv](https://docs.astral.sh/uv/) (the installer
+gets it if missing) and, for WhatsApp, [Go](https://go.dev/dl/) (`brew install go`).
 
 ```bash
 git clone https://github.com/SamarthY06/Mac.git && cd Mac
 ./install.sh
 ```
 
-The installer checks your Mac, installs `uv` if needed, sets up the Python daemon, downloads the
-speech models (~700 MB), builds and signs `Mac.app`, installs it to `~/Applications`, and opens it.
-The **Meet Mac** window then walks you through the permissions (Microphone, Accessibility,
-Automation, Screen Recording, Notifications) and checks that Claude Code is signed in and
-Chrome is paired. Then say *"Hey Mac, what can you do?"*
+The installer sets up Python, downloads the speech models (~700 MB), builds `Mac.app` and opens
+it. The **Meet Mac** window walks you through the permissions and pairing Chrome. Then say
+*"Hey Mac, what can you do?"*
 
-Flags: `--yes` (non-interactive) · `--no-models` · `--no-open` · `--app-only` · `--uninstall`.
+**Optional keys**, to talk to Mac from your phone over LiveKit or to use an Anthropic API key
+instead of your Claude login: store each one in the Keychain with `macctl secret set <NAME>`
+(the names are in `.env.example`). A `.env` file in the repo also works for the app; git
+ignores it.
 
-## Connect Claude and Chrome
-
-Mac uses **your** Claude and **your** Chrome. The Meet Mac window walks you through both and
-shows live status; here is what happens underneath.
-
-1. **Claude**, install [Claude Code](https://code.claude.com/docs/en/quickstart) and sign in
-   (`claude`, then `/login`). Mac runs your `claude` with your claude.ai plan.
-   An API key works too (`macctl secret set ANTHROPIC_API_KEY`, `auth = "api_key"`), but
-   **Claude in Chrome only works with a claude.ai sign-in**, per Anthropic's docs.
-2. **Chrome**, install the
-   [Claude in Chrome extension](https://chromewebstore.google.com/detail/claude/fcoeoabgfenejglbffodgkkbkcdhcgfn)
-   (v1.0.36+), sign it in to the same claude.ai account, then run `claude --chrome` once in a
-   terminal: press Enter at the dialog, type `/chrome` and choose **Enabled by default**.
-   That writes Claude's native-messaging host file and pairs the extension. Mac's
-   *Check connection* button verifies all of it (Chrome running · extension · native host ·
-   enabled · connected). Works with Chrome, Edge, Brave and Arc.
-
-## Using it
+## Voice
 
 | Say | Mac does |
 |---|---|
 | "Hey Mac, what's on my calendar tomorrow?" | answers by voice |
-| "Hey Mac, find me 20 product managers in Bangalore on LinkedIn" | drives Chrome, narrates progress, reads the names, saves the list to `~/Documents/Mac/`, notifies you |
-| "Hey Mac, draft an email to Sam about the demo" → "paste it in WhatsApp to Sam" → "looks good, send it" | multi-app flow; the send waits for your spoken **yes** |
-| "Hey Mac, teach me system design interviews" | tutor mode, in short spoken chunks |
-| "stop" / "never mind" (while Mac is talking) | stops immediately |
-| "Hey Mac, go to sleep" | turns listening off (menu bar → Turn On to wake) |
+| "Hey Mac, find 20 product managers in Bangalore on LinkedIn" | drives your Chrome, saves the list to `~/Documents/Mac/` |
+| "Hey Mac, draft an email to Sam" → "send it" | the send waits for your spoken **yes** |
+| "stop" | stops at once |
 
-After Mac answers, you have a few seconds to follow up **without** the wake word.
-Menu bar: Talk to Mac (⌥Space push-to-talk), Stop, Turn Off/On, Mute, New Conversation,
-Talk from Phone…, Permissions…, Launch at Login, logs, settings.
+Menu bar: push-to-talk (⌥Space), Stop, Turn Off, Settings. Command line: `macctl`.
 
-Command line (`macctl` is linked into `~/.local/bin`):
+## WhatsApp
 
-```
-macctl status | ask "text" [--wait] | say "text" | stop | mute on|off | listen
-macctl off | on | reset | remote-link | remote-end | logs | doctor [--deep] | models
-macctl voice set sample.wav | voice reset | voice status   # voice cloning (Pocket TTS)
-macctl secret set LIVEKIT_URL      # secrets live in the macOS Keychain
-```
-
-## Settings
-
-Menu bar → **Settings…** (⌘,), also shown right after onboarding:
-
-- **General**, Mac's name (the wake word follows it: "Hey Jarvis"), your name, the language Mac
-  speaks (English US/UK, Spanish, French, Hindi, Italian, Japanese, Portuguese, Chinese, you
-  still speak English for now), idle shutdown, follow-up window, launch at login.
-- **Voice**, 54 built-in voices with ▶ preview, speed, and your cloned voice.
-- **Appearance**, your picture (Mac's portrait), HUD position.
-- **Permissions**, **Phone**, **Advanced** (Chrome, your own Claude MCP servers/skills, results
-  folder, config and logs).
-
-By voice: "Hey Mac, change your name to Jarvis", "use your default voice".
-CLI: `macctl settings get`, `macctl settings set tts.voice=bm_george tts.speed=1.1`, `macctl voices`,
-`macctl voice preview af_sky`.
-
-## Authentication
-
-- **Default (`auth = "claude_cli"`)**: Mac runs your installed `claude` with your own login.
-  Anthropic's Agent SDK terms say third-party products may not *offer* claude.ai login to their
-  users without approval, Mac is an open-source tool you install on your own machine with your
-  own account; if you distribute a build to others, read those terms.
-- **API key (`auth = "api_key"`)**: `macctl secret set ANTHROPIC_API_KEY`, then set
-  `auth = "api_key"` under `[brain]` in `~/.mac-agent/config.toml`.
-
-## Configuration
-
-`~/.mac-agent/config.toml` (created with defaults on first run; `MAC_*` env vars override).
-Notable keys: `wake.phrases` (default `["hey mac", "ok mac"]`), `listen.silence_ms`,
-`listen.followup_s`, `tts.voice`, `tts.engine` (`kokoro` | `clone`; the *Voice…* panel sets it), `brain.idle_shutdown_min`, `brain.setting_sources`
-(`["user"]` loads your own `~/.claude` MCP servers, skills and plugins into Mac; `[]` isolates),
-`results_dir` (`~/Documents/Mac`), `remote.enabled`.
-
-## How it works
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) (design, concurrency model, safety model, latency
-budget) and [docs/DESIGN.md](docs/DESIGN.md) (UI). Short version:
-
-```
-Mac.app (Swift)  ── mic w/ echo cancellation ──►  macd (Python)
-   menu bar, HUD, permissions,                    wake word → VAD → STT → orchestrator
-   supervises the daemon                          → Claude (Agent SDK, --chrome) → TTS
-                 ◄── speech audio ────────────────  safety hook gates outward actions
-```
-
-Everything irreversible goes through a `PreToolUse` hook that classifies each tool call
-(shell commands are parsed, script files are read, the frontmost app and current browser tab
-are checked). An outward action is refused until the orchestrator has heard you say "yes" to a
-spoken summary; the resulting token is bound to that one action and expires in 120 s.
-Prompt injection from web pages cannot bypass it, because the model never holds the token.
-
-## Development
+Mac links to your own WhatsApp as a linked device, like WhatsApp Web.
 
 ```bash
-make app          # build + sign build/Mac.app
-make test         # Swift + Python tests
-cd daemon && uv run pytest -q -m "not live and not models and not perf"   # fast unit suite
-cd daemon && uv run pytest -q -s -m perf                       # benchmarks, run alone (W6 latency gate)
-cd daemon && uv run pytest -q -m models                       # needs downloaded models
-cd daemon && uv run pytest -q -m live                         # needs claude login / LiveKit creds
-uv run macd --audio sounddevice   # headless daemon (permissions attribute to your terminal)
+scripts/mac whatsapp link          # scan the QR code with your phone, then pick groups
+scripts/services.sh install        # run it in the background, at every login
+scripts/mac chats add "Family"     # add another group later
 ```
 
-Reviews that shaped the code (architecture, code quality, simplicity, UX) are in `docs/reviews/`.
+**In a group**, Mac acts only on your own messages that start with "Mac" ("Mac, find me 20
+jobs"). Reply to a message with your request and Mac sees that message. Mac can tag people.
+It reads the group's last 50 messages, other members' included, so it can follow the
+conversation. Those messages go to Claude as context and are never treated as instructions.
 
-## Using Mac in WhatsApp groups
-
-In a group, Mac acts only on your own messages that start with "Mac" (for example
-"Mac, find me 20 jobs"). It reads the group's last 50 messages, other members' included,
-so it can follow the conversation and tag people. Those messages go to Claude with your
-request and are never treated as instructions. To stop that in a group, send
-"Mac, disallow reading group messages", or turn it off in Mac ▸ WhatsApp. Replying to a
-message with your request always shows Mac that message. Mac answers from any of your
-linked devices.
-
-## Run the WhatsApp bot as a service
-
-The WhatsApp bot (chatd) and the agent behind it (agentd) can run in the background on their own.
-They start when you log in, restart by themselves if they crash, and need no open terminal.
+**Turning things off:**
 
 ```bash
-scripts/services.sh install     # start now and at every login
-scripts/services.sh status      # what is running, from which commit, and whether WhatsApp is connected
-scripts/services.sh update      # switch to the commit you have checked out and restart
-scripts/services.sh rollback    # go back to the commit that ran before
-scripts/services.sh restart     # restart both (also brings back a bot that stopped)
-scripts/services.sh uninstall   # stop and remove
+scripts/mac chats                              # each group and what it may use
+scripts/mac chats deny "Family" reading group messages, the web
+scripts/mac chats off "Family"                 # Mac ignores the group
+scripts/mac chats remove "Family"              # forget it
 ```
 
-The service runs a frozen copy of the last commit, kept in `~/.mac-agent/release/`, never the
-files you are editing. Changes reach it only when you commit and run `update`. `install` and
-`update` refuse to run while the repo has uncommitted changes unless you add `--allow-dirty`
-(the last commit is still what runs). The last 3 copies are kept for `rollback`. Building needs
-Go, because the WhatsApp helper is built from that copy. After a dependency change, run
-`install.sh` before `update`.
+You can also send "Mac, disallow reading group messages" in the group, or say "stop" to stop
+a task.
 
-If the bot stops for a reason a restart can't fix (its settings are wrong, its message budget is
-spent, or WhatsApp is in use by another run), it stays stopped and `status` says why. The agent
-keeps running. Fix the cause, then run `restart`. Logs are in `~/Library/Logs/Mac/services.log`.
-They never contain message text.
+## Safety
 
-macOS may ask once whether Python may use files in the folder that holds this repo (for example
-Desktop or Documents). Allow it, or keep the repo outside those folders.
+- Anything irreversible (send, post, pay, delete, upload) waits for your yes to a summary of
+  that exact action.
+- Mac never reads or writes the "Timetable" group. That never-list wins over every setting.
+- In WhatsApp, only your own messages are requests. Everyone else's are context.
+- The safety check is a rule-based filter, not a sandbox. Add only groups whose members you
+  trust, and deny writing files where you don't need it.
 
-## Screen off, screen locked
+## Updates
 
-Mac keeps listening with the display off or the screen locked (it runs in your user session, not
-on the lock screen). *Settings → General → Stay awake while listening* keeps the Mac from
-sleeping while plugged in. While locked: voice, Chrome, shell, files and AppleScript automation
-(Mail, Calendar, Notes, Messages) all work; clicking/typing inside apps and screenshots wait
-until you unlock, Mac knows the difference and never tries to unlock. A closed MacBook lid still
-sleeps the Mac unless an external display is attached.
+```bash
+git pull && ./install.sh           # the app and the Python environment
+scripts/services.sh update         # the background services, from the commit you have checked out
+scripts/services.sh rollback       # back to the commit that ran before
+scripts/mac status                 # what is running, and whether WhatsApp is connected
+```
 
-Ask "what's on my screen?" or "what's this error?" and Mac looks at your screen (Screen
-Recording permission).
+The services run a frozen copy of a commit, so editing the repo never changes what runs.
 
-## Memory
+## Your data
 
-Mac keeps a small `~/.mac-agent/workspace/memory.md`, your name, how you like answers, your
-projects, people you mention, recurring tasks, and updates it on its own from what *you* say
-(never from web pages or documents it reads). Ask "what do you remember about me?" or say
-"forget that". Before a conversation is retired, Mac writes a short "recent context" note so
-"what were we doing?" works after a restart.
+Everything lives on your Mac, never in git: settings, memory and the WhatsApp link in
+`~/.mac-agent/`, secrets in the Keychain, logs in `~/Library/Logs/Mac/` (no message text).
+Audio never leaves your Mac. Your requests and what Mac reads for them go to Anthropic as part
+of your Claude session.
 
-## Privacy & safety
+## Uninstall
 
-Audio never leaves your Mac. Your requests, the text Claude produces and tool results go to
-Anthropic as part of your Claude session. Web pages, emails and documents Mac reads are treated
-as untrusted data; the safety hook, not the prompt, decides what can leave your machine.
-Secrets live in the Keychain. Logs are in `~/Library/Logs/Mac/`.
+```bash
+scripts/services.sh uninstall      # stop the background services
+./install.sh --uninstall           # remove the app, settings and (if you say so) data
+```
 
-## License
+To unlink WhatsApp, remove this Mac under Settings ▸ Linked devices in WhatsApp on your phone.
 
-MIT, see [LICENSE](LICENSE). Speech models carry their own licenses (sherpa-onnx: Apache-2.0;
-Parakeet: CC-BY-4.0; Kokoro: Apache-2.0; Silero VAD: MIT; Kyutai Pocket TTS weights: CC-BY-4.0 , 
-only clone voices you own or have permission to use).
+## More
+
+[docs/USAGE.md](docs/USAGE.md) has the details: every command, settings, Chrome, authentication,
+the services, memory and development. Design: [ARCHITECTURE.md](ARCHITECTURE.md). License: MIT
+([LICENSE](LICENSE)); the speech models carry their own licenses (see docs/USAGE.md).

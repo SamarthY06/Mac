@@ -8,6 +8,10 @@ chatd reads `~/.mac-agent/chat/config.toml` (process keys only; a missing file m
 builds the channel with an empty allowlist (agentd's profiles fill it) and the never-set from
 `agentd.profiles.load_never_set`, failing closed when that cannot be read, and runs ChatRunner.
 
+While WhatsApp is connected, chatd keeps `~/.mac-agent/chat/chats.json` (0600): the bridge's
+`list_chats` (id, subject, members, owner_only, is_self), refreshed on every connect, every 5
+minutes and on SIGUSR1. `mac chats add` resolves a group name to its id from it.
+
 stdout carries one JSON line per change for a supervisor, never message text:
 `{"link": {"state", "detail"}}` and, last, `{"stopping": {"code", "why"}}`.
 
@@ -37,6 +41,8 @@ log = logging.getLogger("chatd")
 EXIT_OK, EXIT_CRASH, EXIT_CONFIG, EXIT_BUDGET, EXIT_LOCKED = 0, 1, 2, 3, 75
 TOKEN_READ_TIMEOUT_S = 10.0
 POLL_S = 0.5
+CHATS_EVERY_S = 300.0
+CHAT_KEYS = ("id", "subject", "members", "owner_only", "is_self")
 REPO = Path(__file__).resolve().parents[3]
 
 
@@ -111,7 +117,22 @@ def bridge_stopped(adapter: Any) -> Stop | None:
     return None
 
 
-async def serve(args: argparse.Namespace, token: str, stop: asyncio.Event, out: IO[str]) -> int:
+async def write_chats(adapter: Any, path: Path) -> None:
+    """The bridge's chat list to `chats.json` for `mac chats add` (subjects never logged)."""
+    from agentd.stores import atomic_write_json
+
+    try:
+        chats = await adapter.list_chats()
+    except Exception as e:  # noqa: BLE001 - offline, timeout: the next refresh tries again
+        log.info("chatd: chat list not refreshed (%s)", type(e).__name__)
+        return
+    rows = [{k: c[k] for k in CHAT_KEYS if k in c} for c in chats if isinstance(c.get("id"), str)]
+    await asyncio.to_thread(atomic_write_json, path, rows)
+    log.info("chatd: chat list refreshed (%d chats)", len(rows))
+
+
+async def serve(args: argparse.Namespace, token: str, stop: asyncio.Event, out: IO[str],
+                refresh: asyncio.Event | None = None) -> int:
     from agentd import profiles as pf
     from chatd.channels.registry import ChannelContext, SeenIds, create
     from chatd.governor import Budget, Governor
@@ -148,12 +169,24 @@ async def serve(args: argparse.Namespace, token: str, stop: asyncio.Event, out: 
     await runner.start()
     log.info("chatd: running channel %s", name)
     shown: tuple[str, str] | None = None
+    refresh = refresh or asyncio.Event()
+    listing: asyncio.Task[None] | None = None
+    listed_at = 0.0
+    loop = asyncio.get_running_loop()
     try:
         while not stop.is_set():
             link = runner.link or adapter.status()
             if (link.state.value, link.detail) != shown:
+                if link.state.value == "connected":
+                    refresh.set()  # every (re)connect
                 shown = (link.state.value, link.detail)
                 emit(out, {"link": {"state": shown[0], "detail": shown[1]}})
+            due = refresh.is_set() or loop.time() - listed_at >= CHATS_EVERY_S
+            if shown[0] == "connected" and due and (listing is None or listing.done()) \
+                    and hasattr(adapter, "list_chats"):
+                refresh.clear()
+                listed_at = loop.time()
+                listing = asyncio.create_task(write_chats(adapter, chat_dir / "chats.json"))
             if runner.fatal is not None:
                 raise Stop(EXIT_CONFIG, "agentd refused chat's token or version.")
             if (gone := bridge_stopped(adapter)) is not None:
@@ -163,6 +196,10 @@ async def serve(args: argparse.Namespace, token: str, stop: asyncio.Event, out: 
         return EXIT_OK
     finally:
         log.info("chatd: stopping")
+        if listing is not None:
+            listing.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await listing
         await runner.close()
 
 
@@ -231,11 +268,13 @@ def main(argv: list[str] | None = None) -> int:
 
     loop = asyncio.new_event_loop()
     stop = asyncio.Event()
+    refresh = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
+    loop.add_signal_handler(signal.SIGUSR1, refresh.set)  # `mac chats add`: refresh chats.json now
     threading.Thread(target=_watch_lifeline, args=(lifeline, loop, stop), daemon=True, name="lifeline").start()
     try:
-        code, why = loop.run_until_complete(serve(args, token, stop, out)), "Stopped."
+        code, why = loop.run_until_complete(serve(args, token, stop, out, refresh)), "Stopped."
     except Stop as e:
         code, why = e.code, e.why
         log.error("chatd: %s (exit %d)", why, code)

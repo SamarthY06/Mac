@@ -45,11 +45,13 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import functools
 import hashlib
 import logging
 import os
 import posixpath
 import re
+import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterable
@@ -137,6 +139,39 @@ SENSITIVE_ROOTS: tuple[str, ...] = (
 # dev tokens, device.db. The workspace and agent/chats/* stay usable.
 MAC_PRIVATE: tuple[str, ...] = ("agent/state", "run", "bin", "chat", "config.toml")
 MAC_READABLE: tuple[str, ...] = ("chat/whatsapp/media",)  # inbound attachments: read, never written
+# H1 (security audit): nothing under ~/.mac-agent is written by a tool except these two (release
+# snapshots, models, voice, state.json, logs included), and nothing that starts Mac or a shell.
+MAC_WRITABLE: tuple[str, ...] = ("workspace", "agent/chats", "agent/chat-workspace")
+WRITE_DENIED: tuple[str, ...] = ("~/Library/LaunchAgents", "~/.local/bin")
+# The owner's own shell and Claude Code setup: never from chat; by voice behind a spoken yes.
+OWNER_CONFIG: tuple[str, ...] = (
+    "~/.claude/settings*.json", "~/.claude.json", "~/.claude/CLAUDE.md", "~/.claude/hooks",
+    "~/.zshrc", "~/.zprofile", "~/.bashrc", "~/.bash_profile", "~/.profile",
+)
+PROTECTED_WRITE = "protected_write"
+OWNER_CONFIG_WRITE = "owner_config"
+
+
+@functools.cache
+def _own_code_roots() -> tuple[str, ...]:
+    """Mac's own code: the daemon's src and venvs, the running interpreter's venv, and the repo."""
+    here = Path(__file__).resolve()
+    daemon = here.parents[3]  # .../daemon/src/macd/brain/gate.py
+    roots = {str(daemon / "src"), str(daemon / ".venv"), str(Path(sys.prefix).resolve())}
+    venv = Path(sys.prefix).resolve()
+    if venv.name == ".venv" and venv.parent.name == "daemon":  # a snapshot run uses the repo's venv
+        roots |= {str(venv.parent / "src")}
+    return tuple(sorted(roots))
+
+
+@functools.cache
+def _repo_roots() -> tuple[str, ...]:
+    """The repo (and its daemon dir) for the catastrophic rm rule."""
+    out = {str(Path(__file__).resolve().parents[4]), str(Path(__file__).resolve().parents[3])}
+    venv = Path(sys.prefix).resolve()
+    if venv.name == ".venv" and venv.parent.name == "daemon":
+        out |= {str(venv.parent), str(venv.parent.parent)}
+    return tuple(sorted(out))
 
 SENSITIVE_BASENAMES: tuple[str, ...] = (
     "*.pem", "*.key", "*.p12", "*.pfx", "*.keychain", "*.keychain-db",
@@ -340,7 +375,12 @@ class _Paths:
         self.mac_private = [posixpath.join(h, sub) for h in sorted(mac_homes) for sub in MAC_PRIVATE]
         self.mac_readable = [posixpath.join(h, sub) for h in sorted(mac_homes) for sub in MAC_READABLE]
         self.sensitive_names = tuple(n.lower() for n in SENSITIVE_BASENAMES)
-        self.protected = [_segments(self.expand_tilde(p)) for p in PROTECTED_ROOTS]
+        self.protected = [_segments(self.expand_tilde(p)) for p in [*PROTECTED_ROOTS, *_repo_roots()]]
+        self.mac_homes = sorted(mac_homes)
+        self.mac_writable = [posixpath.join(h, sub) for h in self.mac_homes for sub in MAC_WRITABLE]
+        self.write_denied = [*self.mac_homes, *(r.lower() for r in _own_code_roots()),
+                             *(self._abs(self.expand_tilde(p), "/").lower() for p in WRITE_DENIED)]
+        self.owner_config = [self._abs(self.expand_tilde(p), "/").lower() for p in OWNER_CONFIG]
         self.memory_files = {
             posixpath.join(self.workspace, "claude.md"),
             posixpath.join(self.workspace, "memory.md"),
@@ -431,6 +471,32 @@ class _Paths:
     def is_ancestor_of_sensitive(self, raw: str, cwd: str) -> bool:
         p = self.norm(raw, cwd).lower().rstrip("/") + "/"
         return any(root.startswith(p) for root in [*self.sensitive, *self.mac_private])
+
+    def write_decision(self, raw: str, cwd: str, glob: bool = False) -> GateDecision | None:
+        """H1: a write to Mac's own code, state or launch config, or to the owner's shell and
+        Claude Code setup. Mac's: denied everywhere. The owner's: denied in chat, a spoken yes by
+        voice (it is the owner speaking)."""
+        if not raw or raw.startswith("-") and "=" not in raw:
+            return None
+        path = self.norm(raw, cwd).lower()
+        cands = {path}
+        if not glob:
+            try:
+                cands.add(os.path.realpath(self.norm(raw, cwd)).lower())
+            except (OSError, ValueError):
+                pass
+        for cand in cands:
+            if any(fnmatch.fnmatchcase(cand, pat) or self._under(cand, pat) for pat in self.owner_config):
+                if self.ctx.capabilities is not None:
+                    return GateDecision("sensitive_read", OWNER_CONFIG_WRITE,
+                                        f"{raw} is your shell or Claude Code setup; Mac never changes it from a chat")
+                return GateDecision("outward", OWNER_CONFIG_WRITE, f"changes your shell or Claude Code setup ({raw})",
+                                    target=posixpath.basename(cand))
+            if any(self._under(cand, r) for r in self.write_denied) and not any(
+                    self._under(cand, w) for w in self.mac_writable):
+                return GateDecision("sensitive_read", PROTECTED_WRITE,
+                                    f"{raw} is Mac's own code, settings or startup files; no tool may change it")
+        return None
 
     def is_memory_file(self, raw: str, cwd: str) -> bool:
         return self.norm(raw, cwd).lower() in self.memory_files
@@ -611,6 +677,7 @@ class _BashAnalyzer:
         found.append(self._catastrophic(c, pipeline_words))
         found.append(self._sensitive(c, pipeline_words, feeds))
         found.append(self._memory(c))
+        found.append(self._protected_write(c))
         found.append(self._outward(c))
         found.append(self._nested(c, depth, stdin))
         self._track_cwd(c)
@@ -657,6 +724,8 @@ class _BashAnalyzer:
             reason = self.p.sensitive_reason(lit, self.cwd)
             if reason and ("/" in lit or lit.startswith("~")):
                 found.append(GateDecision("sensitive_read", "sensitive_path", reason))
+            if "/" in lit or lit.startswith("~"):  # a script naming a protected path may write it
+                found.append(self.p.write_decision(lit, self.cwd) or ALLOW)
             if _INTERP_DELETE.search(payload) and self.p.is_protected(self.p.norm(lit, self.cwd), False) \
                     and ("/" in lit or lit.startswith("~")):
                 found.append(GateDecision("catastrophic", "rm_root", f"deletes {lit}"))
@@ -737,6 +806,9 @@ class _BashAnalyzer:
                 for t in self.expand(shell.Word(root)):
                     if self.p.is_protected(self.p.norm(t, self.cwd), False):
                         return GateDecision("catastrophic", "find_delete", f"find {t} deletes files")
+        if name == "launchctl" and raw and raw[0].lower() in ("bootout", "unload", "remove", "disable", "kill") \
+                and any("com.mac-agent" in a.lower() for a in raw[1:]):
+            return GateDecision("catastrophic", "mac_service", f"launchctl {raw[0]} stops Mac's own services")
         if name in ("csrutil", "spctl") and any(a in ("disable", "--master-disable") for a in raw):
             return GateDecision("catastrophic", "security_off", f"{name} disables system security")
         for w in c.cmd.redirects_out:
@@ -816,6 +888,17 @@ class _BashAnalyzer:
                     return GateDecision("sensitive_read", "bulk_copy_sensitive",
                                         f"{c.name} of {t} would include protected secrets")
         return ALLOW
+
+    def _protected_write(self, c: _Cmd) -> GateDecision:
+        """H1: redirects into, and any non-read-only command naming, a write-protected path."""
+        found: list[GateDecision] = []
+        for t, glob in self.words(c.cmd.redirects_out):
+            found.append(self.p.write_decision(t, self.cwd, glob) or ALLOW)
+        if c.name not in READ_ONLY_TEXT and c.name not in ("source", "."):  # sourcing reads
+            for t, glob in self.words(c.args):
+                for cand in _path_candidates(t):
+                    found.append(self.p.write_decision(cand, self.cwd, glob) or ALLOW)
+        return _worst(found)
 
     def _memory(self, c: _Cmd) -> GateDecision:
         for t, _ in self.words(c.cmd.redirects_out):
@@ -1061,7 +1144,9 @@ def _file_tool(name: str, inp: dict[str, Any], paths: _Paths) -> GateDecision:
         if target and paths.is_memory_file(target, cwd):
             return GateDecision("sensitive_read", MEMORY_WRITE, "memory files are append-only via remember")
         reason = paths.sensitive_reason(target, cwd, write=True) if target else None
-        return GateDecision("sensitive_read", "sensitive_write", reason) if reason else ALLOW
+        if reason:
+            return GateDecision("sensitive_read", "sensitive_write", reason)
+        return (paths.write_decision(target, cwd) if target else None) or ALLOW
     if name in _FILE_READ_TOOLS:
         target = str(inp.get("file_path") or inp.get("notebook_path") or "")
         reason = paths.sensitive_reason(target, cwd) if target else None
@@ -1243,11 +1328,17 @@ def _never_chat(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateC
     return _never_named(" ".join(texts), ctx)
 
 
+def _plain(text: str) -> str:
+    """L1: NFKC, format characters (zero-width and the like) dropped, case-folded."""
+    t = unicodedata.normalize("NFKC", text)
+    return "".join(c for c in t if unicodedata.category(c) != "Cf").casefold()
+
+
 def _never_named(text: str, ctx: GateContext) -> GateDecision | None:
     """`text` names a never-listed chat (NFKC, case-folded, at word boundaries)."""
-    blob = unicodedata.normalize("NFKC", text).casefold()
+    blob = _plain(text)
     for raw in ctx.never_chat_names:
-        n = unicodedata.normalize("NFKC", raw).strip().casefold()
+        n = _plain(raw).strip()
         if n and re.search(rf"(?<![^\W_]){re.escape(n)}(?![^\W_])", blob):
             return GateDecision("catastrophic", NEVER_CHAT, f"'{n}' is on the never-list; Mac never reads "
                                 f"from or sends to it", target=n)
@@ -1285,6 +1376,9 @@ def _unparsed(tool_name: str, inp: dict[str, Any], d: GateDecision, ctx: GateCon
             reason = paths.sensitive_reason(raw, ctx.workspace, write=write)
             if reason:
                 return GateDecision("sensitive_read", "sensitive_write" if write else "sensitive_path", reason)
+            guarded = paths.write_decision(raw, ctx.workspace) if write else None
+            if guarded is not None:
+                return guarded
     return None
 
 
@@ -1526,7 +1620,9 @@ class ConfirmationGate:
             return False
         fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._pending = _Pending(turn_id, summary, fut)
-        log.info("gate: confirmation requested turn=%d action=%s summary=%r", turn_id, action, summary)
+        tool, code = (action.split("|") + ["", ""])[:2]  # M1: never message text; a hash to correlate
+        log.info("gate: confirmation requested turn=%d tool=%s code=%s ref=%s", turn_id, tool, code,
+                 hashlib.sha256(f"{action}\n{summary}".encode()).hexdigest()[:12])
         try:
             approved = await asyncio.wait_for(asyncio.shield(fut), timeout)
         except TimeoutError:

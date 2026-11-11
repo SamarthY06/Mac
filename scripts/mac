@@ -1,0 +1,8 @@
+#!/bin/bash
+# mac: link your WhatsApp and choose the groups Mac answers in. Run `scripts/mac help`.
+set -euo pipefail
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+if [[ "${1:-}" == status ]]; then
+  exec "$REPO/scripts/services.sh" status
+fi
+exec "$REPO/daemon/.venv/bin/python" -m macsvc.cli "$@"
