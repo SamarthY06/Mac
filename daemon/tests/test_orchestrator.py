@@ -23,7 +23,7 @@ from macd.contracts import (
     State,
     WindowReason,
 )
-from macd.orchestrator import Orchestrator
+from macd.orchestrator import BARGE_NOTE, WORKING_NOTE, Orchestrator, interruption_note
 from macd.speech.segmenter import SentenceSegmenter
 from macd.speech_queue import SpeechQueue
 from macd.tasks import supervise
@@ -476,12 +476,64 @@ async def test_no_speaking_thinking_flicker_between_sentences(rig: Rig) -> None:
 # ----------------------------------------------------------------------------- FSM: mid-turn policy
 
 
-async def test_mid_turn_non_woke_ignored(rig: Rig) -> None:
+async def test_mid_turn_speech_from_another_mic_is_ignored(rig: Rig) -> None:
+    other = FakeListener("other")
+    rig.orch.add_listener(other)
     tid = await start_turn(rig, "open my email")
-    rig.mic.say("blah blah tv in the background", woke=False)
+    other.say("blah blah tv in the background", woke=False)
     await asyncio.sleep(0.05)
     assert rig.brain.steers == [] and rig.brain.interrupts == [] and len(rig.brain.asks) == 1
     assert rig.orch.turn is not None and rig.orch.turn.id == tid
+
+
+async def test_voice_turn_keeps_the_partner_mic_open(rig: Rig) -> None:
+    """Owner 2026-11-11: a real conversation, not walkie-talkie: no wake word during the turn."""
+    await start_turn(rig, "open my email")
+    assert rig.mic.reasons()[-1] == WindowReason.TURN
+    rig.mic.say("stop")  # wake-less, from the turn's TURN window
+    await wait_until(lambda: rig.orch.turn is None)
+    assert rig.orch._turn_window is None and rig.mic.closed_windows >= 1
+
+
+async def test_typed_turn_opens_no_wakeless_window(rig: Rig) -> None:
+    rig.scripts["open my email"] = [pause()]
+    tid = await rig.orch.ask("open my email")
+    await wait_until(lambda: rig.brain.asks)
+    assert WindowReason.TURN not in rig.mic.reasons()
+    rig.mic.say("what about tomorrow", woke=False)
+    await asyncio.sleep(0.05)
+    assert rig.brain.steers == [] and len(rig.brain.asks) == 1 and rig.orch.turn.id == tid
+
+
+async def test_kept_talking_before_any_output_is_merged(rig: Rig) -> None:
+    """"Book a meeting with Sam" … pause … "on Friday at three": one request (LiveKit discards a
+    preemptive reply the same way when the user goes on)."""
+    tid = await start_turn(rig, "book a meeting with Sam")
+    rig.scripts["book a meeting with Sam on Friday at three"] = [pause()]
+    rig.mic.say("on Friday at three", window=WindowReason.TURN)
+    await wait_until(lambda: rig.brain.asks[-1][1] == "book a meeting with Sam on Friday at three")
+    assert tid in rig.brain.interrupts and rig.orch.turn.text == "book a meeting with Sam on Friday at three"
+    assert sum(s in P.FILLER_ACTION for s in rig.spoken) <= 1  # no second "On it."
+    assert rig.orch.metrics.counters["merged_utterances"] == 1
+
+
+async def test_wakeless_speech_mid_task_is_steered_with_a_note(rig: Rig) -> None:
+    tid = await start_turn(rig, "find flights to Goa", [*tool("Bash"), pause()])
+    await wait_until(lambda: rig.orch.turn.output_started)
+    rig.mic.say("only direct ones", window=WindowReason.TURN)
+    await wait_until(lambda: rig.brain.steers)
+    steer_tid, steer_text = rig.brain.steers[-1]
+    assert steer_tid == tid and steer_text.endswith("only direct ones") and steer_text.startswith(WORKING_NOTE)
+    await asyncio.sleep(0.05)
+    assert P.STEER_ACK not in rig.spoken and len(rig.brain.asks) == 1
+
+
+async def test_wakeless_backchannel_mid_turn_is_ignored(rig: Rig) -> None:
+    await start_turn(rig, "find flights to Goa", [*tool("Bash"), pause()])
+    await wait_until(lambda: rig.orch.turn.output_started)
+    rig.mic.say("okay", window=WindowReason.TURN)
+    await asyncio.sleep(0.05)
+    assert rig.brain.steers == [] and len(rig.brain.asks) == 1
 
 
 async def test_woke_stop_interrupts_and_drops_stale(rig: Rig) -> None:
@@ -508,15 +560,161 @@ async def test_bare_stop_while_speaking(rig: Rig) -> None:
     assert "You have forty messages." not in rig.spoken  # cut off mid-sentence
 
 
-@pytest.mark.parametrize("bystander", ["add their titles", "actually, let's get lunch", "no, make it Friday",
-                                       "hey what's for dinner", "never mind the lunch plans"])
-async def test_speaking_window_only_stop_words_count(rig: Rig, bystander: str) -> None:
-    """DECISION 11: without the wake word, only a bare stop word is honoured while Mac talks."""
-    tid = await start_turn(rig, "read my email")
+@pytest.mark.parametrize("bystander", ["add their titles", "actually, let's get lunch", "no, make it Friday"])
+async def test_speaking_window_over_a_typed_turn_only_stop_words_count(rig: Rig, bystander: str) -> None:
+    """DECISION 11 still holds where nobody is in a spoken conversation with Mac (a typed turn)."""
+    rig.scripts["read my email"] = [pause()]
+    tid = await rig.orch.ask("read my email")
+    await wait_until(lambda: rig.brain.asks)
     rig.mic.say(bystander, window=WindowReason.SPEAKING)
     await asyncio.sleep(0.05)
     assert rig.brain.steers == [] and rig.brain.interrupts == [] and len(rig.brain.asks) == 1
     assert rig.orch.turn is not None and rig.orch.turn.id == tid
+
+
+# ----------------------------------------------------------------------------- barge-in (talking over Mac)
+
+ANSWER = "one two three four five six seven eight."
+
+
+@pytest.fixture
+async def talky() -> AsyncIterator[Rig]:
+    """Each spoken line is 0.5 s of PCM played in 0.5 s, so playback position tracks wall time."""
+    tts = FakeTTS(samples=8_000)
+    r, task = await make_rig(outputs={"local": FakeOutput(tts, play_s=0.5)})
+    r.brain.alive = True
+    try:
+        yield r
+    finally:
+        await teardown(r, task)
+
+
+def _barge(r: Rig) -> None:
+    r.mic.push(ListenerEvent(ListenerEventKind.BARGE_IN, "local", window=WindowReason.SPEAKING))
+
+
+async def _answering(r: Rig, steps: list[Step] | None = None) -> int:
+    tid = await start_turn(r, "count to eight", steps if steps is not None else [text(ANSWER + "\n")])
+    await wait_until(lambda: any(t == ANSWER for t, _ in r.out.play_started), timeout=4)
+    await asyncio.sleep(0.2)
+    return tid
+
+
+async def test_barge_in_pauses_at_once_and_resumes_when_no_words(talky: Rig) -> None:
+    await _answering(talky)
+    _barge(talky)
+    await wait_until(lambda: talky.speech.paused, msg="paused")
+    assert talky.out.cancelled_at  # cut on VAD onset, before any transcript
+    talky.mic.push(ListenerEvent(ListenerEventKind.NO_SPEECH, "local", window=WindowReason.SPEAKING))
+    await wait_until(lambda: ANSWER in talky.spoken, timeout=4)
+    assert talky.orch.metrics.counters["false_interruptions"] == 1 and len(talky.brain.asks) == 1
+
+
+@pytest.mark.parametrize("heard", ["mm-hmm", "yeah okay", "five six seven", "Friday"])
+async def test_backchannel_echo_and_short_words_resume(talky: Rig, heard: str) -> None:
+    await _answering(talky)
+    _barge(talky)
+    await wait_until(lambda: talky.speech.paused)
+    talky.mic.say(heard, window=WindowReason.SPEAKING)
+    await wait_until(lambda: ANSWER in talky.spoken, timeout=4)
+    assert len(talky.brain.asks) == 1 and talky.brain.steers == []
+
+
+async def test_one_word_over_the_filler_finishes_the_request(talky: Rig) -> None:
+    """Live 2026-11-11: "give me one fun fact about" … "octopuses." The turn had started and
+    "On it." was playing; the one word was dropped as too short and Claude asked "about what?"."""
+    tid = await start_turn(talky, "give me one fun fact about", [pause()])
+    await wait_until(lambda: talky.out.play_started, timeout=4)  # the filler
+    talky.scripts["give me one fun fact about octopuses."] = [pause()]
+    _barge(talky)
+    await wait_until(lambda: talky.speech.paused)
+    talky.mic.say("octopuses.", window=WindowReason.SPEAKING)
+    await wait_until(lambda: talky.brain.asks[-1][1] == "give me one fun fact about octopuses.")
+    assert tid in talky.brain.interrupts and talky.orch.metrics.counters["merged_utterances"] == 1
+
+
+async def test_real_barge_in_after_the_brain_is_done_starts_a_told_turn(talky: Rig) -> None:
+    await _answering(talky)
+    _barge(talky)
+    await wait_until(lambda: talky.speech.paused)
+    talky.scripts["what about tomorrow"] = [pause()]
+    talky.mic.say("what about tomorrow", window=WindowReason.SPEAKING)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    asked = talky.brain.asks[-1][1]
+    assert asked.endswith(BARGE_NOTE + " what about tomorrow") and "they did not hear" in asked
+    assert talky.orch.turn.text == "what about tomorrow"
+    await asyncio.sleep(0.2)
+    assert ANSWER not in talky.spoken and P.STOPPED not in talky.spoken
+
+
+async def test_real_barge_in_mid_turn_steers_and_later_speech_plays(talky: Rig) -> None:
+    tid = await _answering(talky, [text(ANSWER + "\n"), pause()])
+    _barge(talky)
+    await wait_until(lambda: talky.speech.paused)
+    talky.mic.say("no wait, count backwards", window=WindowReason.SPEAKING)
+    await wait_until(lambda: talky.brain.steers)
+    steer_tid, steer = talky.brain.steers[-1]
+    assert steer_tid == tid and steer.startswith("[Your last reply was cut off")
+    assert steer.endswith(BARGE_NOTE + " no wait, count backwards")
+    assert not talky.speech.paused and talky.orch.turn.id == tid
+    talky.inject(BrainEventKind.TEXT, tid, text="Eight, seven.\n")
+    await wait_until(lambda: "Eight, seven." in talky.spoken, timeout=4)
+    assert ANSWER not in talky.spoken
+
+
+async def test_stop_while_paused_stops_and_next_ask_knows_what_was_missed(talky: Rig) -> None:
+    await _answering(talky, [text(ANSWER + "\n"), pause()])
+    _barge(talky)
+    await wait_until(lambda: talky.speech.paused)
+    talky.mic.say("stop", window=WindowReason.SPEAKING)
+    await wait_until(lambda: P.STOPPED in talky.spoken, timeout=4)
+    assert ANSWER not in talky.spoken
+    talky.scripts["what was the last number"] = [pause()]
+    talky.mic.say("what was the last number", woke=True)
+    await wait_until(lambda: len(talky.brain.asks) == 2)
+    assert talky.brain.asks[-1][1].startswith("[Your last reply was cut off: they heard")
+
+
+async def test_no_barge_in_pause_over_a_confirmation(talky: Rig) -> None:
+    await start_turn(talky, "email Bob", [confirm("I'll email Bob the report"), pause()])
+    await wait_until(lambda: talky.orch.state == State.CONFIRMING and talky.speech.speaking, timeout=4)
+    _barge(talky)
+    await asyncio.sleep(0.1)
+    assert not talky.speech.paused
+    talky.mic.say("yes send it", window=WindowReason.SPEAKING)  # said over the question: not a yes
+    await asyncio.sleep(0.1)
+    assert talky.gate.resolved == [] and talky.orch.turn.confirming
+
+
+async def test_barge_in_off_keeps_the_old_rule(talky: Rig) -> None:
+    talky.orch.cfg.listen.barge_in = False
+    await _answering(talky)
+    _barge(talky)
+    await asyncio.sleep(0.1)
+    assert not talky.speech.paused
+    talky.mic.say("what about tomorrow", window=WindowReason.SPEAKING)
+    await wait_until(lambda: ANSWER in talky.spoken, timeout=4)
+    assert len(talky.brain.asks) == 1
+
+
+def test_interruption_note() -> None:
+    assert interruption_note("all of it", "") == ""
+    note = interruption_note("one two", "three four")
+    assert note == '[Your last reply was cut off: they heard up to "…one two"; they did not hear "three four".]'
+    assert "they heard none of it" in interruption_note("", "everything")
+    assert len(interruption_note("x" * 1000, "y" * 1000)) < 500
+
+
+@pytest.mark.parametrize(("t", "bc"), [("mm-hmm", True), ("Yeah, okay.", True), ("uh huh right", True),
+                                       ("got it", True), ("okay but make it Friday", False), ("what", False),
+                                       ("", False)])
+def test_is_backchannel(t: str, bc: bool) -> None:
+    assert P.is_backchannel(t) is bc
+
+
+def test_is_echo_and_interjection() -> None:
+    assert P.is_echo("five six seven", ANSWER) and not P.is_echo("what about seven", ANSWER)
+    assert P.is_interjection("wait") and P.is_interjection("hold on please") and not P.is_interjection("Friday")
 
 
 async def test_steer_ack_jumps_the_queue(rig: Rig) -> None:
@@ -586,6 +784,13 @@ async def test_confirm_yes_but_denies_and_steers(rig: Rig) -> None:
     await wait_until(lambda: rig.brain.steers == [(tid, "yes but change the subject")])
     await wait_until(lambda: P.STEER_ACK in rig.spoken)
     assert P.DENIED not in rig.spoken
+
+
+async def test_empty_turn_window_capture_does_not_deny_a_confirmation(rig: Rig) -> None:
+    await _confirm(rig)
+    rig.mic.push(ListenerEvent(ListenerEventKind.NO_SPEECH, "local", window=WindowReason.TURN))
+    await asyncio.sleep(0.05)
+    assert rig.gate.resolved == [] and rig.orch.turn.confirming
 
 
 async def test_confirm_timeout_and_no_speech_deny(rig: Rig) -> None:
@@ -757,6 +962,32 @@ async def test_stalled_output_still_ends_the_turn(monkeypatch: pytest.MonkeyPatc
         errs = [e for e in r.events if e["event"] == "error"]
         assert errs and errs[0]["kind"] == "timeout" and "stalled" in errs[0]["message"]
         assert r.orch.metrics.counters["output_stalls"] == 1
+    finally:
+        await teardown(r, task)
+
+
+async def test_a_long_spoken_answer_is_not_a_stall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live 2026-11-11: speech still playing SPEECH_STALL_S after the brain finished was cut as a
+    stall. Only no playback progress is a stall."""
+    from macd import orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "SPEECH_STALL_S", 0.2)
+    r, task = await make_rig()
+    r.brain.alive = True
+    real_play = r.out.play
+
+    async def slowish(pcm: object, sr: int) -> None:
+        await asyncio.sleep(0.15)  # each sentence plays a while; all of them take far over 0.2 s
+        await real_play(pcm, sr)
+
+    r.out.play = slowish  # type: ignore[method-assign]
+    try:
+        r.scripts["long"] = [text("One. Two. Three. Four. Five. Six.\n")]
+        r.mic.say("long", woke=True)
+        await wait_until(lambda: r.brain.asks)
+        await wait_until(lambda: r.orch.state == State.IDLE and r.orch.turn is None, timeout=5)
+        assert r.orch.metrics.counters.get("output_stalls", 0) == 0
+        assert not [e for e in r.events if e["event"] == "error"]
     finally:
         await teardown(r, task)
 

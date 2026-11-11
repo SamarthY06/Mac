@@ -26,15 +26,16 @@ class FakeTTS:
 
     sample_rate = 16_000
 
-    def __init__(self, delay: float = 0.0) -> None:
+    def __init__(self, delay: float = 0.0, samples: int = 160) -> None:
         self.delay = delay
+        self.samples = samples  # PCM length per text (16 kHz): set it to the output's play_s for barge-in tests
         self.texts: list[str] = []
         self.started: list[tuple[str, float]] = []
         self.finished: list[tuple[str, float]] = []
 
     def encode(self, text: str) -> np.ndarray:
         self.texts.append(text)
-        return np.full(160, float(len(self.texts) - 1), dtype=np.float32)
+        return np.full(self.samples, float(len(self.texts) - 1), dtype=np.float32)
 
     def decode(self, pcm: np.ndarray) -> str:
         i = int(pcm[0])

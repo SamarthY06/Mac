@@ -293,3 +293,62 @@ async def test_wake_right_after_mac_stops_speaking_and_during_followup():
     assert [k for k in kinds if k is not K.SPEECH_START] == [K.WAKE, K.UTTERANCE]
     assert events[-1].utterance.woke and events[-1].utterance.window is None
     assert lis._window_end is None  # the wake closed the follow-up window
+
+
+def _speaking_aec(text="Here is a long answer about the weather"):
+    return lambda l: (setattr(l, "_aec", True), l.set_speaking(True, text))
+
+
+async def test_barge_in_with_aec_pauses_then_passes_any_words():
+    """With AEC, speech over Mac emits BARGE_IN after barge_in_onset_ms, then the full transcript
+    (the orchestrator decides what it means); an empty transcript is a NO_SPEECH verdict."""
+    kinds, events, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=FakeSTT("what about tomorrow"),
+                                   before=_speaking_aec())
+    assert kinds == [K.BARGE_IN, K.UTTERANCE]
+    assert events[0].window is WindowReason.SPEAKING
+    u = events[1].utterance
+    assert u.window is WindowReason.SPEAKING and u.text == "what about tomorrow" and not u.woke
+    # onset: 300 ms of speech, so a 200 ms click never pauses Mac
+    kinds, _, _ = await run(audio((1.0, 1.2)), wake_at=None, stt=FakeSTT(""), before=_speaking_aec())
+    assert K.BARGE_IN not in kinds
+    # words heard as nothing (cough): the verdict is NO_SPEECH so Mac resumes
+    kinds, events, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT(""), before=_speaking_aec())
+    assert kinds == [K.BARGE_IN, K.NO_SPEECH] and events[1].window is WindowReason.SPEAKING
+    # no STT model: also a NO_SPEECH verdict (never stuck paused)
+    kinds, _, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT(missing=True), before=_speaking_aec())
+    assert kinds == [K.BARGE_IN, K.NO_SPEECH]
+
+
+async def test_barge_in_capture_is_a_full_utterance_and_survives_playback_end():
+    # 3 s of talking over Mac is one utterance (not cut at the 2 s stop-word cap)
+    kinds, events, _ = await run(audio((1.0, 4.0)), wake_at=None, stt=FakeSTT("long reply"), before=_speaking_aec())
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.audio_s > 3.0
+
+    def stop_mid(l):
+        _speaking_aec()(l)
+        orig = l._on_frame
+
+        async def frame(f):
+            await orig(f)
+            if l._pos == int(1.5 * SAMPLE_RATE):
+                l.set_speaking(False)  # Mac's sentence ended while the user was still talking
+
+        l._on_frame = frame
+
+    kinds, events, _ = await run(audio((1.0, 2.0)), wake_at=None, stt=FakeSTT("and another thing"), before=stop_mid)
+    assert kinds == [K.BARGE_IN, K.UTTERANCE] and events[1].utterance.text == "and another thing"
+
+
+async def test_barge_in_disabled_keeps_stop_word_only_capture():
+    cfg = Config()
+    cfg.listen.barge_in = False
+    kinds, _, _ = await run(audio((1.0, 1.5)), wake_at=None, stt=FakeSTT("what about tomorrow"), cfg=cfg,
+                            before=_speaking_aec())
+    assert kinds == []
+
+
+async def test_turn_window_stays_open_across_utterances():
+    kinds, events, _ = await run(audio((1.0, 1.5), (3.0, 3.5)), wake_at=None, stt=FakeSTT("and on Friday"),
+                                 before=lambda l: l.open_window(3600, WindowReason.TURN))
+    assert kinds == [K.SPEECH_START, K.UTTERANCE, K.SPEECH_START, K.UTTERANCE]
+    assert all(e.utterance.window is WindowReason.TURN for e in events if e.utterance)

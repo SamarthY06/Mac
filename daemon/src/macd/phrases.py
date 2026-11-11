@@ -174,6 +174,52 @@ def is_stop_other(text: str) -> bool:
     return bool(n) and any(p in STOP_OTHER_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS))
 
 
+# ----------------------------------------------------------------------------- barge-in (talking over Mac)
+
+#: Listener feedback that must NOT stop Mac (Vapi "acknowledgementPhrases", LiveKit/Pipecat backchannels).
+BACKCHANNEL_PHRASES = frozenset(
+    {"mm", "mmm", "mm hmm", "mhm", "mmhmm", "hmm", "hm", "uh huh", "uhhuh", "uh", "um", "ah", "oh", "ooh", "wow",
+     "yeah", "yes", "yep", "yup", "yah", "okay", "alright", "all right", "right", "sure", "cool", "nice", "great",
+     "good", "true", "exactly", "perfect", "interesting", "got it", "gotcha", "i see", "makes sense", "fair enough",
+     "of course", "totally", "indeed", "thanks", "thank you", "go on", "keep going", "uh hm"}
+)
+#: Short words that DO interrupt despite being under the word minimum (Vapi "interruptionPhrases").
+INTERJECTION_PHRASES = frozenset(
+    {"wait", "hold on", "hang on", "one sec", "one second", "pause", "excuse me", "sorry", "sorry what", "what",
+     "pardon", "huh", "hey"}
+)
+
+
+def _covered_by(words: list[str], phrases: frozenset[str]) -> bool:
+    """Can `words` be split entirely into `phrases` ("yeah okay got it" → yes)?"""
+    if not words:
+        return True
+    return any(" ".join(words[:k]) in phrases and _covered_by(words[k:], phrases) for k in range(min(3, len(words)), 0, -1))
+
+
+def is_backchannel(text: str) -> bool:
+    """"mm-hmm", "yeah", "okay got it", "right right": the listener is following, not taking the turn."""
+    words = normalize(text).replace("-", " ").split()
+    return bool(words) and len(words) <= 6 and _covered_by(words, BACKCHANNEL_PHRASES)
+
+
+def is_interjection(text: str) -> bool:
+    n = normalize(text)
+    return bool(n) and any(p in INTERJECTION_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS))
+
+
+def word_count(text: str) -> int:
+    return len(normalize(text).split())
+
+
+def is_echo(heard: str, spoken: str) -> bool:
+    """Residual echo of Mac's own voice that leaked through AEC: (nearly) every heard word is
+    one Mac was just saying."""
+    words = normalize(heard).split()
+    said = set(normalize(spoken).split())
+    return bool(words) and bool(said) and sum(w in said for w in words) / len(words) >= 0.8
+
+
 _NEG = re.compile(
     r"\b(no|nope|don'?t|not|never|cancel|stop|wait|hold on|but|instead|change|actually|after|once|before|first|"
     r"unless|except|only if)\b"

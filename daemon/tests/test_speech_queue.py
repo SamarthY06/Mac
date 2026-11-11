@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from orch_fakes import FakeOutput, FakeTTS, wait_until
 
-from macd.speech_queue import SYSTEM_TURN, SpeechQueue
+from macd.speech_queue import SYSTEM_TURN, SpeechQueue, resume_offset
 
 
 @pytest.fixture
@@ -194,3 +194,107 @@ async def test_priority_item_jumps_the_queue() -> None:
         assert out.spoken == ["First sentence.", "Got it.", "Second sentence.", "Third sentence."]
     finally:
         task.cancel()
+
+
+# ----------------------------------------------------------------------------- pause / resume (barge-in)
+
+
+@pytest.fixture
+async def slow() -> AsyncIterator[tuple[SpeechQueue, FakeTTS, FakeOutput]]:
+    """1 s of PCM per text, played in 1 s: playback position tracks wall time."""
+    tts = FakeTTS(samples=16_000)
+    out = FakeOutput(tts, play_s=1.0)
+    q = SpeechQueue(tts, {"local": out})
+    task = asyncio.create_task(q.run())
+    try:
+        yield q, tts, out
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+def test_resume_offset_snaps_back_to_a_word_gap() -> None:
+    sr = 16_000
+    pcm = np.full(sr, 0.5, dtype=np.float32)
+    pcm[int(0.50 * sr):int(0.56 * sr)] = 0.0  # a gap between two words
+    at = resume_offset(pcm, sr, int(0.8 * sr))
+    assert int(0.50 * sr) <= at < int(0.56 * sr)  # replays the cut word from its start
+    assert resume_offset(pcm, sr, 100) == 0
+    assert resume_offset(pcm, sr, 10 * sr) <= sr  # clamped to the item
+
+
+async def test_pause_holds_the_remainder_and_resume_plays_it_first(slow) -> None:
+    q, _, out = slow
+    q.set_current_turn(1)
+    q.say(1, "first sentence here", "answer")
+    q.say(1, "second sentence", "answer")
+    await wait_until(lambda: out.play_started)
+    await asyncio.sleep(0.2)
+    assert q.pause() and q.paused and q.speaking and q.playing_turn == 1
+    await asyncio.sleep(0.1)
+    assert len(out.play_started) == 1 and out.cancelled_at  # cut, and nothing else started
+    assert q.pending(1) == 2  # remainder + the queued sentence: drain() still waits
+    assert q.resume() and not q.paused
+    await asyncio.wait_for(q.drain(1), 5)
+    assert out.spoken == ["first sentence here", "second sentence"]
+    assert q.words_heard(1) == 5
+
+
+async def test_pause_ignores_system_speech_and_silence(slow) -> None:
+    q, _, out = slow
+    assert not q.pause()  # nothing playing
+    q.say(SYSTEM_TURN, "Okay, stopped.")
+    await wait_until(lambda: out.play_started)
+    assert not q.pause() and not q.paused
+
+
+async def test_cancel_while_paused_counts_what_was_heard_and_unpauses(slow) -> None:
+    q, _, out = slow
+    q.set_current_turn(1)
+    q.say(1, "one two three four five six seven eight nine ten", "answer")
+    await wait_until(lambda: out.play_started)
+    await asyncio.sleep(0.5)
+    q.pause()
+    q.cancel_turn(1)
+    await asyncio.sleep(0.02)  # the consumer releases the cut item
+    assert not q.paused and q.pending(1) == 0
+    assert 2 <= q.words_heard(1) <= 6  # about half of it, from the resume point
+    q.say(SYSTEM_TURN, "Okay, stopped.")
+    await wait_until(lambda: "Okay, stopped." in out.spoken, timeout=3)
+
+
+async def test_flush_turn_keeps_the_turn_live(slow) -> None:
+    q, _, out = slow
+    q.set_current_turn(1)
+    q.say(1, "a b c d", "answer")
+    q.say(1, "never heard", "answer")
+    await wait_until(lambda: out.play_started)
+    await asyncio.sleep(0.25)
+    q.flush_turn(1)
+    await asyncio.sleep(0.02)
+    assert q.pending(1) == 0 and q.words_heard(1) == 1  # a quarter of four words
+    assert q.say(1, "the reply", "answer")  # unlike cancel_turn, later speech still plays
+    await asyncio.wait_for(q.drain(1), 5)
+    assert out.spoken == ["the reply"]
+
+
+async def test_pause_during_synthesis_holds_the_whole_item() -> None:
+    tts = FakeTTS(delay=0.1, samples=1600)
+    out = FakeOutput(tts, play_s=0.1)
+    q = SpeechQueue(tts, {"local": out})
+    task = asyncio.create_task(q.run())
+    try:
+        q.set_current_turn(1)
+        q.say(1, "on it", "filler")
+        await wait_until(lambda: tts.started)
+        assert q.pause()
+        await asyncio.sleep(0.2)
+        assert out.play_started == [] and q.pending(1) == 1
+        q.resume()
+        await asyncio.wait_for(q.drain(1), 2)
+        assert out.spoken == ["on it"]
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

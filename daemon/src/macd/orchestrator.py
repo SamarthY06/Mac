@@ -4,19 +4,26 @@ One asyncio loop, one owner per resource. The orchestrator owns *policy*; it nev
 audio directly (everything goes through SpeechQueue) and never blocks on the brain (calls
 that may wait run in the Turn's task set).
 
-Input policy:
-| state               | utterance                          | action                              |
-|---------------------|------------------------------------|-------------------------------------|
-| IDLE / LISTENING    | woke (or PTT window / remote)      | new turn                            |
-| FOLLOWUP            | any from the turn's source         | new turn (same conversation)        |
-| THINKING / SPEAKING | woke: stop words                   | interrupt                           |
-|                     | woke: anything else / continuation | steer (+ "Got it." unless cont.);   |
-|                     |   ("actually…" included, AG17)     | the model redirects or adds         |
-|                     | SPEAKING window (bare stop word)   | interrupt                           |
-| CONFIRMING          | affirmative                        | gate.resolve(True)                  |
-|                     | bare negative / timeout            | gate.resolve(False)                 |
-|                     | longer reply ("yes but …")         | gate.resolve(False) + steer         |
-| OFF                 | —                                  | listeners muted; nothing arrives    |
+Input policy ("partner" = the mic of a voice turn's speaker; its TURN window needs no wake word):
+| state               | utterance                               | action                                   |
+|---------------------|-----------------------------------------|------------------------------------------|
+| IDLE / LISTENING    | woke (or PTT window / remote)           | new turn                                 |
+| FOLLOWUP            | any from the turn's source              | new turn (same conversation)             |
+| any, Mac talking    | stop words (any source, wake or not)    | interrupt + "Okay, stopped."             |
+| SPEAKING (barge-in) | partner, VAD onset ≥ 300 ms (AEC on)    | pause speech at once                     |
+|                     | then no words / backchannel / echo /    | resume from just before the cut          |
+|                     |   < 2 words (not "wait"…)               |   (false interruption)                   |
+|                     | then real words                         | cut speech; brain told what was heard;   |
+|                     |                                         | brain done → new turn, else steer        |
+| THINKING / SPEAKING | woke: anything else / continuation      | steer (+ "Got it." unless cont.) (AG17)  |
+|                     | partner, no wake word                   | brain silent so far → merged re-ask;     |
+|                     |   (backchannels ignored)                | else steer, marked as said without wake  |
+|                     | anyone else, no wake word               | ignored (logged)                         |
+| CONFIRMING          | affirmative                             | gate.resolve(True)                       |
+|                     | bare negative / timeout                 | gate.resolve(False)                      |
+|                     | longer reply ("yes but …")              | gate.resolve(False) + steer              |
+|                     | over the prompt (not a stop word)       | ignored: a yes needs the whole question  |
+| OFF                 | —                                       | listeners muted; nothing arrives         |
 """
 
 from __future__ import annotations
@@ -64,7 +71,25 @@ SPEECH_STALL_S = 30.0
 HANDOFF_TIMEOUT_S = 60.0  # brain.handoff() (session notes) before reset / OFF  # an output that hasn't finished a turn's speech by then is treated as broken
 STOP_OTHER_TIMEOUT_S = 5.0
 CONFIRM_SPEECH_SLACK_S = 10.0  # confirm timeout armed at CONFIRM arrival, before the prompt is spoken
+TURN_WINDOW_S = 3600.0  # the partner's TURN window lasts the turn (closed or replaced explicitly)
+BARGE_MAX_PAUSE_S = 20.0  # a barge-in pause with no verdict resumes after this (< SPEECH_STALL_S)
 DescribeTool = Callable[[str, dict[str, Any]], str | None]
+
+# Context for the brain, prepended to the user's words (Realtime's "truncate": the model must
+# know what the user actually heard of a reply that was cut off).
+BARGE_NOTE = ("[The user said this over your speech, without the wake word. If it is not meant for you, "
+              "carry on from where you were cut off.]")
+WORKING_NOTE = ("[Said while you were working, without the wake word. If it is not meant for you, ignore it "
+                "and continue.]")
+
+
+def interruption_note(heard: str, unheard: str) -> str:
+    """'[Your last reply was cut off: …]' or '' when the user heard all of it."""
+    if not unheard.strip():
+        return ""
+    got = f'they heard up to "…{heard[-200:]}"' if heard.strip() else "they heard none of it"
+    rest = unheard if len(unheard) <= 200 else unheard[:200] + "…"
+    return f'[Your last reply was cut off: {got}; they did not hear "{rest}".]'
 
 
 class Gate(Protocol):
@@ -113,10 +138,17 @@ class Turn:
     held_t: float | None = None
     releasing: bool = False  # this text block is the answer: stream it
     assistant: list[str] = field(default_factory=list)
+    context: str = ""  # note(s) prepended to `text` in the brain's ask (cut-off reply, barge-in)
+    output_started: bool = False  # the brain produced something (text, say, tool, confirm)
 
     @property
     def remote(self) -> bool:
         return self.origin == "remote"
+
+    @property
+    def conversational(self) -> bool:
+        """A spoken conversation: its speaker's mic needs no wake word for the rest of the turn."""
+        return self.origin in ("voice", "remote")
 
 
 # ----------------------------------------------------------------------------- orchestrator
@@ -176,6 +208,10 @@ class Orchestrator:
         self._followup_deadline = 0.0
         self._recent_user: collections.deque[str] = collections.deque(maxlen=50)
         self._handoff_task: asyncio.Task[Any] | None = None
+        self._barge: int | None = None  # turn id whose speech is paused by a barge-in
+        self._turn_window: str | None = None  # listener holding the current TURN window
+        self._cut_note = ""  # what the user missed of the last cancelled reply (next ask)
+        self._recent_spoken: collections.deque[str] = collections.deque(maxlen=2)  # echo check
         self._tg: asyncio.TaskGroup | None = None
         self._stop = asyncio.Event()
         self.started = time.monotonic()
@@ -364,6 +400,8 @@ class Orchestrator:
         self.speech.say(SYSTEM_TURN, P.dedash(text), "say", output=out, priority=priority)
 
     def _on_speech_start(self, text: str, kind: str) -> None:
+        if text:
+            self._recent_spoken.append(text)
         for lst in self._listeners.values():
             with contextlib.suppress(Exception):
                 lst.set_speaking(True, text)
@@ -412,9 +450,23 @@ class Orchestrator:
         if lst is None:
             return None
         lst.open_window(seconds, reason)
+        self._turn_window = lst.source_name if reason == WindowReason.TURN else None
         return lst.source_name
 
+    def _ensure_turn_window(self, turn: Turn) -> None:
+        """Keep the partner's mic open (no wake word) while a voice turn runs."""
+        if (self.turn is turn and turn.conversational and not turn.confirming and self._turn_window is None
+                and not self._effective_mute()):
+            self._open_window(turn.source, TURN_WINDOW_S, WindowReason.TURN)
+
+    def _is_partner(self, turn: Turn | None, source: str) -> bool:
+        if turn is None or not turn.conversational:
+            return False
+        lst = self._listener_for(turn.source)
+        return lst is not None and lst.source_name == source
+
     def _close_windows(self) -> None:
+        self._turn_window = None
         for lst in self._listeners.values():
             with contextlib.suppress(Exception):
                 lst.close_window()
@@ -437,6 +489,8 @@ class Orchestrator:
             self.eventlog.emit("false_wake", source=ev.source)
         elif kind == ListenerEventKind.SPEECH_START:
             self._on_speech_detected(ev)
+        elif kind == ListenerEventKind.BARGE_IN:
+            self._on_barge_in(ev)
         elif kind == ListenerEventKind.NO_SPEECH:
             self._on_no_speech(ev)
         elif kind == ListenerEventKind.UTTERANCE and ev.utterance is not None:
@@ -475,6 +529,11 @@ class Orchestrator:
             self._set_state(State.LISTENING, "speech")
 
     def _on_no_speech(self, ev: ListenerEvent) -> None:
+        if ev.window == WindowReason.SPEAKING or (ev.window is None and self._barge is not None):
+            self._barge_resume("no words")  # coughs, clicks, echo, or "Hey Mac" and nothing more
+            return
+        if ev.window == WindowReason.TURN:
+            return  # an empty capture in the partner's open window (a cough): not an answer to anything
         if self.state == State.CONFIRMING and self.turn is not None and self.turn.confirming:
             self._resolve_confirm(self.turn, "timeout", "no_speech")
             return
@@ -510,19 +569,22 @@ class Orchestrator:
             return
 
         turn = self.turn
-        # ---------------------------------------------------------------- bare stop word while speaking
-        # DECISION 11: only stop words count here; corrections/steers still need the wake word
-        # (a bystander's "actually, let's get lunch" must not redirect the turn).
-        if window == WindowReason.SPEAKING:
-            if not P.is_stop(text):
-                self._ignore(source, text, "speaking: not a stop word")
-            elif turn is not None:
-                self.metrics.incr("interrupts")
-                await self._cancel_turn(turn, "stop while speaking", speak=True)
-            else:
-                self.speech.flush_all()
-            return
+        partner = self._is_partner(turn, source)
+        try:
+            # ------------------------------------------------------------ speech over Mac
+            if window == WindowReason.SPEAKING:
+                await self._on_speaking_utterance(turn, text, source, partner, ev.t)
+                return
+            await self._on_turn_utterance(ev, utt, text, source, origin, woke, remote, partner, is_text)
+        finally:
+            if self.turn is not None:
+                self._ensure_turn_window(self.turn)
 
+    async def _on_turn_utterance(self, ev: ListenerEvent, utt: Utterance, text: str, source: str, origin: str,
+                                 woke: bool, remote: bool, partner: bool, is_text: bool) -> None:
+        turn = self.turn
+        window = utt.window
+        continuation = utt.continuation
         # ---------------------------------------------------------------- CONFIRMING
         if turn is not None and self.state == State.CONFIRMING and turn.confirming:
             if utt.woke or window == WindowReason.CONFIRM or source == self._confirm_source(turn):
@@ -542,7 +604,7 @@ class Orchestrator:
 
         # ---------------------------------------------------------------- "stop the other task" (W6)
         if self.stop_other is not None and P.is_stop_other(text) and (
-                (woke and not continuation) or window == WindowReason.FOLLOWUP):
+                (woke and not continuation) or window == WindowReason.FOLLOWUP or partner):
             self._activity("stop_other", turn.id if turn else None, text="Stopping the other task")
             if turn is None and self.state in (State.LISTENING, State.FOLLOWUP):
                 self._cancel_timer("followup")
@@ -552,29 +614,39 @@ class Orchestrator:
 
         # ---------------------------------------------------------------- mid-turn
         if turn is not None and not turn.brain_done:
-            if not woke:
+            if not (woke or partner):
                 self.metrics.incr("ignored_utterances")
                 self._ignore(source, text, "mid-turn without wake word")
-            elif continuation:
-                self._steer(turn, text, ack=False)
-            elif P.is_stop(text):
+                return
+            if P.is_stop(text):
                 self.metrics.incr("interrupts")
                 await self._cancel_turn(turn, "stop words", speak=True)
             elif P.is_off_request(text):
                 await self._cancel_turn(turn, "off request", speak=False)
                 self._go_off_spoken(turn.output)
+            elif continuation:  # dictation past max_utterance_s: the rest of the same request
+                self._steer(turn, text, ack=False)
+            elif not woke and P.is_backchannel(text):
+                self._ignore(source, text, "mid-turn backchannel")
+            elif not woke and not turn.output_started:  # kept talking before the brain said/did anything
+                await self._merge(turn, text, source, ev.t)
             else:  # "actually…", "no rush, also…": the model decides how to take it (AG17)
-                self._steer(turn, text)
+                cut = self._cut_speech(turn) if self._barge == turn.id else ""
+                note = "" if woke else WORKING_NOTE
+                self._steer(turn, _join(cut, note, text), ack=woke, shown=text)
             return
 
         # ---------------------------------------------------------------- brain done, speech still playing
         if turn is not None:
-            if not woke and window != WindowReason.FOLLOWUP:
+            if not (woke or partner or window == WindowReason.FOLLOWUP):
                 self._ignore(source, text, "speaking tail without wake word")
                 return
-            await self._cancel_turn(turn, "stop words" if P.is_stop(text) else "new utterance",
-                                    speak=P.is_stop(text))
-            if P.is_stop(text):
+            if not woke and P.is_backchannel(text):
+                self._ignore(source, text, "speaking tail backchannel")
+                return
+            stop = P.is_stop(text)
+            await self._cancel_turn(turn, "stop words" if stop else "new utterance", speak=stop, keep_windows=not stop)
+            if stop:
                 return
             await self._start_turn(text, source, origin=origin, transcript_t=ev.t)
             return
@@ -606,6 +678,105 @@ class Orchestrator:
         else:
             await self._start_turn(text, source, origin=origin, transcript_t=ev.t)
 
+    # ================================================================== barge-in (talking over Mac)
+
+    def _on_barge_in(self, ev: ListenerEvent) -> None:
+        """VAD onset over Mac's speech (AEC on): pause NOW; the transcript decides (LiveKit's
+        "pause on speech, resume on false interruption")."""
+        turn = self.turn
+        if (turn is None or turn.confirming or not self.cfg.listen.barge_in or not self._is_partner(turn, ev.source)
+                or self.speech.playing_turn != turn.id):
+            return
+        if self.speech.pause():
+            self._barge = turn.id
+            self.metrics.incr("barge_pauses")
+            self.eventlog.emit("barge_pause", turn_id=turn.id, source=ev.source)
+            self._timer("barge", BARGE_MAX_PAUSE_S, lambda: self._barge_resume("timeout"))
+
+    def _barge_resume(self, why: str) -> None:
+        if self._barge is None:
+            return
+        tid, self._barge = self._barge, None
+        self._cancel_timer("barge")
+        if self.speech.resume():
+            self.metrics.incr("false_interruptions")
+            self.eventlog.emit("barge_resume", turn_id=tid, reason=why)
+
+    def _barge_clear(self) -> None:
+        self._barge = None
+        self._cancel_timer("barge")
+
+    async def _on_speaking_utterance(self, turn: Turn | None, text: str, source: str, partner: bool,
+                                     t: float) -> None:
+        if P.is_stop(text):  # "stop" always stops, whoever says it (UX#1)
+            self._barge_clear()
+            if turn is not None:
+                self.metrics.incr("interrupts")
+                await self._cancel_turn(turn, "stop while speaking", speak=True)
+            else:
+                self.speech.flush_all()
+            return
+        # before the brain said anything real (only the "On it." filler plays), the user is still
+        # finishing the request: any words merge into it, however short ("…about" "octopuses")
+        early = turn is not None and partner and not turn.brain_done and not turn.output_started
+        why = self._barge_reject(turn, text, partner, early=early)
+        if why or turn is None:
+            self._ignore(source, text, f"speaking: {why}")
+            self._barge_resume(why)
+            return
+        self.metrics.incr("interrupts")
+        self.metrics.incr("barge_ins")
+        self._barge_clear()
+        self._activity("barge_in", turn.id, text=text)
+        if turn.brain_done:  # only its speech is left: a new turn, told what the user missed
+            await self._cancel_turn(turn, "barge-in", speak=False, keep_windows=True)
+            await self._start_turn(text, source, origin="remote" if turn.remote else "voice", transcript_t=t,
+                                   context=BARGE_NOTE, filler=False)  # no "On it." right after a cut-in
+        elif not turn.output_started:  # talking over the filler: still one request
+            await self._merge(turn, text, source, t)
+        else:
+            self._steer(turn, _join(self._cut_speech(turn), BARGE_NOTE, text), ack=False, shown=text)
+
+    def _barge_reject(self, turn: Turn | None, text: str, partner: bool, *, early: bool = False) -> str:
+        """Why speech over Mac is NOT a real interruption ('' = it is). Deterministic audio
+        mechanics only (who, how much, echo); what it means is the model's call."""
+        if turn is None or not partner:
+            return "not a stop word"  # system speech, a typed turn, or another mic
+        if not self.cfg.listen.barge_in:
+            return "barge-in off"
+        if turn.confirming:
+            return "confirming"  # a yes needs the whole question; "stop" still works
+        if P.is_backchannel(text):
+            return "backchannel"
+        if P.is_echo(text, " ".join(self._recent_spoken)):
+            return "echo"
+        if not early and P.word_count(text) < self.cfg.listen.barge_in_min_words and not P.is_interjection(text):
+            return "too short"
+        return ""
+
+    def _cut_speech(self, turn: Turn) -> str:
+        """Stop the turn's speech for good (the turn goes on) and say what the user missed."""
+        self._barge_clear()
+        self.speech.flush_turn(turn.id)
+        note = self._cut_note_for(turn)
+        turn.held, turn.held_t, turn.releasing = [], None, False
+        turn.segmenter.flush()
+        return note
+
+    def _cut_note_for(self, turn: Turn) -> str:
+        words = " ".join(P.dedash(s) for s in [*turn.assistant, *turn.held]).split()
+        n = self.speech.words_heard(turn.id)
+        return interruption_note(" ".join(words[:n]), " ".join(words[n:]))
+
+    async def _merge(self, turn: Turn, text: str, source: str, t: float) -> None:
+        """The user kept talking before the brain produced anything: re-ask with the whole
+        request (LiveKit's preemptive generation is discarded the same way)."""
+        self.metrics.incr("merged_utterances")
+        self.eventlog.emit("turn_merge", turn_id=turn.id, text=text)
+        await self._cancel_turn(turn, "merged", speak=False, keep_windows=True)
+        await self._start_turn(f"{turn.text} {text}", source, origin=turn.origin, transcript_t=t,
+                               context=turn.context, filler=False)
+
     async def _stop_other(self, output: str) -> None:
         assert self.stop_other is not None
         try:
@@ -624,23 +795,29 @@ class Orchestrator:
 
     # ================================================================== turns
 
-    async def _start_turn(self, text: str, source: str, *, origin: str, transcript_t: float | None = None) -> Turn:
+    async def _start_turn(self, text: str, source: str, *, origin: str, transcript_t: float | None = None,
+                          context: str = "", filler: bool = True) -> Turn:
         if self.turn is not None:
             await self._cancel_turn(self.turn, "superseded", speak=False)
         self._cancel_timer("followup")
-        self._close_windows()
         tid = next(self._turn_ids)
         turn = Turn(id=tid, text=text, source=source, output=self._output_for_source(source), origin=origin,
                     segmenter=self.segmenter_factory(), tasks=TaskSet(f"turn{tid}"),
-                    transcript_t=transcript_t or time.monotonic())
+                    transcript_t=transcript_t or time.monotonic(), context=_join(self._cut_note, context))
+        self._cut_note = ""
+        # A voice turn keeps its speaker's mic open (TURN window; an in-flight capture survives);
+        # anything else closes the follow-up / PTT window.
+        if not turn.conversational:
+            self._close_windows()
         self.turn = turn
         self.speech.set_current_turn(tid)
         self.metrics.incr("turns")
         self.eventlog.emit("turn_start", turn_id=tid, text=text, source=source, origin=origin, output=turn.output)
         self._activity("turn_start", tid, text=text, source=source, origin=origin)
         self._set_state(State.THINKING, "new turn")
-        if (filler := self._filler(text)) is not None:
-            self._speak(turn, filler, "filler")
+        self._ensure_turn_window(turn)
+        if filler and (line := self._filler(text)) is not None:
+            self._speak(turn, line, "filler")
         turn.tasks.spawn(self._ask(turn), "ask")
         turn.tasks.spawn(self._narration_loop(turn), "narration")
         turn.tasks.spawn(self._slow_start(turn), "slow-start")
@@ -649,7 +826,7 @@ class Orchestrator:
 
     async def _ask(self, turn: Turn) -> None:
         try:
-            await self.brain.ask(turn.id, turn.text)
+            await self.brain.ask(turn.id, _join(turn.context, turn.text))
             turn.asked_t = time.monotonic()
         except asyncio.CancelledError:
             raise
@@ -659,21 +836,26 @@ class Orchestrator:
                 self._on_error(turn, BrainEvent(BrainEventKind.ERROR, turn.id, error_kind=BrainErrorKind.INTERNAL,
                                                 data={"exc": repr(e)}))
 
-    def _steer(self, turn: Turn, text: str, *, ack: bool = True) -> None:
+    def _steer(self, turn: Turn, text: str, *, ack: bool = True, shown: str | None = None) -> None:
         self.metrics.incr("steers")
-        self._activity("steer", turn.id, text=text)
+        self._activity("steer", turn.id, text=shown if shown is not None else text)
         if ack:
             self._speak(turn, P.STEER_ACK, "filler", priority=True)
         turn.tasks.spawn(self.brain.steer(turn.id, text), "steer")
 
-    async def _cancel_turn(self, turn: Turn, reason: str, *, speak: bool) -> None:
+    async def _cancel_turn(self, turn: Turn, reason: str, *, speak: bool, keep_windows: bool = False) -> None:
+        """`keep_windows`: a new turn follows at once (merge, barge-in): keep a capture in flight."""
         if self.turn is not turn:
             return
         self.turn = None
         self.last_turn = turn
         self._off_after_turn = False  # stopped or superseded: the user is still talking to Mac
         turn.tasks.cancel()
+        self._barge_clear()
         self.speech.cancel_turn(turn.id)
+        self._cut_note = self._cut_note_for(turn)
+        if not keep_windows and self._turn_window is not None:
+            self._close_windows()
         self._cancel_timer("confirm")
         self._cancel_timer("thinking")
         if turn.confirming:
@@ -693,9 +875,20 @@ class Orchestrator:
             except (TimeoutError, Exception):
                 log.warning("brain.interrupt(%d) failed or timed out", turn.id, exc_info=True)
 
+    async def _drain_while_progressing(self, turn_id: int) -> bool:
+        """Wait for the turn's speech however long it is: a stall is SPEECH_STALL_S with no
+        playback progress (an item started or ended), not a long answer. A barge-in pause is
+        not a stall either (its own timer resumes it)."""
+        while not await self.speech.drain(turn_id, timeout=SPEECH_STALL_S):
+            idle = time.monotonic() - self.speech.last_activity
+            if idle < SPEECH_STALL_S or self.speech.paused:
+                continue
+            return False
+        return True
+
     async def _finish_turn(self, turn: Turn) -> None:
         """After DONE/ERROR: wait for the turn's speech, then FOLLOWUP → IDLE."""
-        if not await self.speech.drain(turn.id, timeout=SPEECH_STALL_S):
+        if not await self._drain_while_progressing(turn.id):
             self.speech.cancel_turn(turn.id)
             if self.turn is turn and not turn.errored:
                 turn.errored = True
@@ -720,6 +913,8 @@ class Orchestrator:
         if not turn.errored and elapsed > LONG_TURN_DONE_EARCON_S:
             self._play_earcon("done", turn.output)
         if self.off or turn.errored or (turn.origin == "control" and not self._listeners):
+            if self._turn_window is not None:
+                self._close_windows()
             self._set_state(State.OFF if self.off else State.IDLE, "turn end")
             return
         asked_question = bool(turn.assistant) and turn.assistant[-1].rstrip().endswith("?")
@@ -731,6 +926,8 @@ class Orchestrator:
                 self._set_state(State.FOLLOWUP, "turn end")
                 self._timer("followup", followup_s + 0.5, self._followup_expired)
                 return
+        if self._turn_window is not None:
+            self._close_windows()
         self._set_state(State.IDLE, "turn end")
 
     def _followup_expired(self) -> None:
@@ -772,6 +969,8 @@ class Orchestrator:
             return
         turn.last_event = time.monotonic()
         k = ev.kind
+        if k in (BrainEventKind.TEXT, BrainEventKind.SAY, BrainEventKind.TOOL_START, BrainEventKind.CONFIRM):
+            turn.output_started = True
         if k in (BrainEventKind.TEXT, BrainEventKind.SAY) and turn.first_text_t is None:
             turn.first_text_t = time.monotonic()
             self.metrics.observe_since("brain_first_text", turn.asked_t or turn.started)
@@ -932,6 +1131,7 @@ class Orchestrator:
                            confirm_source=confirm_source)
         self._activity("confirm_result", turn.id, approved=approved, reason=why, text=text, confirm_source=confirm_source)
         self._set_state(State.THINKING, f"confirm {why}")
+        self._ensure_turn_window(turn)
         if verdict == "steer":
             self._steer(turn, text)  # "yes, but change the subject": the model revises and asks again
         elif verdict != "yes":  # approval gets no ack of ours: the model says the one word
@@ -1066,6 +1266,8 @@ class Orchestrator:
                 lst.set_muted(effective)
         if effective:
             self._close_windows()
+        elif self.turn is not None:
+            self._ensure_turn_window(self.turn)
 
     def set_muted(self, muted: bool) -> None:
         self.muted = bool(muted)
@@ -1134,6 +1336,7 @@ class Orchestrator:
             await self._cancel_turn(self.turn, "reset", speak=False)
         with contextlib.suppress(Exception):
             self.gate.revoke_all()
+        self._cut_note = ""
         await self._handoff("reset")
         await self.brain.reset()
         self._activity("reset", None, text="New conversation")
@@ -1237,6 +1440,10 @@ class Orchestrator:
             "eventlog_dropped": self.eventlog.dropped,
             "uptime_s": round(time.monotonic() - self.started, 1),
         }
+
+
+def _join(*parts: str) -> str:
+    return " ".join(p for p in parts if p)
 
 
 def _truncate(obj: Any, limit: int = 400) -> Any:

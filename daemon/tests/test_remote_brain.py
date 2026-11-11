@@ -759,9 +759,13 @@ async def test_spoken_stop_other_mid_turn_keeps_the_voice_turn() -> None:
         await wait_until(lambda: P.STOPPED_OTHER in r.spoken)
         assert calls == [1] and r.brain.interrupts == [] and r.brain.steers == []
         assert r.orch.turn is not None and r.orch.turn.id == 1
-        r.mic.say("stop the other task")  # no wake word mid turn: ignored
+        other = T.FakeListener("other")
+        r.orch.add_listener(other)
+        other.say("stop the other task")  # no wake word, not the turn's speaker: ignored
         await asyncio.sleep(0.05)
         assert calls == [1]
+        r.mic.say("stop the other task")  # the turn's speaker needs no wake word mid turn (2026-11-11)
+        await wait_until(lambda: calls == [1, 1])
     finally:
         await _local_td(r, task)
 

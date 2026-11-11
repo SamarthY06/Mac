@@ -63,7 +63,7 @@ WAKE_LOOKBACK_S = 1.6  # utterance audio starts this far before the hit (wake ph
 WINDOW_PREROLL_S = 0.3
 WINDOW_START_FRAMES = 3  # consecutive speech frames needed to open a window capture
 SAME_BREATH_S = 0.6  # speech starting within this of the hit = same breath (no wake blip needed)
-STOP_CAPTURE_S = 2.0  # stop-word captures while speaking are at most this long
+STOP_CAPTURE_S = 2.0  # stop-word captures while speaking (no AEC) are at most this long
 TRAILING_KEEP_S = 0.3
 KWS_BATCH_FRAMES = 4  # feed KWS 80 ms at a time: the encoder steps every 16 frames anyway, 4x fewer thread hops
 MAX_KWS_INFLIGHT = 2  # batches the executor may lag before the frame loop waits (never in real time)
@@ -92,6 +92,8 @@ class _Capture:
     speech_start_pending: bool = False  # SPEECH_START held back until WAKE is emitted
     capped: bool = False  # current segment continues one that hit max_utterance_s
     produced_text: bool = False  # set by the utterance job once this capture yielded text
+    barge: bool = False  # SPEAKING capture with AEC: any words count (the orchestrator decides)
+    onset_sent: bool = False  # BARGE_IN already emitted for this capture
     wall_hit: float = 0.0
 
     def restart(self, pos: int, *, speaking: bool, max_end: int) -> None:
@@ -153,6 +155,7 @@ class ListenerImpl:
         self._no_speech = _samples(lc.no_speech_timeout_s)
         self._vad_th = lc.vad_threshold
         self._tail_guard = _samples(lc.tail_guard_ms / 1000)
+        self._barge_onset_frames = max(1, round(lc.barge_in_onset_ms / 20))
 
     # ------------------------------------------------------------------ public API
 
@@ -216,8 +219,8 @@ class ListenerImpl:
             if not self.aec:
                 self._guard_until = self._pos + self._tail_guard
             c = self._capture
-            if c is not None and c.window is WindowReason.SPEAKING:
-                self._capture = None  # playback ended: no more stop-word captures
+            if c is not None and c.window is WindowReason.SPEAKING and not c.barge:
+                self._capture = None  # playback ended: no more stop-word captures (a barge-in finishes)
         self.speaking = speaking
         self._current_text = current_text if speaking else ""
 
@@ -332,6 +335,9 @@ class ListenerImpl:
                     c.speech_start_pending = True  # emitted right after WAKE (keeps event order)
                 else:
                     self._enqueue(self._emit(ListenerEvent(ListenerEventKind.SPEECH_START, self.source_name)))
+        if c.barge and not c.onset_sent and is_speech and self._speech_run >= self._barge_onset_frames:
+            c.onset_sent = True  # straight onto the queue (not chained behind STT): the pause must be instant
+            self._queue.put_nowait(ListenerEvent(ListenerEventKind.BARGE_IN, self.source_name, window=WindowReason.SPEAKING))
         if c.speech_started:
             if c.end >= c.max_end:
                 self._finalize(c, capped=is_speech)  # still talking: the rest continues as dictation
@@ -344,19 +350,27 @@ class ListenerImpl:
     def _step_window(self, is_speech: bool) -> None:
         if self._capture is not None:
             return
+        reason = self._window_reason if self._window_end is not None else None
+        if self.speaking and reason in (None, WindowReason.TURN):
+            if is_speech and self._speech_run >= WINDOW_START_FRAMES:
+                # Speech over Mac. With AEC it is a possible barge-in (a full utterance, BARGE_IN at
+                # onset); without AEC our own voice is in the mic, so only a short stop-word capture.
+                barge = self.aec and self._cfg.listen.barge_in
+                end = self._pos + (self._max_utt if barge else _samples(STOP_CAPTURE_S))
+                self._start_vad_capture(WindowReason.SPEAKING, end, barge=barge)
+            return
+        if self._window_end is None:
+            return
         suppressed = (self.speaking or self._pos < self._guard_until) and not self.aec
-        if self._window_end is not None:
-            if is_speech and not suppressed and self._speech_run >= WINDOW_START_FRAMES:
-                self._start_vad_capture(self._window_reason, self._pos + self._max_utt)
-                self._window_end = None  # one utterance per window
-            elif self._pos >= self._window_end:
-                reason, self._window_end, self._window_reason = self._window_reason, None, None
-                self._enqueue(self._emit(ListenerEvent(ListenerEventKind.NO_SPEECH, self.source_name, window=reason)))
-        elif self.speaking and is_speech and self._speech_run >= WINDOW_START_FRAMES:
-            # Stop-word capture while Mac talks ("stop", "that's enough"): short, VAD-segmented.
-            self._start_vad_capture(WindowReason.SPEAKING, self._pos + _samples(STOP_CAPTURE_S))
+        if is_speech and not suppressed and self._speech_run >= WINDOW_START_FRAMES:
+            self._start_vad_capture(reason, self._pos + self._max_utt)
+            if reason is not WindowReason.TURN:
+                self._window_end = None  # one utterance per window (a TURN window stays open)
+        elif self._pos >= self._window_end:
+            self._window_end, self._window_reason = None, None
+            self._enqueue(self._emit(ListenerEvent(ListenerEventKind.NO_SPEECH, self.source_name, window=reason)))
 
-    def _start_vad_capture(self, window: WindowReason | None, max_end: int) -> None:
+    def _start_vad_capture(self, window: WindowReason | None, max_end: int, *, barge: bool = False) -> None:
         start = max(self._ring.oldest, self._pos - _samples(WINDOW_PREROLL_S) - self._speech_run * FRAME_SAMPLES)
         cap = _Capture(
             woke=False,
@@ -368,6 +382,7 @@ class ListenerImpl:
             speech_seen=True,
             speech_start=start,
             last_speech=self._pos,
+            barge=barge,
         )
         cap.parts.append(self._ring.slice(start, self._pos))
         cap.end = self._pos
@@ -459,14 +474,18 @@ class ListenerImpl:
         if c.rejected:
             return
         text = await self._transcribe(audio, "listener_stt")
+        if c.barge and not text:  # a false barge-in (cough, echo, no STT): Mac resumes
+            self._queue.put_nowait(ListenerEvent(ListenerEventKind.NO_SPEECH, self.source_name, window=c.window))
+            return
         if text is None:
             return
         if c.woke and not c.produced_text:
             text = self._phrases.remove(text)
         if c.window is WindowReason.SPEAKING:
-            if not is_stop(text) or (not self.aec and self._own_voice(text)):
-                return  # anything but a bare stop word (or our own voice) is dropped silently
-            self.metrics.incr("stop_words")
+            if not c.barge and (not is_stop(text) or (not self.aec and self._own_voice(text))):
+                return  # no AEC: anything but a bare stop word (or our own voice) is dropped silently
+            if is_stop(text):
+                self.metrics.incr("stop_words")
         if not text:
             if not c.woke:
                 self._queue.put_nowait(ListenerEvent(ListenerEventKind.NO_SPEECH, self.source_name, window=c.window))

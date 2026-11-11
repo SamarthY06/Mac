@@ -46,6 +46,11 @@ class ListenConfig:
     confirm_window_s: float = 10.0
     vad_threshold: float = 0.5
     tail_guard_ms: int = 300  # ignore input right after playback ends (no-AEC only)
+    # Talking over Mac (AEC only): VAD onset this long pauses speech; it stops for real only on
+    # this many words that are not a backchannel/echo, otherwise it resumes (LiveKit/Vapi style).
+    barge_in: bool = True
+    barge_in_onset_ms: int = 300
+    barge_in_min_words: int = 3  # Pipecat MinWords default; live test: a misheard "mm-hmm" became "An engine."
 
 
 @dataclass

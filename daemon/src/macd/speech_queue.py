@@ -9,6 +9,11 @@
 - turn_id 0 is "system" speech (announcements, "Okay, stopped."): never stale, only
   removed by `flush_all()`.
 - `drain(tid)` waits until everything queued for `tid` has played or been dropped.
+- `pause()` / `resume()` (barge-in): the playing item is cut at its playback position and its
+  unplayed remainder is held (from a quiet point just before the cut, so no word is lost);
+  `resume()` plays it first. While paused nothing else plays and `speaking` stays True.
+- `words_heard(tid)`: how many words of the turn's spoken answer actually reached the speaker
+  (a cut item counts pro rata), so the brain can be told what the user heard.
 """
 
 from __future__ import annotations
@@ -30,6 +35,21 @@ log = logging.getLogger(__name__)
 
 SpeechKind = Literal["say", "answer", "narration", "earcon", "filler", "confirm"]
 SYSTEM_TURN = 0
+HEARD_KINDS = ("answer", "say")  # the kinds the orchestrator keeps in Turn.assistant
+RESUME_LOOKBACK_S = 0.6  # resume from the quietest 20 ms in this much audio before the cut
+
+
+def resume_offset(pcm: np.ndarray, sample_rate: int, pos: int) -> int:
+    """Where to resume after a cut at `pos`: the latest quietest 20 ms frame in the preceding
+    RESUME_LOOKBACK_S (a word gap), so the word that was cut is replayed from its start."""
+    pos = max(0, min(int(pos), pcm.shape[0]))
+    win = max(1, sample_rate // 50)
+    lo = max(0, pos - int(RESUME_LOOKBACK_S * sample_rate))
+    n = (pos - lo) // win
+    if n <= 1:
+        return lo
+    energy = (pcm[lo : lo + n * win].reshape(n, win).astype(np.float64) ** 2).mean(axis=1)
+    return lo + (n - 1 - int(np.argmin(energy[::-1]))) * win
 
 
 @dataclass(eq=False)
@@ -43,6 +63,8 @@ class SpeechItem:
     priority: bool = False  # jumps the queue (steer ack, wake earcon, "Okay, stopped.")
     on_play: Callable[[], None] | None = None  # called when audio for this item starts
     enqueued_at: float = field(default_factory=time.monotonic)
+    offset: int = 0  # a resumed remainder: samples of the full rendering already played
+    total: int = 0  # samples of the full rendering (0 = this pcm is the whole item)
     _synth: asyncio.Task[np.ndarray] | None = field(default=None, repr=False)
 
 
@@ -82,6 +104,12 @@ class SpeechQueue:
         self._render_task: asyncio.Task[np.ndarray] | None = None
         self._pending: collections.Counter[int] = collections.Counter()
         self._drain_waiters: dict[int, list[asyncio.Future[None]]] = {}
+        self._paused = False
+        self._held: SpeechItem | None = None  # the cut remainder waiting for resume()
+        self._play_pcm: np.ndarray | None = None
+        self._play_sr = 0
+        self._play_t0 = 0.0
+        self._heard: dict[int, int] = {}
         self.speaking = False
         self.dropped = 0
         self.played = 0
@@ -122,30 +150,134 @@ class SpeechQueue:
             return
         self._current_turn = turn_id
         self._cancelled = {t for t in self._cancelled if t >= turn_id}
+        self._heard = {t: n for t, n in self._heard.items() if t >= turn_id}
         self._purge(lambda it: self.is_stale(it.turn_id), "stale")
+        self._unpause_if(lambda it: self.is_stale(it.turn_id), "stale")
         if self._playing is not None and self.is_stale(self._playing.turn_id):
             self._stop_current()
 
     def cancel_turn(self, turn_id: int) -> None:
-        """Stop `turn_id`'s speech NOW (sync) and drop its queued items."""
+        """Stop `turn_id`'s speech NOW (sync) and drop its queued items (and any it queues later)."""
         if turn_id == SYSTEM_TURN:
             return
         self._cancelled.add(turn_id)
-        self._purge(lambda it: it.turn_id == turn_id or self.is_stale(it.turn_id), "cancelled")
+        self.flush_turn(turn_id, "cancelled")
+
+    def flush_turn(self, turn_id: int, reason: str = "flushed") -> None:
+        """Stop `turn_id`'s speech NOW and drop what is queued, but keep the turn live: speech it
+        queues later still plays (a barge-in steer: the model's next words are its reply)."""
+        if turn_id == SYSTEM_TURN:
+            return
+        self._purge(lambda it: it.turn_id == turn_id or self.is_stale(it.turn_id), reason)
+        self._unpause_if(lambda it: it.turn_id == turn_id, reason)
         if self._playing is not None and self._playing.turn_id == turn_id:
             self._stop_current()
 
     def flush_all(self) -> None:
         """Stop everything, including system speech."""
         self._purge(lambda it: True, "flushed")
+        self._unpause_if(lambda it: True, "flushed")
         if self._playing is not None:
             self._stop_current()
         for out in self.outputs.values():
             with contextlib.suppress(Exception):
                 out.flush()
 
+    # ------------------------------------------------------------------ pause / resume (barge-in)
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def playing_turn(self) -> int | None:
+        """turn_id of the item playing (or held by a pause) right now; None if silent."""
+        item = self._held if self._paused else self._playing
+        return item.turn_id if item is not None else None
+
+    def pause(self) -> bool:
+        """Cut the playing item NOW (sync) and hold its unplayed remainder; nothing plays until
+        resume() or a flush. Only a turn's speech is paused (system speech is never held).
+        Returns False if there is nothing of a turn to pause."""
+        if self._paused:
+            return True
+        item = self._playing
+        if item is None or item.turn_id == SYSTEM_TURN:
+            return False
+        self._paused = True
+        if self._play_task is not None and not self._play_task.done() and self._play_pcm is not None:
+            pos = self._position()
+            start = resume_offset(self._play_pcm, self._play_sr, pos)
+            self._hold(item, self._play_pcm[start:], self._play_sr, start)
+            out = self.outputs.get(self._out_name(item))
+            if out is not None:
+                with contextlib.suppress(Exception):
+                    out.flush()
+            self._play_task.cancel()
+            self._play_pcm = None  # the held remainder accounts for this item from now on
+        # still synthesizing: _process holds the whole item once its audio is ready
+        return True
+
+    def resume(self) -> bool:
+        """Undo pause(): the held remainder plays first, then the queue continues."""
+        if not self._paused:
+            return False
+        self._paused = False
+        held, self._held = self._held, None
+        if held is not None:
+            if self.is_stale(held.turn_id):
+                self._drop(held, "stale")
+            else:
+                self._q.appendleft(held)  # already counted in _pending by _hold()
+        self._wake.set()
+        return True
+
+    def _hold(self, item: SpeechItem, pcm: np.ndarray, sr: int, offset: int) -> None:
+        total = item.total or (offset + pcm.shape[0])
+        self._held = SpeechItem(turn_id=item.turn_id, kind=item.kind, text=item.text, pcm=pcm, sample_rate=sr,
+                                output=item.output, priority=True, offset=item.offset + offset, total=total)
+        self._pending[item.turn_id] += 1
+
+    def _unpause_if(self, pred: Callable[[SpeechItem], bool], reason: str) -> None:
+        if not self._paused or (self._held is not None and not pred(self._held)):
+            return
+        held, self._held, self._paused = self._held, None, False
+        if held is not None:
+            self._count_heard(held, held.offset / held.total if held.total else 0.0)
+            self._drop(held, reason)
+        self._wake.set()
+
+    def _position(self) -> int:
+        """Samples of the playing pcm that have reached the speaker (wall clock since play start)."""
+        if self._play_pcm is None:
+            return 0
+        return min(self._play_pcm.shape[0], int((time.monotonic() - self._play_t0) * self._play_sr))
+
+    # ------------------------------------------------------------------ heard accounting
+
+    def words_heard(self, turn_id: int) -> int:
+        """Words of `turn_id`'s answer/say speech that were played (cut items pro rata)."""
+        return self._heard.get(turn_id, 0)
+
+    def _count_heard(self, item: SpeechItem, fraction: float) -> None:
+        if item.kind not in HEARD_KINDS or item.turn_id == SYSTEM_TURN:
+            return
+        n = int(len(item.text.split()) * max(0.0, min(1.0, fraction)))
+        if n:
+            self._heard[item.turn_id] = self._heard.get(item.turn_id, 0) + n
+
+    def _count_partial(self, item: SpeechItem) -> None:
+        """The playing item is being cut for good: count the part that was played."""
+        if self._play_pcm is None:
+            return
+        total = item.total or self._play_pcm.shape[0]
+        if total:
+            self._count_heard(item, (item.offset + self._position()) / total)
+
     def _stop_current(self) -> None:
         item = self._playing
+        if item is not None and self._play_task is not None and not self._play_task.done():
+            self._count_partial(item)
         if item is not None:
             out = self.outputs.get(self._out_name(item))
             if out is not None:
@@ -303,8 +435,8 @@ class SpeechQueue:
             return
 
     async def _next_item(self) -> SpeechItem:
-        while not self._q:
-            if self.speaking:
+        while self._paused or not self._q:
+            if self.speaking and not self._paused:
                 self.speaking = False
                 if self.on_idle is not None:
                     with contextlib.suppress(Exception):
@@ -363,6 +495,9 @@ class SpeechQueue:
                 return
             if pcm.size == 0:
                 return
+            if self._paused:  # paused while this item was being synthesized: hold all of it
+                self._hold(item, pcm, sr, 0)
+                return
             self._prefetch_next()
             if not self.speaking:
                 self.speaking = True
@@ -373,6 +508,7 @@ class SpeechQueue:
                 with contextlib.suppress(Exception):
                     item.on_play()
             self.last_activity = time.monotonic()
+            self._play_pcm, self._play_sr, self._play_t0 = pcm, sr, time.monotonic()
             self._play_task = asyncio.create_task(out.play(pcm, sr), name=f"play:{out_name}")
             await asyncio.wait({self._play_task})
             task, self._play_task = self._play_task, None
@@ -382,13 +518,16 @@ class SpeechQueue:
                     log.warning("output %s play failed: %s", out_name, exc)
                 else:
                     self.played += 1
+                    self._count_heard(item, 1.0)
             self.last_activity = time.monotonic()
         finally:
             self._playing = None
+            self._play_pcm = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "speaking": self.speaking,
+            "paused": self._paused,
             "queued": len(self._q),
             "current_turn": self._current_turn,
             "played": self.played,
