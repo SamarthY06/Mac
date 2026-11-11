@@ -55,7 +55,7 @@ APP_DEST="${OPENMAC_APP_DEST:-$HOME/Applications/OpenMac.app}"
 BUNDLE_ID="io.github.macagent.Mac"
 KEYCHAIN_SERVICE="mac-agent"
 
-YES=0; MODELS=1; UNINSTALL=0; OPEN=1; APP_ONLY=0
+YES=0; MODELS=1; UNINSTALL=0; OPEN=1; APP_ONLY=0; MODELS_OK=0
 for a in "$@"; do
   case "$a" in
     -y|--yes) YES=1 ;;
