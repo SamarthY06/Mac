@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- "Stop everything" (chat and voice): ends the running task, its background agents and the session at once.
+- Voice: short progress lines every twenty to thirty seconds on long tasks, and mid-task questions answered at once.
+
 ## 0.1.0 - 2026-11-11
 
 First public release, under the name OpenMac. The assistant is still called Mac.

@@ -201,9 +201,9 @@ def _attach_handoff(rig: Rig, delay: float = 0.0) -> list[str]:
 
     real_reset, real_sleep = rig.brain.reset, rig.brain.sleep
 
-    async def reset() -> None:
+    async def reset(hard: bool = False) -> None:
         order.append("reset")
-        await real_reset()
+        await real_reset(hard=hard)
 
     async def sleep() -> None:
         order.append("sleep")
@@ -547,6 +547,18 @@ async def test_woke_stop_interrupts_and_drops_stale(rig: Rig) -> None:
     await asyncio.sleep(0.05)
     assert "Here are your emails." not in rig.spoken
     assert rig.orch.metrics.counters["stale_brain_events"] >= 1 and rig.orch.state == State.IDLE
+
+
+async def test_stop_everything_by_voice_hard_resets_and_confirms(rig: Rig) -> None:
+    tid = await start_turn(rig, "find twenty jobs", [text("Searching now.\n"), pause()])
+    await wait_until(lambda: "Searching now." in rig.spoken)
+    rig.mic.say("Hey Mac, stop everything", woke=True)
+    await wait_until(lambda: rig.brain.hard_resets == 1)
+    await wait_until(lambda: P.STOPPED_ALL in rig.spoken)
+    assert rig.orch.state == State.IDLE and rig.orch.turn is None
+    rig.inject(BrainEventKind.TEXT, tid, text="Here are the jobs. ")
+    await asyncio.sleep(0.05)
+    assert "Here are the jobs." not in rig.spoken
 
 
 async def test_bare_stop_while_speaking(rig: Rig) -> None:

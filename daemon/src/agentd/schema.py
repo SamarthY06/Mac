@@ -364,6 +364,7 @@ class NewSession(Op):
 class Reset(Op):
     OP: ClassVar[str] = "reset"
     conv: str
+    hard: bool = False  # stop everything: the running turn, queued asks and background agents; fresh session next
 
 
 @dataclass(kw_only=True)
@@ -861,7 +862,7 @@ NOTICES: dict[str, type[Any]] = {ProfileChanged.EV: ProfileChanged}
 _VOICE_OPS = frozenset({"ask", "steer", "interrupt", "confirm", "revoke_all", "reset", "warm", "sleep",
                         "handoff", "set_context", "set_language", "set_name", "voice_settings",
                         "connect_check", "status", "subscribe", "stop_other"})
-_CHAT_OPS = frozenset({"ask", "steer", "interrupt", "reply", "question_posted", "new_session",
+_CHAT_OPS = frozenset({"ask", "steer", "interrupt", "reply", "question_posted", "new_session", "reset",
                        "set_context", "status", "subscribe", "ack", "pause", "ws_list", "profile_list",
                        "profile_command"})
 _APP_OPS = frozenset({"status", "cancel", "pause", "ws_list", "ws_approve", "ws_remove", "profile_list",

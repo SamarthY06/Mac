@@ -1507,10 +1507,16 @@ class Service:
         return s.ConnectCheckData(accepted=True, check_id=check_id)
 
     # -- brain passthrough -------------------------------------------------------------------
-    async def reset(self, conv: str) -> None:
+    async def reset(self, conv: str, hard: bool = False) -> None:
         c = self.conversation(conv)
+        if hard:  # "stop everything": the running turn, any open question, then the brain and its agents
+            await c.interrupt(c.running())
+            if c.question is not None:
+                c.close_question(c.question, s.CloseOutcome.SKIPPED)
+            c.record.fresh_next, c.record.last_answer_at = True, 0.0
+            await self.persist()
         if c.brain is not None:
-            await c.brain.reset()
+            await c.brain.reset(hard=hard)
         c.check_alive()
 
     async def warm(self, conv: str) -> None:

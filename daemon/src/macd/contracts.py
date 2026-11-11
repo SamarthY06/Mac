@@ -183,8 +183,9 @@ class Brain(Protocol):
         the stale tail is drained internally and never emitted as that turn's TEXT."""
         ...
 
-    async def reset(self) -> None:
-        """Start a fresh conversation (new session)."""
+    async def reset(self, hard: bool = False) -> None:
+        """Start a fresh conversation (new session). ``hard``: stop everything now, background
+        agents included, without a session handoff: the underlying process is killed."""
         ...
 
     async def warm(self) -> None:

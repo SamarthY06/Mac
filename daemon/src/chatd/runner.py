@@ -76,6 +76,8 @@ EYES, CHECK, CROSS, HAND, PLUS = "👀", "✅", "❌", "✋", "➕"
 
 # The four commands are exact-match fast paths (W5.3). Every other text goes to the model.
 _STOP = {"stop"}
+_STOP_ALL = {"stop everything", "stop all", "stop it all", "hard stop", "kill everything", "stop and reset",
+             "stop all tasks", "stop everything now"}
 _NEW = re.compile(r"^(?:new chat|start fresh)(?: in (?P<folder>.+))?$")
 _STATUS = {"status", "what are you doing"}
 _HELP = {"help"}
@@ -108,6 +110,8 @@ def parse_command(text: str) -> tuple[str, str] | None:
     with or without "/". `add` is only a candidate: it is a command when exactly one group matches."""
     t = " ".join(text.strip().lower().replace("’", "'").split())
     t = t.lstrip("/").rstrip(".!? ").strip()
+    if t in _STOP_ALL:
+        return ("stop_all", "")
     if t in _STOP:
         return ("stop", "")
     if t in _STATUS:
@@ -1102,6 +1106,16 @@ class ChatRunner:
                     await self._react_on(st, mid, HAND)
             else:
                 await self._react_on(st, mid, HAND)
+            await self._save()
+        elif cmd == "stop_all":
+            await self.client.call("reset", conv=conv, hard=True)  # turn, queued asks, background agents, session
+            t = st.turn
+            if t is not None:
+                t.stopped = True
+                if t.status:
+                    await self._edit_status(st, t, fmt.STOPPED, final=True)
+            self.rings[st.chat_id] = Ring(fresh=True)
+            await self._send(st, None, fmt.STOPPED_ALL, reply_to=mid)
             await self._save()
         elif cmd == "new":
             if st.turn is not None:

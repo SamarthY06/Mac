@@ -359,8 +359,8 @@ class RemoteBrain:
         if turn_id:
             await self._call(s.Interrupt(conv=CONV, turn=turn_id))
 
-    async def reset(self) -> None:
-        await self._call(s.Reset(conv=CONV))
+    async def reset(self, hard: bool = False) -> None:
+        await self._call(s.Reset(conv=CONV, hard=hard))
 
     async def warm(self) -> None:
         link = self._link

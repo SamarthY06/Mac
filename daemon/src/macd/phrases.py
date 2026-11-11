@@ -20,6 +20,7 @@ CONFIRM_TIMEOUT = "No answer, so I won't."
 GOING_OFF = "Okay, going to sleep. Click the menu bar icon to wake me."
 STILL_WORKING = "Still working on it."
 HEARTBEATS = ("Still on it.", "This is taking a while. I'll keep going.")
+STOPPED_ALL = "Stopped everything."
 PHONE_CONNECTED = "Phone connected."
 PHONE_PREEMPTED = "Someone joined from the phone."
 PIN_PROMPT = "Please say the four-digit code shown on the Mac."
@@ -126,6 +127,18 @@ def normalize(text: str) -> str:
     return " ".join(t.split())
 
 
+STOP_ALL_PHRASES = frozenset(
+    {"stop everything", "stop all", "stop it all", "hard stop", "kill everything", "stop and reset", "stop all tasks",
+     "stop everything now", "stop everything and start fresh"}
+)
+
+
+def is_stop_all(text: str) -> bool:
+    """"Stop everything": the turn, the background agents and the session, at once."""
+    n = normalize(text)
+    return bool(n) and any(p in STOP_ALL_PHRASES for p in _strip_edges(n, _LEADERS, _TRAILERS))
+
+
 STOP_PHRASES = frozenset(
     {"stop", "cancel", "never mind", "nevermind", "quiet", "shut up", "that's enough", "thats enough",
      "be quiet", "stop it", "stop talking", "enough", "cancel that"}
@@ -197,10 +210,38 @@ def _covered_by(words: list[str], phrases: frozenset[str]) -> bool:
     return any(" ".join(words[:k]) in phrases and _covered_by(words[k:], phrases) for k in range(min(3, len(words)), 0, -1))
 
 
+#: Short appraisals over Mac's speech ("that's a good idea", "it's really pretty", "I love it") are the
+#: listener agreeing, not taking the turn (live 2026-11-12: each one cancelled a long answer and
+#: started a new turn on the compliment). Glue words carry no meaning on their own; a cue word
+#: (an objection, a question, an instruction) makes it an interruption whatever else it contains.
+_APPRAISALS = frozenset(
+    {"good", "great", "nice", "pretty", "cool", "awesome", "perfect", "interesting", "smart", "clever", "helpful",
+     "useful", "lovely", "brilliant", "excellent", "fantastic", "amazing", "fine", "right", "true", "correct", "fair",
+     "sensible", "reasonable", "solid", "clear", "impressive", "beautiful", "neat", "sweet", "love", "like", "agree",
+     "agreed", "sure", "okay", "yes", "yeah", "wonderful", "superb", "best", "better", "promising", "strong"}
+)
+_GLUE = frozenset(
+    {"that", "thats", "that's", "it", "its", "it's", "this", "is", "a", "an", "the", "really", "so", "very", "quite",
+     "one", "idea", "point", "plan", "approach", "way", "thought", "answer", "i", "to", "me", "sounds", "seems",
+     "looks", "oh", "ah", "yeah", "yes", "okay", "all", "of", "them", "those", "these", "actually"})
+_CUES = frozenset(
+    {"stop", "wait", "no", "not", "dont", "don't", "never", "instead", "but", "what", "why", "how", "when", "where",
+     "which", "who", "can", "could", "would", "you", "please", "make", "do", "send", "open", "find", "change", "use",
+     "try", "lets", "let's", "should", "want", "need", "skip", "repeat", "again", "wrong", "hold"})
+
+
 def is_backchannel(text: str) -> bool:
-    """"mm-hmm", "yeah", "okay got it", "right right": the listener is following, not taking the turn."""
+    """"mm-hmm", "yeah", "okay got it", "that's a good idea": the listener is following or agreeing,
+    not taking the turn."""
     words = normalize(text).replace("-", " ").split()
-    return bool(words) and len(words) <= 6 and _covered_by(words, BACKCHANNEL_PHRASES)
+    if not words or len(words) > 6:
+        return False
+    if _covered_by(words, BACKCHANNEL_PHRASES):
+        return True
+    if any(w in _CUES for w in words):
+        return False
+    rest = [w for w in words if w not in _GLUE]
+    return bool(rest) and all(w in _APPRAISALS for w in rest)
 
 
 def is_interjection(text: str) -> bool:

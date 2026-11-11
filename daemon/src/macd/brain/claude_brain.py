@@ -478,8 +478,8 @@ class ClaudeBrain:
             self._cancelled.add(turn_id)  # the hook denies tools from now on
         self._put(_Cmd("interrupt", turn_id))
 
-    async def reset(self) -> None:
-        self._put(_Cmd("reset"))
+    async def reset(self, hard: bool = False) -> None:
+        self._put(_Cmd("reset", payload=hard))
 
     async def warm(self) -> None:
         """Start the CLI now so the first ask() is fast. Idempotent; never raises."""
@@ -964,7 +964,7 @@ class ClaudeBrain:
         except BaseException as e:  # forwarded to the owner  # noqa: BLE001
             self._inbox.put_nowait(_Cmd("reader_done", gen=gen, payload=e))
 
-    async def _disconnect(self) -> None:
+    async def _disconnect(self, kill: bool = False) -> None:
         reader, client = self._reader, self._client
         self._reader, self._client = None, None
         self._gen += 1  # anything still queued from the old reader is stale
@@ -972,7 +972,7 @@ class ClaudeBrain:
         self._wake_ok = False
         if client is not None:
             self._report_alive(False)
-        await self._close_client(client, reader)
+        await self._close_client(client, reader, kill=kill)
 
     def _report_alive(self, alive: bool) -> None:
         if self._on_alive is None:
@@ -982,15 +982,17 @@ class ClaudeBrain:
         except Exception:
             log.exception("on_alive callback failed")
 
-    async def _close_client(self, client: Any, reader: asyncio.Task[None] | None) -> None:
+    async def _close_client(self, client: Any, reader: asyncio.Task[None] | None, kill: bool = False) -> None:
         if reader is not None:
             reader.cancel()
             with contextlib.suppress(BaseException):
                 await reader
         if client is not None:
             pid = getattr(getattr(getattr(client, "_transport", None), "_process", None), "pid", None)
+            if kill and isinstance(pid, int):  # hard stop: no graceful drain, the whole tree goes now
+                await asyncio.to_thread(_kill_process_tree, pid)
             try:
-                await asyncio.wait_for(client.disconnect(), 10)
+                await asyncio.wait_for(client.disconnect(), 3 if kill else 10)
             except Exception:
                 log.warning("brain disconnect failed; killing the CLI tree", exc_info=True)
                 if isinstance(pid, int):
@@ -1227,7 +1229,8 @@ class ClaudeBrain:
 
     async def _on_reset(self, cmd: _Cmd) -> None:
         a = self._active
-        if (a is None and self._client is not None and self._handoff_enabled and not self._handed_off
+        hard = bool(cmd.payload)
+        if (not hard and a is None and self._client is not None and self._handoff_enabled and not self._handed_off
                 and self._turns_this_session):
             await self._start_handoff(after=self._do_reset)  # save context, then start fresh
             return
@@ -1235,10 +1238,15 @@ class ClaudeBrain:
             if not a.timed_out:
                 self._emit(BrainEventKind.DONE, a.turn_id, data={"interrupted": True})
             self._active = None
-        await self._do_reset()
+        if hard:  # "stop everything": queued asks die too, and the hook refuses stragglers
+            for queued in self._pending:
+                self._emit(BrainEventKind.DONE, queued.turn_id, data={"interrupted": True})
+            self._pending.clear()
+            log.info("brain: hard stop (%d background task(s) killed with the CLI)", len(self._bg_tasks))
+        await self._do_reset(kill=hard)
 
-    async def _do_reset(self) -> None:
-        await self._disconnect()
+    async def _do_reset(self, kill: bool = False) -> None:
+        await self._disconnect(kill=kill)
         self._resume_next = None
         self._session_id = None
         await self._save_session(None)

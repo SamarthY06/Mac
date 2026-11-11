@@ -18,18 +18,19 @@ MAX_CHUNKS = 3  # longer than this many messages: the full text goes out as a .m
 
 # -- fixed strings (W5.3, W5.5; verbatim where the design gives them) -----------------------------
 HELP = (PREFIX + "Text me what you'd do on your Mac.\n"
-        '"stop" stops the current task.\n'
+        '"stop" stops the current task. "stop everything" also ends background work and starts fresh.\n'
         '"new chat" starts fresh. "new chat in {folder}" picks a folder.\n'
         '"status" shows what I\'m doing.\n'
         "No 👀 on your message means your Mac is asleep or offline.")
 # a prefix chat (every shared chat): a bare "stop" is ignored there, so help says the word (UX7)
 HELP_PREFIX = (PREFIX + 'Start each message with "{w}", like "{w}, find me 20 jobs".\n'
-               '"{w} stop" stops the current task.\n'
+               '"{w} stop" stops the current task. "{w} stop everything" also ends background work and starts fresh.\n'
                '"{w} new chat" starts fresh. "{w} new chat in {folder}" picks a folder.\n'
                '"{w} status" shows what I\'m doing.')
 HELP_FOLDER = "Documents"  # the example folder when the chat has no default workspace
 VOICE_NOTE = f"{PREFIX}I only read text here."
 STOPPED = f"{PREFIX}Stopped."
+STOPPED_ALL = f"{PREFIX}Stopped everything, background work included. The next message starts fresh."
 NOTHING_TO_STOP = f"{PREFIX}Nothing is running."
 FRESH = f"{PREFIX}Fresh start."
 FRESH_IN = PREFIX + "Fresh start in {folder}."

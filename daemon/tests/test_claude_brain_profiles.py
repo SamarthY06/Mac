@@ -575,3 +575,33 @@ async def test_message_during_report_back_joins_it_and_never_kills_background_wo
     allowed = await brain.hook(pre("Bash", {"command": "ls"}), "b")
     assert allowed == {}
     await brain.close()
+
+
+async def test_stop_everything_kills_background_agents_and_skips_the_handoff(make) -> None:
+    """Owner, 2026-11-12: a hard stop must end the running turn AND every background agent AND the
+    session, at once. A plain "stop" keeps background agents alive by design (the Job Hunt fix)."""
+    def r(c: MockClient, p: str) -> None:
+        if p == "find 20 jobs":
+            c.push(init(), _task_started("a"), _task_started("b"), delta("Searching."), result())
+    brain = make(r, chat=True)
+    await brain.start()
+    await brain.ask(1, "find 20 jobs")
+    await collect(brain)
+    assert brain._bg_tasks == {"a", "b"} and not brain.is_cancelled(0)
+    c = MockClient.instances[0]
+    await brain.ask(2, "and the ones in Berlin")  # starts at once; the responder never answers it
+    for _ in range(50):
+        if brain._active is not None and brain._active.turn_id == 2:
+            break
+        await asyncio.sleep(0.01)
+    await brain.reset(hard=True)
+    evs = await collect(brain)
+    assert evs[-1].kind == K.DONE and evs[-1].turn_id == 2 and evs[-1].data.get("interrupted")
+    for _ in range(100):  # DONE is emitted first; the disconnect completes right after
+        if c.disconnected:
+            break
+        await asyncio.sleep(0.01)
+    assert c.disconnected and brain._client is None and brain._bg_tasks == set()
+    assert len(c.queries) == 2  # no session-handoff query on a hard stop
+    assert brain.is_cancelled(0)  # a straggling agent call is refused by the hook
+    await brain.close()

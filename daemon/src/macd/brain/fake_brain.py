@@ -86,6 +86,7 @@ class FakeBrain:
         self.steers: list[tuple[int, str]] = []
         self.interrupts: list[int] = []
         self.resets = 0
+        self.hard_resets = 0
         self.warms = 0
         self.sleeps = 0
         self.handoffs = 0
@@ -137,8 +138,10 @@ class FakeBrain:
         if turn_id and turn_id not in self._finished:
             self._cancelled.add(turn_id)
 
-    async def reset(self) -> None:
+    async def reset(self, hard: bool = False) -> None:
         self.resets += 1
+        if hard:
+            self.hard_resets += 1
         await self._inbox.put(_Cmd("reset"))
 
     async def warm(self) -> None:

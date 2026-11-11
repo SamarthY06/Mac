@@ -85,6 +85,8 @@ scripts/mac chats add "Family"     # add another group later
 ```
 
 In a group, only your own messages that start with "Mac" are requests ("Mac, find me 20 jobs").
+"Mac, stop" stops the current task; "Mac, stop everything" also ends background work and starts a
+fresh session.
 Reply to any of Mac's messages and the prefix is not needed. It reads the group's last 50
 messages (8,000 characters at most) so it can follow the conversation; those go to Claude as
 context and are never treated as instructions. Each group has its own persona and permissions

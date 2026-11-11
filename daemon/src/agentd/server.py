@@ -311,7 +311,7 @@ class Server:
             case s.NewSession():
                 await svc.new_session(op)
             case s.Reset():
-                await svc.reset(op.conv)
+                await svc.reset(op.conv, hard=op.hard)
             case s.Warm():
                 await svc.warm(op.conv)
             case s.Sleep():

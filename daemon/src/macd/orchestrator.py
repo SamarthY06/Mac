@@ -612,6 +612,11 @@ class Orchestrator:
             self._tasks.spawn(self._stop_other(self._output_for_source(source)), "stop-other")
             return
 
+        # ---------------------------------------------------------------- stop everything (any state)
+        if P.is_stop_all(text) and (woke or partner or window == WindowReason.FOLLOWUP):
+            await self._stop_all(source)
+            return
+
         # ---------------------------------------------------------------- mid-turn
         if turn is not None and not turn.brain_done:
             if not (woke or partner):
@@ -710,6 +715,10 @@ class Orchestrator:
 
     async def _on_speaking_utterance(self, turn: Turn | None, text: str, source: str, partner: bool,
                                      t: float) -> None:
+        if P.is_stop_all(text) and partner:
+            self._barge_clear()
+            await self._stop_all(source)
+            return
         if P.is_stop(text):  # "stop" always stops, whoever says it (UX#1)
             self._barge_clear()
             if turn is not None:
@@ -1333,15 +1342,25 @@ class Orchestrator:
         if text.strip():
             self._say_system(text.strip())
 
-    async def reset(self) -> None:
+    async def reset(self, hard: bool = False) -> None:
         if self.turn is not None:
-            await self._cancel_turn(self.turn, "reset", speak=False)
+            await self._cancel_turn(self.turn, "stop everything" if hard else "reset", speak=False)
         with contextlib.suppress(Exception):
             self.gate.revoke_all()
         self._cut_note = ""
-        await self._handoff("reset")
-        await self.brain.reset()
-        self._activity("reset", None, text="New conversation")
+        if not hard:
+            await self._handoff("reset")
+        await self.brain.reset(hard=hard)
+        self._activity("reset", None, text="Stopped everything" if hard else "New conversation")
+
+    async def _stop_all(self, source: str) -> None:
+        """"Stop everything": the turn, its background agents and the session end now; one line back."""
+        self.metrics.incr("interrupts")
+        self.speech.flush_all()
+        await self.reset(hard=True)
+        self._cancel_timer("followup")
+        self._set_state(State.IDLE, "stop everything")
+        self._say_system(P.STOPPED_ALL, self._output_for_source(source))
 
     async def power(self, event: str) -> None:
         if event == "will_sleep":

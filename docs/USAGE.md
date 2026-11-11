@@ -35,6 +35,7 @@ shows live status; here is what happens underneath.
 | "Hey Mac, draft an email to Sam about the demo" → "paste it in WhatsApp to Sam" → "looks good, send it" | multi-app flow; the send waits for your spoken **yes** |
 | "Hey Mac, teach me system design interviews" | tutor mode, in short spoken chunks |
 | "stop" / "never mind" (while Mac is talking) | stops immediately |
+| "stop everything" | ends the task, its background agents and the session at once; the next request starts fresh |
 | "Hey Mac, go to sleep" | turns listening off (menu bar → Turn On to wake) |
 
 After Mac answers, you have a few seconds to follow up **without** the wake word.

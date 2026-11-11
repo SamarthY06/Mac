@@ -333,6 +333,21 @@ async def test_mid_turn_steer_progress_status_new_and_stop(world: World) -> None
     assert status.text == fmt.STOPPED and world.ch.reactions[req] == ["👀", "✋"]
 
 
+async def test_stop_everything_ends_the_turn_the_agents_and_the_session(world: World) -> None:
+    world.agent.scripts[CHAT] = script({"long task": [fb.say("Reading the job boards", delay=0.05),
+                                                      *fb_slow(200)]})
+    await world.say("long task")
+    await until(lambda: any("Reading the job boards" in m.text for m in world.ch.sent()))
+    mid = await world.say("stop everything")
+    await until(lambda: any(m.text == fmt.STOPPED_ALL and m.reply_to == mid for m in world.ch.sent()))
+    await until(lambda: world.conv().running() is None)
+    assert world.brain().hard_resets == 1
+    assert world.conv().record.fresh_next  # the next message starts a fresh session
+    await world.r.settle()
+    await world.say("hard stop")  # idle: still answered, still a hard reset
+    await until(lambda: world.ch.sent()[-1].text == fmt.STOPPED_ALL)
+
+
 def fb_slow(n: int, delay: float = 0.02) -> list[fb.Step]:
     return [fb.Step(BrainEventKind.TOOL_START, tool_name="Bash", delay=delay) for _ in range(n)]
 
