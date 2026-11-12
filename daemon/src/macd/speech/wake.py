@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import math
 import re
 import tempfile
 from pathlib import Path
@@ -170,6 +171,28 @@ def strip_wake(text: str, phrases: WakePhrases = _DEFAULT) -> str:
 
 
 # ----------------------------------------------------------------------------- KWS
+
+
+class InputGain:
+    """Slow automatic gain for the KWS feed only (STT, VAD and Smart Turn see the raw audio).
+
+    Without voice processing the plain mic has no gain: at a low input volume "Hey Mac" peaks
+    near 0.005, where the 3.3M KWS model misses most wakes; it wants peaks around 0.1. A peak
+    envelope (instant attack, ``release_s`` decay) sets the gain, so the output never exceeds
+    ``target`` (no clipping) and loud input passes unchanged. On synthetic wakes in real room
+    noise this roughly doubled recall at quiet levels and changed nothing at normal levels.
+    """
+
+    def __init__(self, target: float = 0.2, max_gain: float = 30.0, release_s: float = 3.0) -> None:
+        self._target, self._max, self._release = target, max_gain, release_s
+        self._env = 0.0
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        if x.size == 0:
+            return x
+        self._env = max(float(np.abs(x).max()), self._env * math.exp(-x.shape[0] / SAMPLE_RATE / self._release))
+        gain = min(self._max, self._target / max(self._env, 1e-6))
+        return x * np.float32(gain) if gain > 1.0 else x
 
 
 def keyword_lines(phrases: list[str] | tuple[str, ...], kws_dir: Path, score: float, threshold: float) -> list[str]:

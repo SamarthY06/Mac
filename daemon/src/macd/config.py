@@ -34,6 +34,10 @@ class WakeConfig:
     kws_score: float = 1.5  # sherpa-onnx keywords_score (boost; higher values LOWER recall on this model)
     verify: bool = True  # stage-2 STT verification of wake hits
     accept_similar_names: bool = True  # stage 2 also accepts "hey mark/make/mic..." (what STT hears for accented "mac")
+    # Stage 2 hearing no words at all is no evidence against the hit: Parakeet often returns ""
+    # for a lone short "Hey Mac" (measured: 6 of 50 clear wakes). Words that are not the
+    # phrase still reject. Cost: a rare noise hit makes Mac listen for a few seconds.
+    accept_unheard: bool = True
 
 
 @dataclass

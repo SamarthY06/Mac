@@ -52,7 +52,7 @@ from macd.contracts import (
 )
 from macd.eventlog import Metrics
 from macd.phrases import is_stop
-from macd.speech.wake import WakePhrases
+from macd.speech.wake import InputGain, WakePhrases
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ KWS_BATCH_FRAMES = 4  # feed KWS 80 ms at a time: the encoder steps every 16 fra
 MAX_KWS_INFLIGHT = 2  # batches the executor may lag before the frame loop waits (never in real time)
 TURN_DECIDE_FRAMES = 3  # Smart Turn runs off-loop (~35 ms); its answer is applied exactly this many frames later
 TURN_AUDIO_S = 8.0  # the model reads the last 8 s
+REOPENABLE = (WindowReason.FOLLOWUP, WindowReason.CONFIRM)  # an empty capture keeps these windows open
 
 def _samples(seconds: float) -> int:
     return round(seconds * SAMPLE_RATE)
@@ -82,6 +83,8 @@ class _Capture:
     max_end: int
     hit: WakeHit | None = None
     window: WindowReason | None = None
+    window_end: int | None = None  # FOLLOWUP/CONFIRM: the window's end, reopened if this capture is empty
+    window_token: object | None = None
     parts: list[np.ndarray] = field(default_factory=list)
     end: int = 0  # absolute index after the last captured sample
     speech_started: bool = False  # endpointing armed (silence after last_speech ends the segment)
@@ -146,6 +149,7 @@ class ListenerImpl:
         self._capture: _Capture | None = None
         self._window_end: int | None = None
         self._window_reason: WindowReason | None = None
+        self._window_token: object | None = None  # identity of the open window (None: closed)
         self._speech_run = 0  # consecutive VAD speech frames (for window starts)
         self._muted = False
         self._current_text = ""
@@ -155,6 +159,7 @@ class ListenerImpl:
         self._jobs: set[asyncio.Task[None]] = set()
         self._kws_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kws_pool")
         self._kws_batch: list[np.ndarray] = []
+        self._kws_gain = InputGain()
         self._kws_inflight: deque[tuple[asyncio.Future[WakeHit | None], float]] = deque()
         self._vad_active = False  # VAD only runs while something can use it (idle CPU)
         self._stt_missing_logged = False
@@ -197,12 +202,14 @@ class ListenerImpl:
     def open_window(self, seconds: float, reason: WindowReason) -> None:
         self._window_end = self._pos + _samples(seconds)
         self._window_reason = reason
+        self._window_token = object()
         # PTT starts on the very first speech frame; others need a short run.
         self._speech_run = WINDOW_START_FRAMES if reason is WindowReason.PTT else 0
 
     def close_window(self) -> None:
         self._window_end = None
         self._window_reason = None
+        self._window_token = None
         c = self._capture
         if c is not None and not c.woke and c.window is not WindowReason.SPEAKING:
             self._capture = None
@@ -212,6 +219,7 @@ class ListenerImpl:
         if muted:
             self._capture = None
             self._window_end = None
+            self._window_token = None
             if self._wake is not None:
                 self._kws_pool.submit(self._wake.reset)  # same thread as accept(): no race
 
@@ -257,7 +265,7 @@ class ListenerImpl:
         if not self._muted and self._requires_wake and self._wake is not None:
             self._kws_batch.append(frame)
             if len(self._kws_batch) >= KWS_BATCH_FRAMES:
-                chunk = np.concatenate(self._kws_batch)
+                chunk = self._kws_gain(np.concatenate(self._kws_batch))
                 self._kws_batch.clear()
                 fut = asyncio.get_running_loop().run_in_executor(self._kws_pool, self._wake.accept, chunk, self._pos - chunk.shape[0])
                 self._kws_inflight.append((fut, time.perf_counter()))
@@ -430,9 +438,12 @@ class ListenerImpl:
             return
         suppressed = (self.speaking or self._pos < self._guard_until) and not self.aec
         if is_speech and not suppressed and self._speech_run >= WINDOW_START_FRAMES:
+            window_end = self._window_end
             self._start_vad_capture(reason, self._pos + self._max_utt)
             if reason is not WindowReason.TURN:
                 self._window_end = None  # one utterance per window (a TURN window stays open)
+                if reason in REOPENABLE and self._capture is not None:
+                    self._capture.window_end, self._capture.window_token = window_end, self._window_token
         elif self._pos >= self._window_end:
             self._window_end, self._window_reason = None, None
             self._enqueue(self._emit(ListenerEvent(ListenerEventKind.NO_SPEECH, self.source_name, window=reason)))
@@ -504,7 +515,7 @@ class ListenerImpl:
     async def _emit_wake(self, c: _Capture) -> None:
         if c.wall_hit:
             self.metrics.observe_since("kws_hit_to_wake", c.wall_hit)
-        self._window_end = None  # a verified wake supersedes any open window
+        self._window_end = self._window_token = None  # a verified wake supersedes any open window
         self.metrics.incr("wakes")
         self._queue.put_nowait(ListenerEvent(ListenerEventKind.WAKE, self.source_name, wake=c.hit))
         if c.speech_start_pending:
@@ -526,9 +537,11 @@ class ListenerImpl:
 
     async def _verify(self, c: _Capture, audio: np.ndarray) -> None:
         text = await self._transcribe(audio, "wake_verify_stt")
-        if text is None or self._phrases.verify(text):
+        unheard = text == "" and self._cfg.wake.accept_unheard
+        if text is None or unheard or self._phrases.verify(text):
             c.verified = True  # no STT -> lighter path: trust the KWS hit
-            self._emit_log("wake_verify", accepted=True, transcript=text, reason="no_stt" if text is None else "phrase_found")
+            reason = "no_stt" if text is None else "no_words" if unheard else "phrase_found"
+            self._emit_log("wake_verify", accepted=True, transcript=text, reason=reason)
             await self._emit_wake(c)
         else:
             c.rejected = True
@@ -554,7 +567,7 @@ class ListenerImpl:
             if is_stop(text):
                 self.metrics.incr("stop_words")
         if not text:
-            if not c.woke:
+            if not c.woke and not self._reopen_window(c):
                 self._queue.put_nowait(ListenerEvent(ListenerEventKind.NO_SPEECH, self.source_name, window=c.window))
             return  # woke: the restarted capture keeps listening until the deadline
         woke = c.woke and not c.produced_text
@@ -567,6 +580,18 @@ class ListenerImpl:
         self._queue.put_nowait(ListenerEvent(ListenerEventKind.UTTERANCE, self.source_name, utterance=utt, wake=c.hit if woke else None))
         if self._capture is c and not c.speech_seen:
             self._capture = None  # got the command; no need to keep waiting for one
+
+    def _reopen_window(self, c: _Capture) -> bool:
+        """An empty capture (cough, click, echo) in a follow-up or confirm window: keep listening
+        for the rest of that window instead of ending it, so the real answer still counts."""
+        if c.window_end is None or c.window_token is None or c.window_token is not self._window_token:
+            return False  # the window was closed or replaced meanwhile
+        if self._window_end is not None or self._capture is not None or self._muted or self._pos >= c.window_end:
+            return False
+        self._window_end, self._window_reason = c.window_end, c.window
+        self._speech_run = 0
+        self._emit_log("window_reopened", window=c.window.value if c.window else None)
+        return True
 
     def _own_voice(self, heard: str) -> bool:
         """Self-trigger check without AEC: is Mac itself saying a word of the heard stop phrase?"""

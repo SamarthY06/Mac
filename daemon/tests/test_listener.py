@@ -98,6 +98,27 @@ async def test_false_wake_rejected():
     assert lis.metrics.counters["false_wakes"] == 1
 
 
+async def test_verify_hearing_no_words_trusts_kws():
+    """Parakeet often returns "" for a lone short "Hey Mac": that is no evidence against the hit."""
+    events_seen = []
+
+    class Log:
+        def emit(self, type_, **f):
+            events_seen.append((type_, f))
+
+    stt = SeqSTT("", "open mail")
+    kinds, _, _ = await run(audio((1.0, 1.6), (2.4, 3.2)), wake_at=1.6, stt=stt, before=lambda l: setattr(l, "eventlog", Log()))
+    assert kinds[0] is K.WAKE and kinds[-1] is K.UTTERANCE and K.FALSE_WAKE not in kinds
+    assert [f["reason"] for t, f in events_seen if t == "wake_verify"] == ["no_words"]
+
+
+async def test_verify_hearing_no_words_rejects_when_disabled():
+    cfg = Config()
+    cfg.wake.accept_unheard = False
+    kinds, _, _ = await run(audio((1.0, 1.6)), wake_at=1.6, stt=FakeSTT(""), cfg=cfg)
+    assert kinds == [K.FALSE_WAKE]
+
+
 async def test_verify_disabled_trusts_kws():
     cfg = Config()
     cfg.wake.verify = False
@@ -563,3 +584,64 @@ async def test_barge_in_repeats_at_each_item_start_while_the_user_talks_on():
     kinds = [e.kind for e in events]
     assert kinds == [K.SPEECH_START, K.BARGE_IN, K.BARGE_IN, K.UTTERANCE], kinds
     assert events[-1].utterance.window is WindowReason.SPEAKING
+
+
+# ----------------------------------------------------------------------------- empty captures in a window
+
+
+class SeqSTT(FakeSTT):
+    """Returns the queued transcripts in order (then the last one); ``on_call`` runs before each."""
+
+    def __init__(self, *texts: str, on_call=None) -> None:
+        super().__init__()
+        self.texts, self.on_call = list(texts), on_call
+
+    async def transcribe(self, pcm):
+        await asyncio.sleep(0)
+        self.calls.append(len(pcm) / SAMPLE_RATE)
+        if self.on_call:
+            self.on_call(len(self.calls))
+        return self.texts.pop(0) if len(self.texts) > 1 else self.texts[0]
+
+
+async def test_a_cough_in_the_followup_window_does_not_end_it():
+    """A capture that transcribes empty (cough, click, echo tail) used to close the follow-up
+    window, so the real answer a moment later needed "Hey Mac" again."""
+    kinds, events, _ = await run(audio((0.5, 0.8), (2.5, 3.5)), wake_at=None, stt=SeqSTT("", "yes please"),
+                                 before=lambda l: l.open_window(4.0, WindowReason.FOLLOWUP))
+    assert kinds == [K.SPEECH_START, K.SPEECH_START, K.UTTERANCE]
+    assert events[-1].utterance.text == "yes please" and events[-1].utterance.window is WindowReason.FOLLOWUP
+
+
+async def test_a_cough_in_the_confirm_window_does_not_answer_it():
+    kinds, events, _ = await run(audio((0.5, 0.8), (2.0, 2.6)), wake_at=None, stt=SeqSTT("", "yes"),
+                                 before=lambda l: l.open_window(4.0, WindowReason.CONFIRM))
+    assert kinds == [K.SPEECH_START, K.SPEECH_START, K.UTTERANCE]
+    assert events[-1].utterance.window is WindowReason.CONFIRM
+
+
+async def test_a_reopened_window_still_expires_on_time():
+    kinds, events, lis = await run(audio((0.5, 0.8), total_s=4.0), wake_at=None, stt=SeqSTT(""),
+                                   before=lambda l: l.open_window(2.0, WindowReason.FOLLOWUP))
+    assert kinds == [K.SPEECH_START, K.NO_SPEECH] and events[-1].window is WindowReason.FOLLOWUP
+    assert lis._window_end is None
+
+
+async def test_a_window_closed_meanwhile_is_not_reopened():
+    holder = {}
+
+    def close(_n):
+        holder["lis"].close_window()  # the orchestrator moved on while the cough was transcribed
+
+    def before(l):
+        holder["lis"] = l
+        l.open_window(4.0, WindowReason.FOLLOWUP)
+
+    kinds, _, _ = await run(audio((0.5, 0.8), (2.5, 3.5)), wake_at=None, stt=SeqSTT("", "yes please", on_call=close), before=before)
+    assert kinds == [K.SPEECH_START, K.NO_SPEECH]
+
+
+async def test_an_empty_push_to_talk_capture_still_ends_the_window():
+    kinds, _, _ = await run(audio((0.5, 0.8), (2.5, 3.5)), wake_at=None, stt=SeqSTT("", "hello"),
+                            before=lambda l: l.open_window(4.0, WindowReason.PTT))
+    assert kinds == [K.SPEECH_START, K.NO_SPEECH]
