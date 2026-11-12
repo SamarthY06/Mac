@@ -141,9 +141,9 @@ echo "${B}OpenValet, an always-on voice agent for macOS, powered by Claude${O}"
 # ------------------------------------------------------------------------- system
 step "Checking your system"
 [[ $(uname -s) == Darwin ]] || die "OpenValet only runs on macOS."
-[[ $(uname -m) == arm64 ]] || die "OpenValet requires an Apple silicon Mac (arm64); found $(uname -m)."
+[[ $(uname -m) == arm64 ]] || die "OpenValet requires an Apple silicon Mac (arm64); found $(uname -m). See https://github.com/SamarthY06/OpenValet/blob/main/docs/FAQ.md for why."
 MACOS="$(sw_vers -productVersion)"
-[[ ${MACOS%%.*} -ge 14 ]] || die "macOS 14 (Sonoma) or newer is required; you have $MACOS. See docs/FAQ.md."
+[[ ${MACOS%%.*} -ge 14 ]] || die "macOS 14 (Sonoma) or newer is required; you have $MACOS. See https://github.com/SamarthY06/OpenValet/blob/main/docs/FAQ.md"
 ok "macOS $MACOS on Apple silicon"
 if ! xcrun --find swift >/dev/null 2>&1; then
   die "Swift toolchain not found. Install the Command Line Tools: xcode-select --install (then re-run)."

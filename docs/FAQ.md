@@ -2,7 +2,7 @@
 
 ## Does it run on an Intel Mac?
 
-No. OpenMac needs an Apple silicon Mac, and `install.sh` stops on any other machine.
+No. OpenValet needs an Apple silicon Mac, and `install.sh` stops on any other machine.
 The speech models (sherpa-onnx, Kokoro, Parakeet int8) run on the CPU through Apple's
 Accelerate framework, and the Python wheels they ship are built for Apple silicon. On an
 Intel Mac they would be too slow to answer you in conversation time, so there is no Intel
@@ -22,7 +22,7 @@ macOS frameworks that Linux does not have.
 
 ## Does it run on older versions of macOS?
 
-No. OpenMac needs macOS 14 (Sonoma) or newer. The Swift app is built for macOS 14, and
+No. OpenValet needs macOS 14 (Sonoma) or newer. The Swift app is built for macOS 14, and
 `install.sh` checks the version before it installs anything. Update macOS first, then run the
 installer again.
 
@@ -37,5 +37,5 @@ an API key alone.
 
 No. The wake word, speech recognition, end-of-turn detection, and voice all run on your Mac.
 The one exception is the optional phone feature: if you turn it on, call audio is relayed
-through LiveKit. Your requests, and what OpenMac reads to answer them, go to Anthropic as part
+through LiveKit. Your requests, and what Mac reads to answer them, go to Anthropic as part
 of your Claude session.
