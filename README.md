@@ -16,7 +16,9 @@ say yes.
 
 The project is OpenValet; the assistant answers to Mac.
 
-<!-- DEMO -->
+<a href="https://github.com/SamarthY06/OpenValet/blob/main/docs/media/demo.mp4"><img src="docs/media/demo-poster.png" alt="OpenValet demo: Mac explains the page on screen, writes a note, shows it and opens Kiro, by voice" width="100%"></a>
+
+*70-second demo, sound on: Mac reads the page you are on, writes it up in Notes, shows it and opens an app, and you talk over it whenever you like. The working stretches are sped up and the voices are re-voiced from the session log.*
 
 ## Quickstart
 
