@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/SamarthY06/OpenValet/blob/main/SECURITY.md
     about: Found a way past the gate, or a leak? Report it privately. SECURITY.md says how.
   - name: Usage questions
-    url: https://github.com/SamarthY06/OpenValet/blob/main/docs/USAGE.md
-    about: Commands, settings, Chrome pairing, the services and memory are documented here. If the docs are wrong, open a bug.
+    url: https://github.com/SamarthY06/OpenValet/discussions
+    about: Ask in Discussions. Commands, settings, Chrome pairing, the services and memory are documented in docs/USAGE.md; if the docs are wrong, open a bug.
