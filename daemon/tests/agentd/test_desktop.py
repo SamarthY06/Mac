@@ -79,14 +79,14 @@ async def test_cancelled_waiting_task_leaks_nothing():
 
 
 async def test_idle_release_and_touch():
-    lock = DesktopLock(idle_release_s=0.1)
+    lock = DesktopLock(idle_release_s=0.5)  # wide margins: shared CI runners stall the loop for 100 ms+
     a = tok(CHAT)
     await lock.acquire(a, 1)
-    await asyncio.sleep(0.07)
+    await asyncio.sleep(0.3)
     lock.touch(a)
-    await asyncio.sleep(0.07)
+    await asyncio.sleep(0.3)  # 0.6 s after acquiring, but only 0.3 s after the touch
     assert lock.holder is a
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.5)
     assert lock.holder is None
 
 

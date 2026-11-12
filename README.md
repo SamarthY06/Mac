@@ -2,11 +2,6 @@
 
 **Talk to your Mac. It does the work, in your apps, and asks before anything leaves the machine.**
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](#quickstart)
-[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black.svg)](#quickstart)
-[![CI](https://github.com/SamarthY06/OpenValet/actions/workflows/ci.yml/badge.svg)](https://github.com/SamarthY06/OpenValet/actions/workflows/ci.yml)
-
 Say *"Hey Mac, find three trending repos, put them in a note and send the list to my team on
 WhatsApp"* and it does it, across apps, while you sit back, and it asks before the send. The brain is Claude (the full Claude
 Code agent loop through the Claude Agent SDK) with your own Claude login; the wake word, speech
@@ -16,7 +11,7 @@ say yes.
 
 The project is OpenValet; the assistant answers to Mac.
 
-<a href="https://github.com/SamarthY06/OpenValet/blob/main/docs/media/demo.mp4"><img src="docs/media/demo-poster.png" alt="OpenValet demo: Mac explains the page on screen, writes a note, shows it and opens Kiro, by voice" width="100%"></a>
+<a href="https://github.com/SamarthY06/OpenValet/blob/main/docs/media/openvalet-demo.mp4"><img src="docs/media/openvalet-demo-poster.png" alt="OpenValet demo: Mac explains the page on screen, writes a note, shows it and opens Kiro, by voice" width="100%"></a>
 
 *70-second demo, sound on: Mac reads the page you are on, writes it up in Notes, shows it and opens an app, and you talk over it whenever you like. The working stretches are sped up and the voices are re-voiced from the session log.*
 

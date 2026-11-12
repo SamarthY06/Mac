@@ -206,9 +206,11 @@ async def test_slow_kws_does_not_block_loop():
     assert events[:2] == [K.WAKE, K.SPEECH_START]
     assert lis.frame_ms_max < 20
     assert lis.kws_ms_max >= 30
-    # The property is "the loop is not blocked by the KWS step" (30 ms), not a wall-clock
-    # bound: under load the ticker itself jitters, so no gap may reach the step length.
-    assert max(gaps) < 0.03, max(gaps)
+    # The property is "the loop is not blocked by the KWS step" (30 ms on every frame). Were it
+    # blocked, nearly every tick would be late; a loaded CI runner can stall any single tick, so
+    # the bound is on the 95th percentile, not the worst gap.
+    gaps.sort()
+    assert gaps[int(len(gaps) * 0.95)] < 0.03, gaps[-10:]
 
 
 async def test_max_utterance_cap():
