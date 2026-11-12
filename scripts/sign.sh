@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sign OpenMac.app.
+# Sign OpenValet.app.
 #
-#   scripts/sign.sh path/to/OpenMac.app
+#   scripts/sign.sh path/to/OpenValet.app
 #
 # Order of preference:
 #   1. $SIGN_IDENTITY (e.g. "Developer ID Application: …") from the default keychains,

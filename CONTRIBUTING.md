@@ -1,4 +1,4 @@
-# Contributing to OpenMac
+# Contributing to OpenValet
 
 Thanks for looking. This page covers how to set up a development checkout, where things live,
 and what a pull request needs. Issues and feature ideas go through the templates on GitHub.
@@ -11,9 +11,9 @@ signed in, the Xcode Command Line Tools, and [uv](https://docs.astral.sh/uv/). G
 (the Swift unit tests in `make test`) needs full Xcode, because XCTest ships with it.
 
 ```bash
-git clone https://github.com/SamarthY06/OpenMac.git ~/OpenMac && cd ~/OpenMac
+git clone https://github.com/SamarthY06/OpenValet.git ~/OpenValet && cd ~/OpenValet
 cd daemon && uv sync && cd ..       # Python 3.12 or 3.13, pinned by uv.lock
-make app                            # build + sign build/OpenMac.app
+make app                            # build + sign build/OpenValet.app
 make test                           # Swift unit tests + the fast Python suite
 ```
 
@@ -54,7 +54,7 @@ cd daemon && uv run macd --audio sounddevice
 
 This runs the daemon headless with the Python audio backend, without the app. Microphone and
 other permissions attribute to your terminal. With the app built, `make run` opens
-`build/OpenMac.app`, which starts the daemon itself. `macctl status` and `macctl logs` work
+`build/OpenValet.app`, which starts the daemon itself. `macctl status` and `macctl logs` work
 against either.
 
 For the WhatsApp side, `scripts/services.sh install` runs a frozen copy of your last commit,

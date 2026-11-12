@@ -1,8 +1,8 @@
 .PHONY: app install test daemon-test app-test e2e clean run
 
-APP := build/OpenMac.app
+APP := build/OpenValet.app
 
-app:            ## build + sign build/OpenMac.app
+app:            ## build + sign build/OpenValet.app
 	scripts/bundle.sh
 
 install:        ## full install (deps, models, app → ~/Applications)

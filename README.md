@@ -1,11 +1,11 @@
-# OpenMac
+# OpenValet
 
 **Talk to your Mac. It does the work, in your apps, and asks before anything leaves the machine.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](#quickstart)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-black.svg)](#quickstart)
-[![CI](https://github.com/SamarthY06/OpenMac/actions/workflows/ci.yml/badge.svg)](https://github.com/SamarthY06/OpenMac/actions/workflows/ci.yml)
+[![CI](https://github.com/SamarthY06/OpenValet/actions/workflows/ci.yml/badge.svg)](https://github.com/SamarthY06/OpenValet/actions/workflows/ci.yml)
 
 Say *"Hey Mac, find three trending repos, put them in a note and send the list to my team on
 WhatsApp"* and it does it, across apps, while you sit back, and it asks before the send. The brain is Claude (the full Claude
@@ -14,7 +14,7 @@ recognition, end-of-turn detection and voice run locally on your Mac. It also an
 WhatsApp groups you add, and a deterministic safety gate blocks anything irreversible until you
 say yes.
 
-The project is OpenMac; the assistant answers to Mac.
+The project is OpenValet; the assistant answers to Mac.
 
 <!-- DEMO -->
 
@@ -25,18 +25,18 @@ installed and signed in (`claude`, then `/login`), and the Xcode Command Line To
 (`xcode-select --install`).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenValet/main/install.sh | bash
 ```
 
-This clones the repo into `~/OpenMac`, installs [uv](https://docs.astral.sh/uv/) if needed, sets
-up Python (about 600 MB), downloads the speech models (about 1 GB on disk), builds `OpenMac.app`
+This clones the repo into `~/OpenValet`, installs [uv](https://docs.astral.sh/uv/) if needed, sets
+up Python (about 600 MB), downloads the speech models (about 1 GB on disk), builds `OpenValet.app`
 and opens it. If Claude Code is missing, the installer offers to install it and sign you in. The
 **Meet Mac** window walks you through the permissions and Chrome pairing.
 
 Then say: **"Hey Mac, what can you do?"**
 
 Flags pass through as `| bash -s -- --yes --no-open`. If you would rather look first:
-`git clone https://github.com/SamarthY06/OpenMac.git ~/OpenMac && cd ~/OpenMac && ./install.sh`.
+`git clone https://github.com/SamarthY06/OpenValet.git ~/OpenValet && cd ~/OpenValet && ./install.sh`.
 
 ## What it can do
 
@@ -78,7 +78,7 @@ Menu bar: push-to-talk (⌥Space), Stop, Turn Off, Settings. Command line: `macc
 Mac links to your own WhatsApp as a linked device, like WhatsApp Web.
 
 ```bash
-cd ~/OpenMac
+cd ~/OpenValet
 scripts/mac whatsapp link          # scan the QR code with your phone, then pick groups
 scripts/services.sh install        # run it in the background, at every login
 scripts/mac chats add "Family"     # add another group later
@@ -111,7 +111,7 @@ only: no polls, no buttons.
 ## Updates
 
 ```bash
-cd ~/OpenMac
+cd ~/OpenValet
 git pull && ./install.sh           # the app and the Python environment (the one-liner also pulls)
 scripts/services.sh update         # the background WhatsApp services
 scripts/services.sh rollback       # back to the commit that ran before
@@ -139,12 +139,12 @@ a build to others, read those terms. An API key works too (`auth = "api_key"`, s
 ## Uninstall
 
 ```bash
-cd ~/OpenMac
+cd ~/OpenValet
 scripts/services.sh uninstall      # stop the background services
 ./install.sh --uninstall           # remove the app, settings and (if you say so) data
 ```
 
-Then delete `~/OpenMac`. To unlink WhatsApp, remove this Mac under Settings, Linked devices in WhatsApp on your phone.
+Then delete `~/OpenValet`. To unlink WhatsApp, remove this Mac under Settings, Linked devices in WhatsApp on your phone.
 
 ## More
 

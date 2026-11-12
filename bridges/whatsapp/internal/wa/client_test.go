@@ -13,7 +13,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/SamarthY06/OpenMac/bridges/whatsapp/internal/bridge"
+	"github.com/SamarthY06/OpenValet/bridges/whatsapp/internal/bridge"
 )
 
 // These tests open a real (temp) SQLite store through whatsmeow but never

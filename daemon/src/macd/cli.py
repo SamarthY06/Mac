@@ -46,7 +46,7 @@ class ControlClient:
             s.connect(self.path)
         except (FileNotFoundError, ConnectionRefusedError) as e:
             s.close()
-            raise DaemonError("Mac isn't running. Open OpenMac.app (or run `macd` for headless use).") from e
+            raise DaemonError("Mac isn't running. Open OpenValet.app (or run `macd` for headless use).") from e
         self._sock = s
 
     def close(self) -> None:

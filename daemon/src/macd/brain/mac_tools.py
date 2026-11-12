@@ -43,7 +43,7 @@ NOTHING_TO_CONFIRM = ("Nothing to confirm yet: attempt the action first; the saf
 ALREADY_PENDING = ("A confirmation is already being asked, wait for that answer; do not ask again "
                    "and do not treat this as a decline.")
 AX_HELP = ("Accessibility permission is missing. Ask the user to open System Settings > Privacy & "
-           "Security > Accessibility and turn on OpenMac, then try again.")
+           "Security > Accessibility and turn on OpenValet, then try again.")
 
 # AG10: the model writes the confirmation; over-long text is a tool error it rewrites, never a cut.
 SUMMARY_MAX_CHARS = 200
@@ -631,7 +631,7 @@ class MacTools:
         try:
             res = _run(["screencapture", "-x", "-t", "png", str(path)], 15)
             if res.returncode != 0 or not path.exists() or path.stat().st_size == 0:
-                return _err("Screenshot failed. Screen Recording permission may be missing for OpenMac.app "
+                return _err("Screenshot failed. Screen Recording permission may be missing for OpenValet.app "
                             "(System Settings > Privacy & Security > Screen Recording).")
             _run(["sips", "-Z", "1600", str(path)], 15)
             data = base64.b64encode(path.read_bytes()).decode("ascii")

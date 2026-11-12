@@ -1,4 +1,4 @@
-# Using OpenMac: the details
+# Using OpenValet: the details
 
 The [README](../README.md) is the one-screen version, including the list of what Mac can do.
 This page has the rest. One extra: you can talk to your Mac from your phone over LiveKit
@@ -39,7 +39,7 @@ shows live status; here is what happens underneath.
 | "Hey Mac, go to sleep" | turns listening off (menu bar → Turn On to wake) |
 
 After Mac answers, you have a few seconds to follow up **without** the wake word.
-The app is `~/Applications/OpenMac.app`. Menu bar: Talk to Mac (⌥Space push-to-talk), Stop,
+The app is `~/Applications/OpenValet.app`. Menu bar: Talk to Mac (⌥Space push-to-talk), Stop,
 Turn Off/On, Mute, New Conversation, Talk from Phone…, Permissions…, Launch at Login, logs,
 settings.
 
@@ -171,7 +171,7 @@ Desktop or Documents). Allow it, or keep the repo outside those folders.
 Short version:
 
 ```
-OpenMac.app (Swift)  ── mic w/ echo cancellation ──►  macd (Python)
+OpenValet.app (Swift)  ── mic w/ echo cancellation ──►  macd (Python)
    menu bar, HUD, permissions,                        wake word → VAD → STT → Smart Turn → orchestrator
    supervises the daemon                          → Claude (Agent SDK, --chrome) → TTS
                  ◄── speech audio ────────────────  safety hook gates outward actions
@@ -187,7 +187,7 @@ destination, and the model never sees it, so prompt injection from a web page ca
 ## Development
 
 ```bash
-make app          # build + sign build/OpenMac.app
+make app          # build + sign build/OpenValet.app
 make test         # Swift + Python tests
 cd daemon && uv run pytest -q -m "not live and not models and not perf"   # fast unit suite
 cd daemon && uv run pytest -q -s -m perf                       # benchmarks, run alone (W6 latency gate)

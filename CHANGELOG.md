@@ -10,7 +10,7 @@
 
 ## 0.1.0 - 2026-11-11
 
-First public release, under the name OpenMac. The assistant is still called Mac.
+First public release, under the name OpenMac (renamed OpenValet the next day). The assistant is still called Mac.
 
 ### Voice
 
@@ -52,8 +52,8 @@ First public release, under the name OpenMac. The assistant is still called Mac.
 
 ### Setup
 
-- One-line install: clones into `~/OpenMac`, installs uv, Python, the speech models, builds
-  and opens `OpenMac.app`. The Meet Mac window handles permissions and Chrome pairing.
+- One-line install: clones into `~/OpenValet`, installs uv, Python, the speech models, builds
+  and opens `OpenValet.app`. The Meet Mac window handles permissions and Chrome pairing.
 - Go is optional: without it the WhatsApp bridge is downloaded prebuilt from the release.
 - `./install.sh --uninstall`, `scripts/services.sh uninstall`.
 

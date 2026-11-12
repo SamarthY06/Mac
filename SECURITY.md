@@ -1,12 +1,12 @@
 # Security
 
-OpenMac runs an agent with access to your Mac, your browser and your WhatsApp. We take reports
+OpenValet runs an agent with access to your Mac, your browser and your WhatsApp. We take reports
 seriously and would rather hear about a problem privately first.
 
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting on the repository: **Security**, then **Report a
-vulnerability**, at <https://github.com/SamarthY06/OpenMac/security/advisories/new>. Please do
+vulnerability**, at <https://github.com/SamarthY06/OpenValet/security/advisories/new>. Please do
 not open a public issue for a security problem, and do not post it in a pull request.
 
 Include what you did, what happened, and what you expected. A command, a message or a page that
@@ -43,7 +43,7 @@ Out of scope, by design:
 - **Group members are trusted.** Their messages reach Claude as framed, untrusted context, and
   only the owner's messages are requests, but a group the owner adds is a group the owner
   trusts. Social engineering of the owner through a group is out of scope.
-- The owner's own Claude account, Chrome profile and WhatsApp account. OpenMac uses them as
+- The owner's own Claude account, Chrome profile and WhatsApp account. OpenValet uses them as
   the owner; it does not add protection they do not already have.
 - Denial of service against the owner's own machine (a long-running task, a full disk).
 

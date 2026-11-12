@@ -1,57 +1,57 @@
 #!/usr/bin/env bash
-# OpenMac installer. Idempotent: safe to re-run after `git pull`.
+# OpenValet installer. Idempotent: safe to re-run after `git pull`.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenValet/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --yes --no-open      (flags pass through)
 #   ./install.sh               interactive install from a checkout
 #   ./install.sh --yes         non-interactive (assume "yes" to installs, skip optional prompts)
 #   ./install.sh --no-models   skip speech model download
 #   ./install.sh --no-open     don't launch the app at the end
-#   ./install.sh --app-only    only rebuild + reinstall OpenMac.app (skip uv, models, LiveKit)
-#   ./install.sh --uninstall   remove OpenMac.app, settings and (optionally) data
+#   ./install.sh --app-only    only rebuild + reinstall OpenValet.app (skip uv, models, LiveKit)
+#   ./install.sh --uninstall   remove OpenValet.app, settings and (optionally) data
 #
-# Env: OPENMAC_DIR (checkout used by the one-liner, default ~/OpenMac), OPENMAC_REPO, OPENMAC_REF,
+# Env: OPENVALET_DIR (checkout used by the one-liner, default ~/OpenValet), OPENVALET_REPO, OPENVALET_REF,
 #      SIGN_IDENTITY (Developer ID for signing), LIVEKIT_URL/LIVEKIT_API_KEY/LIVEKIT_API_SECRET
 #      (stored into the Keychain when given, also with --yes).
 set -euo pipefail
 
 # ------------------------------------------------------------------------- bootstrap (curl | bash)
 # Nothing before the exec may read stdin: bash runs a piped script as it arrives.
-OPENMAC_REPO="${OPENMAC_REPO:-https://github.com/SamarthY06/OpenMac.git}"
-OPENMAC_DIR="${OPENMAC_DIR:-$HOME/OpenMac}"
+OPENVALET_REPO="${OPENVALET_REPO:-https://github.com/SamarthY06/OpenValet.git}"
+OPENVALET_DIR="${OPENVALET_DIR:-$HOME/OpenValet}"
 bootstrap() {  # not inside a checkout (curl | bash, bash <(curl), a lone downloaded file): get one, hand over
   local src="${BASH_SOURCE[0]:-}" a
   [[ -f "$src" && -d "$(cd "$(dirname "$src")" && pwd)/daemon" ]] && return 0
   for a in "$@"; do
     if [[ $a == -h || $a == --help ]]; then
-      echo "usage: curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash -s -- [--yes] [--no-models] [--no-open]"
-      echo "       clones OpenMac into \$OPENMAC_DIR (default ~/OpenMac) and runs its install.sh"
+      echo "usage: curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenValet/main/install.sh | bash -s -- [--yes] [--no-models] [--no-open]"
+      echo "       clones OpenValet into \$OPENVALET_DIR (default ~/OpenValet) and runs its install.sh"
       exit 0
     fi
   done
-  echo "OpenMac: using a checkout in $OPENMAC_DIR"
+  echo "OpenValet: using a checkout in $OPENVALET_DIR"
   if ! xcode-select -p >/dev/null 2>&1; then            # /usr/bin/git is only a shim without the CLT
     xcode-select --install >/dev/null 2>&1 || true
     echo "Install the Command Line Tools from the dialog that just opened (they bring git and Swift), then run this command again." >&2
     exit 1
   fi
-  if [[ -d "$OPENMAC_DIR/.git" ]]; then
-    echo "  $(git -C "$OPENMAC_DIR" remote get-url origin 2>/dev/null || echo "no remote") ($(git -C "$OPENMAC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null))"
-    git -C "$OPENMAC_DIR" pull --ff-only -q || echo "  ! could not update $OPENMAC_DIR (offline or local changes); installing what is there" >&2
-  elif [[ -e "$OPENMAC_DIR" ]]; then
-    echo "$OPENMAC_DIR exists and is not an OpenMac checkout. Move it, or set OPENMAC_DIR." >&2; exit 1
+  if [[ -d "$OPENVALET_DIR/.git" ]]; then
+    echo "  $(git -C "$OPENVALET_DIR" remote get-url origin 2>/dev/null || echo "no remote") ($(git -C "$OPENVALET_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null))"
+    git -C "$OPENVALET_DIR" pull --ff-only -q || echo "  ! could not update $OPENVALET_DIR (offline or local changes); installing what is there" >&2
+  elif [[ -e "$OPENVALET_DIR" ]]; then
+    echo "$OPENVALET_DIR exists and is not an OpenValet checkout. Move it, or set OPENVALET_DIR." >&2; exit 1
   else
-    git clone --depth 1 ${OPENMAC_REF:+--branch "$OPENMAC_REF"} "$OPENMAC_REPO" "$OPENMAC_DIR"
+    git clone --depth 1 ${OPENVALET_REF:+--branch "$OPENVALET_REF"} "$OPENVALET_REPO" "$OPENVALET_DIR"
   fi
-  [[ -x "$OPENMAC_DIR/install.sh" ]] || { echo "$OPENMAC_DIR has no install.sh" >&2; exit 1; }
-  cd "$OPENMAC_DIR"
+  [[ -x "$OPENVALET_DIR/install.sh" ]] || { echo "$OPENVALET_DIR has no install.sh" >&2; exit 1; }
+  cd "$OPENVALET_DIR"
   if { : </dev/tty; } 2>/dev/null; then exec ./install.sh "$@" </dev/tty; else exec ./install.sh "$@"; fi
 }
 bootstrap "$@"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DAEMON_DIR="$ROOT/daemon"
-APP_DEST="${OPENMAC_APP_DEST:-$HOME/Applications/OpenMac.app}"
+APP_DEST="${OPENVALET_APP_DEST:-$HOME/Applications/OpenValet.app}"
 BUNDLE_ID="io.github.macagent.Mac"
 KEYCHAIN_SERVICE="mac-agent"
 
@@ -90,10 +90,10 @@ stop_app_at() {  # $1: an .app path; only that exact app (other copies may be li
 }
 quit_app() { stop_app_at "$APP_DEST"; }
 
-legacy_app_cleanup() {  # the app was called Mac.app before 0.1.0; same bundle id, so it is ours
+legacy_app_cleanup() {  # the app was Mac.app, then briefly OpenMac.app; same bundle id, so it is ours
   local p id
-  [[ -z ${OPENMAC_APP_DEST:-} ]] || return 0   # a custom destination (tests) never touches the real apps
-  for p in "/Applications/Mac.app" "$HOME/Applications/Mac.app"; do
+  [[ -z ${OPENVALET_APP_DEST:-} ]] || return 0   # a custom destination (tests) never touches the real apps
+  for p in "/Applications/Mac.app" "$HOME/Applications/Mac.app" "/Applications/OpenMac.app" "$HOME/Applications/OpenMac.app"; do
     [[ -d "$p" && "$p" != "$APP_DEST" ]] || continue
     id="$(defaults read "$p/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
     [[ "$id" == "$BUNDLE_ID" ]] || continue
@@ -115,7 +115,7 @@ if [[ $UNINSTALL == 1 ]]; then
   fi
   rm -rf "$APP_DEST" && ok "removed $APP_DEST"
   [[ -L "$HOME/.local/bin/macctl" ]] && rm -f "$HOME/.local/bin/macctl" && ok "removed ~/.local/bin/macctl"
-  if [[ ${OPENMAC_NO_DEFAULTS:-0} != 1 ]]; then
+  if [[ ${OPENVALET_NO_DEFAULTS:-0} != 1 ]]; then
     defaults delete "$BUNDLE_ID" >/dev/null 2>&1 && ok "removed app preferences" || true
     tccutil reset All "$BUNDLE_ID" >/dev/null 2>&1 && ok "reset privacy permissions for $BUNDLE_ID" || true
   fi
@@ -132,16 +132,16 @@ if [[ $UNINSTALL == 1 ]]; then
     security delete-keychain "$HOME/Library/Keychains/mac-agent-signing.keychain-db" >/dev/null 2>&1 || true
     rm -rf "$HOME/.mac-agent/signing"; ok "removed signing identity"
   fi
-  echo; echo "${G}OpenMac has been uninstalled.${O} Logs remain in ~/Library/Logs/Mac."
+  echo; echo "${G}OpenValet has been uninstalled.${O} Logs remain in ~/Library/Logs/Mac."
   exit 0
 fi
 
-echo "${B}OpenMac, an always-on voice agent for macOS, powered by Claude${O}"
+echo "${B}OpenValet, an always-on voice agent for macOS, powered by Claude${O}"
 
 # ------------------------------------------------------------------------- system
 step "Checking your system"
-[[ $(uname -s) == Darwin ]] || die "OpenMac only runs on macOS."
-[[ $(uname -m) == arm64 ]] || die "OpenMac requires an Apple silicon Mac (arm64); found $(uname -m)."
+[[ $(uname -s) == Darwin ]] || die "OpenValet only runs on macOS."
+[[ $(uname -m) == arm64 ]] || die "OpenValet requires an Apple silicon Mac (arm64); found $(uname -m)."
 MACOS="$(sw_vers -productVersion)"
 [[ ${MACOS%%.*} -ge 14 ]] || die "macOS 14 (Sonoma) or newer is required; you have $MACOS."
 ok "macOS $MACOS on Apple silicon"
@@ -268,31 +268,31 @@ fi
 fi  # APP_ONLY
 
 # ------------------------------------------------------------------------- app
-step "Building OpenMac.app"
+step "Building OpenValet.app"
 "$ROOT/scripts/bundle.sh"
 legacy_app_cleanup
 quit_app
 mkdir -p "$HOME/Applications"
 rm -rf "$APP_DEST"
-ditto "$ROOT/build/OpenMac.app" "$APP_DEST"
+ditto "$ROOT/build/OpenValet.app" "$APP_DEST"
 ok "installed $APP_DEST"
-if [[ ${OPENMAC_NO_DEFAULTS:-0} == 1 ]]; then
-  warn "OPENMAC_NO_DEFAULTS=1: daemonDir not written (test mode)"
+if [[ ${OPENVALET_NO_DEFAULTS:-0} == 1 ]]; then
+  warn "OPENVALET_NO_DEFAULTS=1: daemonDir not written (test mode)"
 else
   defaults write "$BUNDLE_ID" daemonDir "$DAEMON_DIR"
   ok "daemonDir = $DAEMON_DIR"
 fi
 if codesign -dv "$APP_DEST" 2>&1 | grep -q "Signature=adhoc"; then
-  warn "OpenMac.app is ad-hoc signed: macOS will ask for permissions again after every rebuild."
+  warn "OpenValet.app is ad-hoc signed: macOS will ask for permissions again after every rebuild."
 fi
 
 # First-minute collision: don't launch (and prompt for permissions) while the models are
 # still missing, the app would show "voice unavailable" right away.
 if [[ $OPEN == 1 && ( $MODELS_OK == 1 || $MODELS == 0 || $APP_ONLY == 1 ) ]]; then
   open "$APP_DEST" --args --show
-  ok "OpenMac is running, look for the waveform icon in the menu bar; the Meet Mac window is open"
+  ok "OpenValet is running, look for the waveform icon in the menu bar; the Meet Mac window is open"
 elif [[ $OPEN == 1 ]]; then
-  warn "not opening OpenMac.app because the speech models are missing; run 'macctl models', then: open $APP_DEST"
+  warn "not opening OpenValet.app because the speech models are missing; run 'macctl models', then: open $APP_DEST"
 fi
 
 echo
@@ -304,4 +304,4 @@ echo "  3. Chrome (optional, for browser tasks), “Install extension…” then
 echo "     press Enter at the dialog, type /chrome, choose “Enabled by default”, then /exit."
 echo "  4. Try it, say ${B}“Hey Mac, what can you do?”${O} , or press ${B}⌥Space${O} to talk."
 echo "  Settings: ~/.mac-agent/config.toml   Logs: ~/Library/Logs/Mac/   CLI: macctl status"
-echo "  Menu bar icon → Permissions… reopens the Meet Mac window; so does double-clicking OpenMac.app."
+echo "  Menu bar icon → Permissions… reopens the Meet Mac window; so does double-clicking OpenValet.app."
