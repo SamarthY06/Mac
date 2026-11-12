@@ -551,10 +551,18 @@ async def test_a_recent_restart_resumes_the_request_by_itself(short_root):
     a = await make_agent(short_root, boot="b2", scripts={CHAT: lambda t: [fb.text("Found.")]})
     try:
         c = await a.client(CHAT_TOKEN, [CHAT])
-        assert (await c.event("text"))["text"] == "Found."
+        # the resumed turn may finish before this client connects: its answer waits in `unacked`,
+        # which chatd delivers on (re)connect
+        async def answered() -> dict:
+            for _ in range(300):
+                st = (await c.call({"op": "status", "conv": CHAT}))["data"]
+                if any(u["answer"] == "Found." for u in st.get("unacked", [])):
+                    return st
+                await asyncio.sleep(0.01)
+            raise AssertionError("the resumed turn never answered")
+        st = await answered()
         ask = a.brain(CHAT).asks[-1][1]
         assert ask.endswith("find jobs") and "restarted" in ask and "do not start over" in ask
-        st = (await c.call({"op": "status", "conv": CHAT}))["data"]
         assert st.get("question") is None
     finally:
         await stop_agent(a)

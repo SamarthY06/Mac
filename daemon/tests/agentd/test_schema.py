@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 from dataclasses import fields
 from pathlib import Path
@@ -15,7 +16,11 @@ import pytest
 
 from agentd import schema as s
 
-DOC = (Path(__file__).resolve().parents[3] / "docs" / "agentd-api.md").read_text()
+# The API reference is an internal doc kept out of the public repo; point MAC_API_DOC at it to run this.
+_DOC_PATH = Path(os.environ.get("MAC_API_DOC", Path(__file__).resolve().parents[3] / "docs" / "agentd-api.md"))
+if not _DOC_PATH.is_file():
+    pytest.skip("agentd-api.md not available (set MAC_API_DOC)", allow_module_level=True)
+DOC = _DOC_PATH.read_text()
 
 
 def _section(title_prefix: str) -> str:
@@ -263,7 +268,7 @@ REQUESTS = {
     "steer": {"conv": "whatsapp:1203@g.us", "turn_uid": "b:c:e:3", "text": "only London"},
     "interrupt": {"conv": "voice:local", "turn": 2},
     "new_session": {"conv": "whatsapp:1203@g.us", "folder": "~/Desktop/Personal/Mac"},
-    "reset": {"conv": "voice:local"}, "warm": {"conv": "voice:local"}, "sleep": {"conv": "voice:local"},
+    "reset": {"conv": "voice:local", "hard": True}, "warm": {"conv": "voice:local"}, "sleep": {"conv": "voice:local"},
     "handoff": {"conv": "voice:local"}, "cancel": {"conv": "whatsapp:1203@g.us"}, "stop_other": {},
     "confirm": {"conv": "voice:local", "question_id": "q1", "approved": True},
     "revoke_all": {"conv": "voice:local"},

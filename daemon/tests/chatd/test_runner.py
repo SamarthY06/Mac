@@ -29,6 +29,7 @@ from agentd_kit import (
 )
 
 from agentd import schema as s
+from agentd import service as agentd_service
 from agentd.service import RESTART_TEXT
 from chatd import format as fmt
 from chatd.agent_client import AgentClient, AgentFatal, dev_token, read_lifeline_token
@@ -523,7 +524,33 @@ async def test_attach_ids_are_never_sent_twice(world: World) -> None:
     assert not [m for m in world.ch.sent() if m.path]
 
 
-async def test_restart_notice_once_and_the_answer_binds_to_it(short_root: Path) -> None:
+async def test_a_recent_cut_turn_is_picked_up_without_asking(short_root: Path) -> None:
+    calls = {"n": 0}
+
+    def scr(text: str) -> list[fb.Step]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [fb.say("Working", delay=0.05), *fb_slow(60)]
+        return [fb.text("Picked it up and finished.")]
+
+    agent = await agentd(short_root, scripts={CHAT: scr})
+    ch = channel(short_root)
+    r = await runner(agent, ch, short_root)
+    w = World(short_root, agent, ch, r)
+    try:
+        await w.say("long task")
+        await until(lambda: any("Working" in m.text for m in ch.sent()))
+        await stop_agent(agent)  # agentd dies mid-turn
+        w.agent = agent = await agentd(short_root, scripts={CHAT: scr})
+        await until(lambda: any(m.text == "Mac · Picked it up and finished." for m in ch.sent()))
+        assert fmt.prefixed(RESTART_TEXT) not in [m.text for m in ch.sent()]
+    finally:
+        await w.r.close()
+        await stop_agent(w.agent)
+
+
+async def test_restart_notice_once_and_the_answer_binds_to_it(short_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agentd_service, "RESUME_WINDOW_S", 0.0)  # an old cut turn: Mac asks instead of resuming
     calls = {"n": 0}
 
     def scr(text: str) -> list[fb.Step]:

@@ -218,7 +218,8 @@ async def test_free_text_restart_answer_is_a_new_ask_with_context(short_root):
     await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "find me 20 jobs"})
     await c.event("say")
     await stop_agent(a)
-    a = await make_agent(short_root, boot="b2", scripts={CHAT: lambda t: [fb.text("Found.")]})
+    later = lambda: time.time() + 3 * 3600  # hours later: a stale cut turn asks instead of resuming
+    a = await make_agent(short_root, boot="b2", scripts={CHAT: lambda t: [fb.text("Found.")]}, clock=later)
     try:
         c = await a.client(CHAT_TOKEN, [CHAT])
         st = (await c.call({"op": "status", "conv": CHAT}))["data"]
