@@ -167,7 +167,7 @@ def test_a_failed_bridge_build_switches_nothing(w: World) -> None:
 
 
 def _fake_release(w: World, release: str, body: str, *, corrupt: bool = False) -> str:
-    """A file:// stand-in for github.com/<owner>/OpenMac/releases/download/v<release>/."""
+    """A file:// stand-in for github.com/<owner>/OpenValet/releases/download/v<release>/."""
     d = w.root / "rel" / f"v{release}"
     d.mkdir(parents=True)
     asset = d / "wa-bridge-darwin-arm64"
@@ -183,7 +183,7 @@ def _fake_release(w: World, release: str, body: str, *, corrupt: bool = False) -
 def test_without_go_the_bridge_is_downloaded_for_the_snapshots_version(w: World) -> None:
     sha = w.commit("v1", release="0.1.0")
     w.env["MAC_BRIDGE"] = "download"
-    w.env["OPENMAC_RELEASES_URL"] = _fake_release(w, "0.1.0", "#!/bin/sh\necho prebuilt 0.1.0\n")
+    w.env["OPENVALET_RELEASES_URL"] = _fake_release(w, "0.1.0", "#!/bin/sh\necho prebuilt 0.1.0\n")
     r = w.run("install")
     assert r.returncode == 0, r.stderr
     assert w.current() == sha and w.bridge() == "#!/bin/sh\necho prebuilt 0.1.0\n"
@@ -195,13 +195,13 @@ def test_a_bad_checksum_or_missing_release_switches_nothing(w: World) -> None:
     sha = w.commit("v1")
     assert w.run("install").returncode == 0  # built (MAC_BRIDGE=build)
     w.env["MAC_BRIDGE"] = "download"
-    w.env["OPENMAC_RELEASES_URL"] = _fake_release(w, "0.2.0", "tampered\n", corrupt=True)
+    w.env["OPENVALET_RELEASES_URL"] = _fake_release(w, "0.2.0", "tampered\n", corrupt=True)
     w.commit("v2", release="0.2.0")
     r = w.run("update")
     assert r.returncode == 1 and "checksum mismatch" in r.stderr and "Install Go" in r.stderr
     assert w.current() == sha and w.snapshots() == {sha} and w.bridge() == "bridge v1\n"
     assert not any(p.name.startswith(".new.") for p in w.releases.iterdir())
-    w.env["OPENMAC_RELEASES_URL"] = "file://" + str(w.root / "nowhere")
+    w.env["OPENVALET_RELEASES_URL"] = "file://" + str(w.root / "nowhere")
     r = w.run("update")
     assert r.returncode == 1 and w.current() == sha and w.snapshots() == {sha}
 

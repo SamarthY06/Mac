@@ -27,7 +27,7 @@ ALIASES: dict[str, str] = {
     "wake_phrases": "wake.phrases", "language": "tts.lang", "voice": "tts.voice", "speed": "tts.speed",
     "engine": "tts.engine", "idle_shutdown_min": "brain.idle_shutdown_min", "followup_s": "listen.followup_s",
     "silence_ms": "listen.silence_ms", "chrome": "brain.chrome", "setting_sources": "brain.setting_sources",
-    "remote_enabled": "remote.enabled",
+    "remote_enabled": "remote.enabled", "confirm_outward": "brain.confirm_outward",
 }
 STT_LANGUAGES = ["en"]  # Parakeet TDT 0.6B v2 is English-only
 PREVIEW_TEXT = "Hi, I'm Mac. This is how I sound."

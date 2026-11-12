@@ -72,7 +72,9 @@ from macd.brain.hooks import (
     MEMORY_TOOLS,
     REASON_DESKTOP_BUSY_CHAT,
     REASON_DESKTOP_BUSY_VOICE,
+    REASON_OUTWARD,
     VOICE_DESKTOP_WAIT_S,
+    ActionFingerprint,
     DesktopGuard,
     DesktopLock,
     HookDecision,
@@ -386,8 +388,9 @@ class ClaudeBrain:
             on_wait=self._on_desktop_wait) if locks else None
         self.hook = PreToolHook(
             gate, self._current_turn, self.is_cancelled, self._memory_check,
-            restrict=self._restrict, on_decision=self._on_hook_decision, desktop=self.desktop)
-        self.tools = MacTools(gate=gate, current_turn=self._current_turn,
+            restrict=self._restrict, on_decision=self._on_hook_decision, desktop=self.desktop,
+            confirm_outward=lambda: self.cfg.brain.confirm_outward)
+        self.tools = MacTools(gate=gate, current_turn=self._current_turn, confirm_outward=lambda: self.cfg.brain.confirm_outward,
                               memory_check=self._memory_check, on_say=self._on_say,
                               on_confirm=self._on_confirm, pending_action=self.hook.pending_for,
                               on_notify=on_notify, workspace=self.cwd, memory_path=self.memory_path,
@@ -855,9 +858,14 @@ class ClaudeBrain:
         system_prompt: dict[str, Any] = {"type": "preset", "preset": "claude_code", "append": persona}
         if self._snapshot is not None:
             system_prompt["snapshot"] = self._snapshot
+        mode = self.cfg.brain.permission_mode if self.cfg.brain.permission_mode in ("auto", "bypassPermissions") else "auto"
         opts = ClaudeAgentOptions(
             system_prompt=system_prompt,  # type: ignore[arg-type]
-            permission_mode="bypassPermissions",
+            permission_mode=mode,  # type: ignore[arg-type]
+            can_use_tool=self._can_use_tool if mode == "auto" else None,
+            # The SDK's default 1 MB line limit kills the stream on a big tool result (live 2026-11-12:
+            # a LinkedIn page read ended the turn with "exceeded maximum buffer size").
+            max_buffer_size=64 * 1024 * 1024,
             hooks=self.hook_matchers(),
             mcp_servers={"mac": self.tools.server()},
             cwd=str(self.cwd),
@@ -1155,6 +1163,26 @@ class ClaudeBrain:
             await self._client.query(prompt)
         except Exception as e:  # noqa: BLE001
             await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
+
+    async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
+        """Claude Code's own classifier (permission_mode "auto") escalated this call. The user
+        decides: the action is bound to a confirmation token like any outward action, the model
+        is told to ask (mcp__mac__request_confirmation), and the retry passes once they said yes."""
+        from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+        turn = self._current_turn()
+        title = str(getattr(context, "title", "") or getattr(context, "display_name", "") or tool_name)
+        fp = ActionFingerprint(turn, tool_name, "auto_classifier", title, str(getattr(context, "description", "") or ""))
+        if self.gate.consume(turn, fp.key):
+            log.info("auto mode: allowed after the user's yes (%s)", tool_name)
+            return PermissionResultAllow()
+        if self.is_cancelled(turn):
+            return PermissionResultDeny(message="The user cancelled this request. Stop now and do not call any more tools.")
+        self.hook.pending_action = fp
+        log.info("auto mode: Claude's classifier escalated %s; asking the user", tool_name)
+        reason = str(getattr(context, "decision_reason", "") or "")
+        return PermissionResultDeny(message=f"{REASON_OUTWARD} (Claude Code's safety check flagged this: {title}."
+                                            f"{' ' + reason if reason else ''})")
 
     def _chrome_recheck_due(self) -> bool:
         """UX#17: Chrome appeared after we were told it's missing → stop telling the model."""

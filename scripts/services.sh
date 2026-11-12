@@ -30,7 +30,7 @@ LOGS="$HOME/Library/Logs/Mac"
 STATUS="$MAC_DIR/run/services.json"
 KEEP=3
 BRIDGE_ASSET="wa-bridge-darwin-arm64"
-RELEASES_URL="${OPENMAC_RELEASES_URL:-https://github.com/SamarthY06/OpenMac/releases/download}"
+RELEASES_URL="${OPENVALET_RELEASES_URL:-https://github.com/SamarthY06/OpenValet/releases/download}"
 LAUNCHCTL="${LAUNCHCTL:-launchctl}"
 DOMAIN="gui/$(id -u)"
 

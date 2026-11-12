@@ -79,6 +79,12 @@ DescribeTool = Callable[[str, dict[str, Any]], str | None]
 # know what the user actually heard of a reply that was cut off).
 BARGE_NOTE = ("[The user said this over your speech, without the wake word. If it is not meant for you, "
               "carry on from where you were cut off.]")
+
+RESUME_WINDOW_S = 1800.0  # a request cut by a restart this recently is picked up again by itself
+RESUME_DELAY_S = 2.0
+RESTART_NOTE = ("[Mac was restarted while working on this request and is picking it up where it left off, in "
+                "this same conversation. Continue; do not start over or repeat what is already done.]")
+
 WORKING_NOTE = ("[Said while you were working, without the wake word. If it is not meant for you, ignore it "
                 "and continue.]")
 
@@ -298,6 +304,7 @@ class Orchestrator:
                     self._start_listener_tasks(name)
                 self.eventlog.emit("orchestrator_start", listeners=sorted(self._listeners))
                 self._set_state(State.OFF if self.off else State.IDLE, "start")
+                self._resume_in_flight()
                 await self._stop.wait()
                 self._shutdown_tasks(own)
         finally:
@@ -689,7 +696,7 @@ class Orchestrator:
         """VAD onset over Mac's speech (AEC on): pause NOW; the transcript decides (LiveKit's
         "pause on speech, resume on false interruption")."""
         turn = self.turn
-        if (turn is None or turn.confirming or not self.cfg.listen.barge_in or not self._is_partner(turn, ev.source)
+        if (turn is None or not self.cfg.listen.barge_in or not self._is_partner(turn, ev.source)
                 or self.speech.playing_turn != turn.id):
             return
         if self._barge == turn.id and self.speech.paused:
@@ -727,6 +734,19 @@ class Orchestrator:
             else:
                 self.speech.flush_all()
             return
+        # Answering over the confirmation question (live 2026-11-12: the summary comes first and
+        # "Send it?" last, so people answer over its tail; dropping those yeses looped the question
+        # three times). A clear yes, an explicit no, or a longer reply resolves it; "hmm" lets the
+        # question finish. Not the model's call: the gate needs the owner's own words.
+        if turn is not None and turn.confirming and partner:
+            verdict = P.classify_confirmation(text)
+            if verdict == "no" and not P.has_negation(text):
+                verdict = ""  # unclear and short: not an answer yet
+            if verdict:
+                self._barge_clear()
+                self.speech.flush_turn(turn.id)  # the rest of the question is moot
+                self._resolve_confirm(turn, verdict, "utterance", text=text, confirm_source="voice")
+                return
         # before the brain said anything real (only the "On it." filler plays), the user is still
         # finishing the request: any words merge into it, however short ("…about" "octopuses")
         early = turn is not None and partner and not turn.brain_done and not turn.output_started
@@ -1341,6 +1361,35 @@ class Orchestrator:
     def say(self, text: str) -> None:
         if text.strip():
             self._say_system(text.strip())
+
+    # ================================================================== restarts
+    def remember_in_flight(self) -> None:
+        """Called at shutdown: keep the request the brain was still working on, so the next start
+        picks it up again in the same session (owner, 2026-11-12: a restart must not lose it)."""
+        turn = self.turn
+        if turn is None or turn.brain_done or turn.confirming:
+            return
+        config.update_state(resume_turn={"text": turn.text, "source": turn.source, "origin": turn.origin,
+                                         "at": time.time()})
+        self.eventlog.emit("resume_saved", turn_id=turn.id)
+
+    def _resume_in_flight(self) -> None:
+        rt = config.read_state().get("resume_turn")
+        if not rt:
+            return
+        config.update_state(resume_turn=None)
+        if self.off or time.time() - float(rt.get("at", 0)) > RESUME_WINDOW_S:
+            return
+        source = rt.get("source") if rt.get("source") in self._listeners else next(iter(self._listeners), "control")
+
+        async def go() -> None:
+            await asyncio.sleep(RESUME_DELAY_S)  # listeners and speech are up by then
+            self._say_system(P.RESUMING, self._output_for_source(source))
+            await self._start_turn(str(rt.get("text", "")), source, origin=str(rt.get("origin", "voice")),
+                                   context=RESTART_NOTE, filler=False)
+
+        self.eventlog.emit("resume_turn", text=rt.get("text", ""))
+        self._tasks.spawn(go(), "resume")
 
     async def reset(self, hard: bool = False) -> None:
         if self.turn is not None:

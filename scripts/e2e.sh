@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end: build/OpenMac.app ⇄ scripts/fake_daemon.py over real unix sockets in a temp
+# End-to-end: build/OpenValet.app ⇄ scripts/fake_daemon.py over real unix sockets in a temp
 # MAC_HOME (socket paths must stay < 104 bytes, hence $TMPDIR not a deep path).
 # Plays a short, quiet (amplitude 0.05) tone. Leaves nothing running.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="${1:-$ROOT/build/OpenMac.app}"
+APP="${1:-$ROOT/build/OpenValet.app}"
 H="$(mktemp -d -t mace2e)"
-# Only ever signal the processes THIS script started (other OpenMac.app instances may be live).
+# Only ever signal the processes THIS script started (other OpenValet.app instances may be live).
 APP_PID=""
 cleanup() {
   [[ -n $APP_PID ]] && kill -TERM "$APP_PID" 2>/dev/null || true

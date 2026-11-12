@@ -1,12 +1,12 @@
 # Security
 
-OpenMac runs an agent with access to your Mac, your browser and your WhatsApp. We take reports
+OpenValet runs an agent with access to your Mac, your browser and your WhatsApp. We take reports
 seriously and would rather hear about a problem privately first.
 
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting on the repository: **Security**, then **Report a
-vulnerability**, at <https://github.com/SamarthY06/OpenMac/security/advisories/new>. Please do
+vulnerability**, at <https://github.com/SamarthY06/OpenValet/security/advisories/new>. Please do
 not open a public issue for a security problem, and do not post it in a pull request.
 
 Include what you did, what happened, and what you expected. A command, a message or a page that
@@ -43,16 +43,16 @@ Out of scope, by design:
 - **Group members are trusted.** Their messages reach Claude as framed, untrusted context, and
   only the owner's messages are requests, but a group the owner adds is a group the owner
   trusts. Social engineering of the owner through a group is out of scope.
-- The owner's own Claude account, Chrome profile and WhatsApp account. OpenMac uses them as
+- The owner's own Claude account, Chrome profile and WhatsApp account. OpenValet uses them as
   the owner; it does not add protection they do not already have.
 - Denial of service against the owner's own machine (a long-running task, a full disk).
 
 ## What the project does to stay safe
 
-The model can only ask. The confirmation token is minted by the orchestrator when the owner
+The model can only ask. With `brain.confirm_outward = true` (the default) the confirmation token is minted by the orchestrator when the owner
 says yes to the summary, is bound to that tool and destination, expires in 120 seconds, and is
 checked in a `PreToolUse` hook outside the model's control; the model never sees it. The
-never-readable set and the `~/.mac-agent/` rule are checked in the same hook. Group
+never-readable set and the `~/.mac-agent/` rule are checked in the same hook. Independently of that switch, Claude Code's own permission classifier (`permission_mode = "auto"`) runs on every tool call and anything it escalates is put to the owner as a confirmation. With `confirm_outward = false` the owner delegates the send/post/pay decision to the model's judgement; the dangerous set stays enforced. Group
 context is capped (50 messages, 8,000 characters) and wrapped as untrusted. Logs carry ids,
 counts and timings, never text. Tests under `daemon/tests/test_gate_security_audit.py` encode
 the findings of the last internal audit.

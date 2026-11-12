@@ -78,7 +78,7 @@ def main() -> int:
 
     # Title.
     title_f = font(148, True)
-    draw.text((margin - 6, 112), "OpenMac", font=title_f, fill=INK)
+    draw.text((margin - 6, 112), "OpenValet", font=title_f, fill=INK)
 
     # Tagline, wrapped to the text column.
     tag_f = font(34, False)
@@ -102,7 +102,7 @@ def main() -> int:
     draw.line((margin, 540, W - margin, 540), fill=RULE, width=2)
     draw.text((margin, 562), FOOTER, font=font(24, False), fill=MUTED)
     repo_f = font(24, False)
-    repo = "github.com/SamarthY06/OpenMac"
+    repo = "github.com/SamarthY06/OpenValet"
     draw.text((W - margin - draw.textlength(repo, font=repo_f), 562), repo, font=repo_f, fill=MUTED)
 
     img.save(OUT, optimize=True)

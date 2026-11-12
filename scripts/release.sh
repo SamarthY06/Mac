@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Publish an OpenMac release: tag v$(cat VERSION), build the WhatsApp bridge for Apple silicon and
-# attach it with its checksum. There is no app download: install.sh builds OpenMac.app locally.
+# Publish an OpenValet release: tag v$(cat VERSION), build the WhatsApp bridge for Apple silicon and
+# attach it with its checksum. There is no app download: install.sh builds OpenValet.app locally.
 #
 #   scripts/release.sh                 tag, build, create the GitHub release
 #   scripts/release.sh --draft         same, as a draft release
@@ -55,7 +55,7 @@ echo "==> tag $TAG"
 if git -C "$ROOT" rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   [[ "$(git -C "$ROOT" rev-parse "$TAG^{commit}")" == "$(git -C "$ROOT" rev-parse HEAD)" ]] || die "tag $TAG exists and is not HEAD"
 else
-  git -C "$ROOT" tag -a "$TAG" -m "OpenMac $VER"
+  git -C "$ROOT" tag -a "$TAG" -m "OpenValet $VER"
 fi
 git -C "$ROOT" push -q origin "$TAG"
 gh release view "$TAG" >/dev/null 2>&1 && die "release $TAG already exists: bump VERSION, or gh release delete $TAG"
@@ -63,12 +63,12 @@ gh release view "$TAG" >/dev/null 2>&1 && die "release $TAG already exists: bump
 echo "==> release notes"
 NOTES="$DIST/notes.md"
 {
-  echo "# OpenMac $VER"
+  echo "# OpenValet $VER"
   echo
   echo "Install or update:"
   echo
   echo '```bash'
-  echo "curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenMac/main/install.sh | bash"
+  echo "curl -fsSL https://raw.githubusercontent.com/SamarthY06/OpenValet/main/install.sh | bash"
   echo '```'
   echo
   echo "## Changes"
@@ -85,10 +85,10 @@ NOTES="$DIST/notes.md"
   echo
   echo "## Files"
   echo
-  echo "- \`$ASSET\`: the WhatsApp bridge. The installer downloads it when Go is not installed and checks it against \`SHA256SUMS\` from this release (a transfer check; both files come from the same place). With Go installed the bridge is built from source instead. There is no app download: \`install.sh\` builds OpenMac.app on your Mac."
+  echo "- \`$ASSET\`: the WhatsApp bridge. The installer downloads it when Go is not installed and checks it against \`SHA256SUMS\` from this release (a transfer check; both files come from the same place). With Go installed the bridge is built from source instead. There is no app download: \`install.sh\` builds OpenValet.app on your Mac."
 } >"$NOTES"
 
 echo "==> gh release create $TAG"
-args=(release create "$TAG" "$DIST/$ASSET" "$DIST/SHA256SUMS" --title "OpenMac $VER" --notes-file "$NOTES" --verify-tag)
+args=(release create "$TAG" "$DIST/$ASSET" "$DIST/SHA256SUMS" --title "OpenValet $VER" --notes-file "$NOTES" --verify-tag)
 [[ $DRAFT == 1 ]] && args+=(--draft)
 gh "${args[@]}"

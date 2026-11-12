@@ -21,6 +21,7 @@ GOING_OFF = "Okay, going to sleep. Click the menu bar icon to wake me."
 STILL_WORKING = "Still working on it."
 HEARTBEATS = ("Still on it.", "This is taking a while. I'll keep going.")
 STOPPED_ALL = "Stopped everything."
+RESUMING = "Back. Picking up where I left off."
 PHONE_CONNECTED = "Phone connected."
 PHONE_PREEMPTED = "Someone joined from the phone."
 PIN_PROMPT = "Please say the four-digit code shown on the Mac."
@@ -269,6 +270,11 @@ _AFF = re.compile(
     r"\b(yes|yeah|yep|yup|sure|okay|go ahead|do it|send it|confirm|looks good|sounds good|go for it|"
     r"please do|absolutely|correct|that's right)\b"
 )
+
+
+def has_negation(text: str) -> bool:
+    """An explicit negative or redirect word ("no", "not", "instead", "wait") is present."""
+    return bool(_NEG.search(normalize(text)))
 
 
 def classify_confirmation(text: str) -> str:

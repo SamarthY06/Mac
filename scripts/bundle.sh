@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build OpenMac.app:  swift build -c release → build/OpenMac.app → sign (scripts/sign.sh)
+# Build OpenValet.app:  swift build -c release → build/OpenValet.app → sign (scripts/sign.sh)
 #   scripts/bundle.sh [--debug]
 set -euo pipefail
 
@@ -9,7 +9,7 @@ CONFIG=release
 VERSION="${MAC_VERSION:-$(tr -d '[:space:]' <"$ROOT/VERSION")}"
 BUILD_NUM="${MAC_BUILD:-$(date +%Y%m%d%H%M)}"
 OUT="$ROOT/build"
-APP="$OUT/OpenMac.app"
+APP="$OUT/OpenValet.app"
 
 g=$'\033[32m'; o=$'\033[0m'
 step() { echo "${g}==>${o} $*"; }
@@ -43,8 +43,8 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleExecutable</key><string>Mac</string>
 	<key>CFBundleIdentifier</key><string>io.github.macagent.Mac</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-	<key>CFBundleName</key><string>OpenMac</string>
-	<key>CFBundleDisplayName</key><string>OpenMac</string>
+	<key>CFBundleName</key><string>OpenValet</string>
+	<key>CFBundleDisplayName</key><string>OpenValet</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$BUILD_NUM</string>
@@ -54,7 +54,7 @@ cat >"$APP/Contents/Info.plist" <<PLIST
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
-	<key>NSHumanReadableCopyright</key><string>MIT License. Copyright © OpenMac contributors.</string>
+	<key>NSHumanReadableCopyright</key><string>MIT License. Copyright © OpenValet contributors.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Mac listens for “Hey Mac” and your spoken requests. Audio is processed on this Mac.</string>
 	<key>NSAppleEventsUsageDescription</key>

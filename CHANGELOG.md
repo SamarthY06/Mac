@@ -2,12 +2,15 @@
 
 ## Unreleased
 
+- A restart no longer loses the request in flight: the voice daemon and the chat backend pick a turn cut by a restart up again in the same session ("Back. Picking up where I left off."), if it was running within the last 30 minutes; older ones still ask.
+- Claude Code's own permission classifier runs on every tool call (`brain.permission_mode = "auto"`, the default); what it escalates is put to the user as a confirmation and passes once they say yes. `"bypassPermissions"` restores the previous behaviour.
+- `brain.confirm_outward` (default true): set it to false and the model decides when to ask before sending, posting or paying; the hook then blocks only dangerous actions (destructive commands, secrets, Mac's own files, the never-list).
 - "Stop everything" (chat and voice): ends the running task, its background agents and the session at once.
 - Voice: short progress lines every twenty to thirty seconds on long tasks, and mid-task questions answered at once.
 
 ## 0.1.0 - 2026-11-11
 
-First public release, under the name OpenMac. The assistant is still called Mac.
+First public release, under the name OpenMac (renamed OpenValet the next day). The assistant is still called Mac.
 
 ### Voice
 
@@ -49,8 +52,8 @@ First public release, under the name OpenMac. The assistant is still called Mac.
 
 ### Setup
 
-- One-line install: clones into `~/OpenMac`, installs uv, Python, the speech models, builds
-  and opens `OpenMac.app`. The Meet Mac window handles permissions and Chrome pairing.
+- One-line install: clones into `~/OpenValet`, installs uv, Python, the speech models, builds
+  and opens `OpenValet.app`. The Meet Mac window handles permissions and Chrome pairing.
 - Go is optional: without it the WhatsApp bridge is downloaded prebuilt from the release.
 - `./install.sh --uninstall`, `scripts/services.sh uninstall`.
 

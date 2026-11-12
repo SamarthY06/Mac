@@ -519,6 +519,9 @@ async def test_slow_client_is_closed_and_can_resume(short_root):
         await stop_agent(a)
 
 
+LATER = lambda: time.time() + 3 * 3600  # a reboot hours later: the cut turn is stale
+
+
 async def test_interrupted_notice_once_across_three_restarts(short_root):
     a = await make_agent(short_root, scripts={CHAT: lambda t: slow(n=20, delay=0.05)})
     c = await a.client(CHAT_TOKEN, [CHAT])
@@ -527,7 +530,7 @@ async def test_interrupted_notice_once_across_three_restarts(short_root):
     await stop_agent(a)  # running stays in the record, like a crash
     seen = []
     for i in range(3):
-        a = await make_agent(short_root, boot=f"b{i}")
+        a = await make_agent(short_root, boot=f"b{i}", clock=LATER)
         c = await Client.open(a.sock)
         r = await c.hello(CHAT_TOKEN, [CHAT])
         seen += r["data"]["interrupted"]
@@ -538,13 +541,32 @@ async def test_interrupted_notice_once_across_three_restarts(short_root):
     assert seen == [{"conv": CHAT, "uid": uid, "text": "find jobs"}]
 
 
-async def test_restart_question_yes_reruns_the_request(short_root):
+async def test_a_recent_restart_resumes_the_request_by_itself(short_root):
+    """Owner, 2026-11-12: a restart must not lose the request. Same session, a note, no question."""
     a = await make_agent(short_root, scripts={CHAT: lambda t: slow(n=20, delay=0.05)})
     c = await a.client(CHAT_TOKEN, [CHAT])
     await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "find jobs"})
     await c.event("say")
     await stop_agent(a)
     a = await make_agent(short_root, boot="b2", scripts={CHAT: lambda t: [fb.text("Found.")]})
+    try:
+        c = await a.client(CHAT_TOKEN, [CHAT])
+        assert (await c.event("text"))["text"] == "Found."
+        ask = a.brain(CHAT).asks[-1][1]
+        assert ask.endswith("find jobs") and "restarted" in ask and "do not start over" in ask
+        st = (await c.call({"op": "status", "conv": CHAT}))["data"]
+        assert st.get("question") is None
+    finally:
+        await stop_agent(a)
+
+
+async def test_restart_question_yes_reruns_the_request(short_root):
+    a = await make_agent(short_root, scripts={CHAT: lambda t: slow(n=20, delay=0.05)})
+    c = await a.client(CHAT_TOKEN, [CHAT])
+    await c.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "find jobs"})
+    await c.event("say")
+    await stop_agent(a)
+    a = await make_agent(short_root, boot="b2", scripts={CHAT: lambda t: [fb.text("Found.")]}, clock=LATER)
     try:
         c = await a.client(CHAT_TOKEN, [CHAT])
         q = (await c.call({"op": "status", "conv": CHAT}))["data"]["question"]
@@ -570,7 +592,7 @@ async def test_restart_never_approves_an_old_question(short_root):
     q = await c.event("question")
     await c.call({"op": "question_posted", "conv": CHAT, "question_id": q["question_id"], "msg_ref": "p1"})
     await stop_agent(a)
-    a = await make_agent(short_root, boot="b2")
+    a = await make_agent(short_root, boot="b2", clock=LATER)
     try:
         c = await a.client(CHAT_TOKEN, [CHAT])
         st = (await c.call({"op": "status", "conv": CHAT}))["data"]

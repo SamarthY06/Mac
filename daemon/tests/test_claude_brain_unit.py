@@ -166,7 +166,7 @@ async def test_basic_turn_with_partial_text_dedup(make_brain) -> None:
     done = evs[-1]
     assert done.kind == K.DONE and done.data["session_id"] == "sess-1" and not done.data["interrupted"]
     opts = MockClient.instances[0].options
-    assert opts.permission_mode == "bypassPermissions"
+    assert opts.permission_mode == "auto" and opts.can_use_tool is not None  # Claude Code's classifier, escalations to the user
     assert opts.setting_sources == ["user"]
     assert opts.extra_args == {"chrome": None}
     assert opts.include_partial_messages is True

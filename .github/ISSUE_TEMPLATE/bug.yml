@@ -45,8 +45,8 @@ body:
   - type: input
     id: version
     attributes:
-      label: OpenMac version
-      description: The contents of `VERSION`, or `git rev-parse --short HEAD` in `~/OpenMac`.
+      label: OpenValet version
+      description: The contents of `VERSION`, or `git rev-parse --short HEAD` in `~/OpenValet`.
     validations:
       required: true
   - type: input
