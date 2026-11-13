@@ -45,6 +45,10 @@ Flags pass through as `| bash -s -- --yes --no-open`. If you would rather look f
   which part of its answer you did and did not hear.
 - **Knows when you have finished a sentence**: a thinking pause mid-sentence does not end your
   turn (Pipecat Smart Turn v3.2). You can keep talking during a task without the wake word.
+- **Works while you are away**: "every weekday at 8, find 20 companies that fit my resume and
+  save them" and Mac runs it on its own at that time, then reports back where you asked: in
+  that WhatsApp group, or as a notification on the Mac. Reminders too. Each task keeps its own
+  memory between runs, and Settings > Tasks shows and edits them all.
 - **Sees your screen**: "what's this error?" and it looks. Works with the screen off;
   screenshots and clicks need the Mac unlocked.
 - **Talks like a person**: short answers, one natural voice. 54 voices in 8 languages (US and

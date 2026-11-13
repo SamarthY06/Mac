@@ -136,6 +136,39 @@ projects, people you mention, recurring tasks, and updates it on its own from wh
 "forget that". Before a conversation is retired, Mac writes a short "recent context" note so
 "what were we doing?" works after a restart.
 
+## Scheduled tasks and reminders
+
+Tell Mac what to do and when, by voice or in a WhatsApp group:
+
+- "Every weekday at 8, find 20 companies that fit my resume and save them to the sheet."
+- "In two minutes, find three trending GitHub repos and put them in a note."
+- "Remind me at 6 to call the bank."
+
+Mac confirms the schedule in words and the background service runs the task at that time,
+without you. Results go back where you asked: a task created in a WhatsApp group posts its
+report in that group; a task created by voice shows a Mac notification (allow notifications
+for OpenValet in System Settings), and "what did the 8 am task find?" reads the full report.
+Reminders deliver your words at the time, with no Claude run.
+
+Rules worth knowing:
+
+- Runs are unattended. Nothing that sends, posts, pays or deletes happens without you: such a
+  step is skipped and listed in the report as waiting for your OK, and "go ahead" later
+  finishes it in a normal conversation.
+- Each task keeps its own memory between runs. A task created in a group shares it with what
+  you tell Mac in that group, so "skip fintech from now on" sticks. One group holds one task;
+  ask in another group for a second one.
+- A run never interrupts you: it waits until your conversation in that group is over, and a
+  message from you during a run steers the run.
+- If the Claude usage limit stops a run, you get one message with the reset time. Reply
+  "continue <task name>" to pick up where it left off, or "stop <task name>".
+- Settings > Tasks shows every task with its schedule, next and last run and history, and lets
+  you run, pause, edit, continue, stop or delete it. "What tasks do I have?" and "pause the
+  8 am one" work too.
+
+Tasks live in `~/.mac-agent/agent/state/tasks.json`, with each task's run history and notes
+under `~/.mac-agent/agent/tasks/`.
+
 ## The background services (WhatsApp)
 
 The WhatsApp bot (chatd) and the agent behind it (agentd) can run in the background on their own.

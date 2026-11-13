@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Scheduled tasks and reminders: ask by voice or in a WhatsApp group ("every weekday at 8 am, find 20 companies that fit my resume and save them"; "remind me at 6 to call the bank") and the background service runs it at that time. Results go back where you asked: the group, or a Mac notification (ask "what did it find" for the full report). A task created in a group belongs to that group (one task per group) and shares its memory with what you tell it there. Runs are unattended: nothing that sends, posts, pays or deletes happens without you; such steps are listed in the report as waiting for your OK. If the Claude usage limit stops a run, you get one message with the reset time; "continue <task>" picks up where it left off, "stop <task>" stops it. Settings > Tasks lists, edits, runs, pauses and deletes tasks with their history.
+- Fixed: "Hey Mac, stop the other task" did nothing when the background services were installed (the voice daemon had no token for the backend).
 - A restart no longer loses the request in flight: the voice daemon and the chat backend pick a turn cut by a restart up again in the same session ("Back. Picking up where I left off."), if it was running within the last 30 minutes; older ones still ask.
 - Claude Code's own permission classifier runs on every tool call (`brain.permission_mode = "auto"`, the default); what it escalates is put to the user as a confirmation and passes once they say yes. `"bypassPermissions"` restores the previous behaviour.
 - `brain.confirm_outward` (default true): set it to false and the model decides when to ask before sending, posting or paying; the hook then blocks only dangerous actions (destructive commands, secrets, Mac's own files, the never-list).
