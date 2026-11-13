@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
     let audio = AudioEngine()
     let control = ControlClient()
+    let tasks = TasksClient()
     let supervisor = Supervisor()
     let perms = Permissions()
     var power: Power!
@@ -19,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     lazy var phone = PhonePanel(model: model)
     lazy var voice = VoicePanel(model: model, control: control)
     lazy var settings = SettingsWindow(deps: .init(
-        model: model, control: control, perms: perms, phone: phone,
+        model: model, control: control, tasks: tasks, perms: perms, phone: phone,
         openVoicePanel: { [weak self] in self?.voice.show() },
         resetConversation: { [weak self] in self?.control.send("reset") },
         voiceReset: { [weak self] in self?.control.send("voice_reset") }))
@@ -132,9 +133,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Scheduled tasks (DESIGN.md 7.2): a finished unbound run is one notification; the full
+        // report stays in the task's history. A reminder rings (it is the whole point of it); a
+        // task report is a silent banner.
+        tasks.onReport = { [weak self] r in
+            self?.notify(title: r.title.isEmpty ? "Mac" : r.title, body: r.body, path: nil, sound: r.kind == "reminder")
+        }
+
         installSignalHandlers()
         power.start()
         control.start()
+        tasks.start()
         supervisor.start()
         hotkey = Hotkey { [weak self] in self?.talk() }
 
@@ -235,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ note: Notification) {
         Log.info("terminating")
         control.stop()
+        tasks.stop()
         audio.shutdown()
         supervisor.stopSync()
     }
@@ -336,13 +346,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Posts a user notification; a click reveals `path` in Finder (or opens a folder).
-    func notify(title: String, body: String, path: String?) {
+    /// Posts a user notification; a click reveals `path` in Finder (or opens a folder). Silent unless `sound`.
+    func notify(title: String, body: String, path: String?, sound: Bool = false) {
         guard notificationsReady else { Log.info("notification skipped (not authorized): \(title)", "ui"); return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = nil
+        content.sound = sound ? .default : nil
         if let path { content.userInfo = ["path": path] }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(req) { err in

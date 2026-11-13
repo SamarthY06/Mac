@@ -2,11 +2,13 @@
 
 Mac.app becomes the supervisor later (W8, builder G); until then this does its job:
 
-- **Tokens.** One chat and one app token per boot of macsvc, never in env. agentd gets
-  `{"tokens": {<chat>: "chat", <app>: "app"}}` and chatd `{"token": <chat>}` as the first line of
-  stdin, their lifeline. Both pipes stay open; restarts reuse the same tokens. The app token is
-  also written to ~/.mac-agent/run/app-token (0600, in the 0700 run dir the gate denies) for the
-  `mac chats` CLI, and removed at stop. The chat token is never on disk.
+- **Tokens.** One chat, one app and one voice token per boot of macsvc, never in env. agentd gets
+  `{"tokens": {<chat>: "chat", <app>: "app", <voice>: "voice"}}` and chatd `{"token": <chat>}` as
+  the first line of stdin, their lifeline. Both pipes stay open; restarts reuse the same tokens.
+  The app token is also written to ~/.mac-agent/run/app-token (0600, in the 0700 run dir the gate
+  denies) for the `mac chats` CLI, and the voice token to run/voice-token for macd's local-mode
+  task and stop_other links (tasks DESIGN D1); both are removed at stop. The chat token is never
+  on disk.
 - **Restarts.** A child that exits restarts with backoff 1, 2, 4 ... 60 s; 5 exits within 10 minutes
   stop it for good (the bridge breaker's numbers). chatd exiting 2 (config), 3 (budget spent) or 75
   (WhatsApp store in use) is not restarted, nor agentd exiting 2 (bad tokens); the other child
@@ -235,15 +237,15 @@ class Supervisor:
 
 
 # -- wiring ----------------------------------------------------------------------------------------------
-def build_children(args: argparse.Namespace, tok: str, app_tok: str) -> list[Child]:
+def build_children(args: argparse.Namespace, tok: str, app_tok: str, voice_tok: str) -> list[Child]:
     py = sys.executable
     agentd = [py, "-m", "agentd"] + (["--fake-brain"] if args.test else []) + \
         (["--socket", args.sock] if args.sock else [])
     chatd = [py, "-m", "chatd"] + (["--test"] if args.test else []) + (["--sock", args.sock] if args.sock else []) + \
         [a for extra in args.chatd_arg or [] for a in extra.split()]
+    tokens = {tok: "chat", app_tok: "app", voice_tok: "voice"}
     return [
-        Child("agentd", agentd, (json.dumps({"tokens": {tok: "chat", app_tok: "app"}}) + "\n").encode(),
-              frozenset({2})),
+        Child("agentd", agentd, (json.dumps({"tokens": tokens}) + "\n").encode(), frozenset({2})),
         Child("chatd", chatd, (json.dumps({"token": tok}) + "\n").encode(), frozenset({2, 3, 75})),
     ]
 
@@ -280,18 +282,21 @@ def write_token(path: Path, token: str) -> None:
 
 async def amain(args: argparse.Namespace, mac_home: Path) -> int:
     sock = Path(args.sock) if args.sock else mac_home / "run" / "agent.sock"
-    tok, app_tok = secrets.token_hex(32), secrets.token_hex(32)
+    tok, app_tok, voice_tok = secrets.token_hex(32), secrets.token_hex(32), secrets.token_hex(32)
     app_path = mac_home / "run" / "app-token"
+    voice_path = mac_home / "run" / "voice-token"
     write_token(app_path, app_tok)
-    sup = Supervisor(build_children(args, tok, app_tok), mac_home / "run" / "services.json", sock=sock)
+    write_token(voice_path, voice_tok)
+    sup = Supervisor(build_children(args, tok, app_tok, voice_tok), mac_home / "run" / "services.json", sock=sock)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, sup.stopping.set)
     try:
         await sup.run()
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            app_path.unlink()
+        for path in (app_path, voice_path):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
     return 0
 
 

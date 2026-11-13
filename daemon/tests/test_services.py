@@ -177,3 +177,41 @@ async def test_chatd_refuses_a_missing_token(world: dict[str, Any]) -> None:
     proc = await chatd(world, "--channel", "fake")
     out, _ = await asyncio.wait_for(proc.communicate(b"short\n"), 15)
     assert proc.returncode == 2 and last_words(out)["code"] == 2
+
+
+async def test_macsvc_mints_a_voice_token_that_agentd_accepts(world: dict[str, Any]) -> None:
+    """Tasks D1: run/voice-token (0600) lets macd's local mode reach agentd; removed at stop."""
+    from macd.brain import remote as rb
+
+    config(world)
+    sup = await macsvc(world, "--channel fake")
+    try:
+        await until(lambda: child(world, "agentd").get("state") == "running" and world["sock"].exists())
+        token_path = world["mac"] / "run" / "voice-token"
+        assert token_path.exists() and stat.S_IMODE(token_path.stat().st_mode) == 0o600
+        token = token_path.read_text().strip()
+        assert len(token) == 64 and token != (world["mac"] / "run" / "app-token").read_text().strip()
+        link = rb.AgentLink(world["sock"])
+        try:
+            hello = await until_hello(link, token)
+            assert hello["kind"] == "voice"  # agentd took the third token as the voice kind
+        finally:
+            await link.close()
+        link = rb.AgentLink(world["sock"])
+        with pytest.raises(rb.RemoteError) as e:
+            await link.open("x" * 64, "e2", [])
+        assert e.value.code == "unauthorized"
+    finally:
+        assert await stop(sup) == 0
+    assert not token_path.exists() and not (world["mac"] / "run" / "app-token").exists()
+
+
+async def until_hello(link: Any, token: str) -> dict[str, Any]:
+    deadline = time.monotonic() + 20
+    while True:
+        try:
+            return await link.open(token, "e1", [])
+        except (ConnectionError, OSError, TimeoutError):
+            if time.monotonic() > deadline:
+                raise
+            await asyncio.sleep(0.2)

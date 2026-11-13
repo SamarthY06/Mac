@@ -119,6 +119,15 @@ class RemoteConfig:
 
 
 @dataclass
+class TasksConfig:
+    """Scheduled tasks (agentd reads these at start; DESIGN.md section 10)."""
+
+    summarise_ratio: float = 0.5  # a task session this full of its window is summarised, then fresh
+    catch_up_h: float = 6.0  # a slot missed while asleep runs late within this many hours, else it is missed
+    max_concurrent: int = 2  # scheduled runs at the same time; the rest queue
+
+
+@dataclass
 class Config:
     name: str = "Mac"
     user_name: str = ""
@@ -130,6 +139,7 @@ class Config:
     brain: BrainConfig = field(default_factory=BrainConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     remote: RemoteConfig = field(default_factory=RemoteConfig)
+    tasks: TasksConfig = field(default_factory=TasksConfig)
 
 
 def _merge(obj: Any, data: dict[str, Any], prefix: str = "") -> None:

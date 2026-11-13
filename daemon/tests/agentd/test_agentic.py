@@ -248,7 +248,7 @@ def _spec(profile, **kw):
 
 ALL_ARGS = [*brains.CLAUDE_ARGS, *brains.CHAT_SAFETY_ARGS, "on_alive", "on_rename", "on_reset_voice",
             "on_go_to_sleep", "chat_persona", "display_name", "chat_shared", "on_set_persona", "channel",
-            "switch_workspace", "send_file", "whatsapp_ui_block", "snapshot"]
+            "switch_workspace", "send_file", "whatsapp_ui_block", "snapshot", "task_api"]
 
 
 def test_factory_passes_profile_policy_to_claude_brain(monkeypatch):
@@ -272,7 +272,7 @@ def test_factory_passes_profile_policy_to_claude_brain(monkeypatch):
 
     make(_spec(brains.CHAT, never_chat_names=("Timetable",), capabilities=caps, confirm_send_file=alive_true,
                chat_persona="Reply in Hindi", display_name="Book club", chat_shared=True, chrome=False,
-               on_alive=alive, on_rename=rename))
+               on_alive=alive, on_rename=rename, unattended=alive_true, task_api=alive))
     make(_spec(brains.VOICE, never_chat_names=("Timetable",), on_alive=alive, on_rename=rename,
                on_go_to_sleep=alive))
     chat, voice = seen
@@ -282,7 +282,8 @@ def test_factory_passes_profile_policy_to_claude_brain(monkeypatch):
     assert chat["on_alive"] is alive and "on_rename" not in chat
     assert chat["channel"] == "chat" and chat["switch_workspace"] is True
     assert chat["snapshot"] is False and "snapshot" not in voice  # W10.7: persona edits reach a resumed session
-    for k in ("never_chat_names", "capabilities", "confirm_send_file", "channel", "chat_persona"):
+    assert chat["unattended"] is alive_true and chat["task_api"] is alive
+    for k in ("never_chat_names", "capabilities", "confirm_send_file", "channel", "chat_persona", "unattended"):
         assert k not in voice
     assert voice["on_rename"] is rename and voice["on_alive"] is alive and voice["on_go_to_sleep"] is alive
     assert "on_reset_voice" not in voice  # not given: not passed
@@ -296,7 +297,7 @@ def test_chat_brain_refused_when_claude_brain_lacks_a_safety_argument(monkeypatc
     with pytest.raises(RuntimeError, match=missing):  # at factory start or at the chat brain build
         make, _ = _spy_factory(monkeypatch, sorted({*ALL_ARGS, *cb.CHAT_PROFILE} - {missing}))
         make(_spec(brains.CHAT, never_chat_names=("Timetable",), capabilities=lambda: frozenset(),
-                   confirm_send_file=lambda: True))
+                   confirm_send_file=lambda: True, unattended=lambda: False))
 
 
 def test_extra_cannot_replace_a_safety_argument(monkeypatch):
@@ -309,6 +310,7 @@ def test_extra_cannot_replace_a_safety_argument(monkeypatch):
         return frozenset()
 
     make(_spec(brains.CHAT, never_chat_names=("Timetable",), capabilities=caps, confirm_send_file=lambda: True,
+               unattended=lambda: False,
                extra={"capabilities": None, "never_chat_names": [], "confirm_send_file": None}))
     assert seen[0]["capabilities"] is caps and seen[0]["never_chat_names"] == ["Timetable"]
     assert seen[0]["confirm_send_file"]() is True
@@ -324,6 +326,9 @@ def test_chat_brain_refused_without_its_policy(monkeypatch):
         make(_spec(brains.CHAT, capabilities=lambda: frozenset(), confirm_send_file=lambda: True))  # no never-list
     with pytest.raises(RuntimeError):  # no live confirm_send_file
         make(_spec(brains.CHAT, never_chat_names=("Timetable",), capabilities=lambda: frozenset()))
+    with pytest.raises(RuntimeError):  # no unattended callable: a run could reach out
+        make(_spec(brains.CHAT, never_chat_names=("Timetable",), capabilities=lambda: frozenset(),
+                   confirm_send_file=lambda: True))
 
 
 # ----------------------------------------------------------------------------- confirm, voice tools

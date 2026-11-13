@@ -34,7 +34,13 @@ from typing import Any
 from agentd import schema as s
 from macd import config
 from macd.config import Config
-from macd.contracts import BrainErrorKind, BrainEvent, BrainEventKind
+from macd.contracts import (
+    TASK_OPS,
+    BrainErrorKind,
+    BrainEvent,
+    BrainEventKind,
+    TaskApiError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +55,10 @@ ASK_CONNECT_WAIT_S = 1.0  # an ask waits this long for a reconnect in progress, 
 HANDOFF_WAIT_S = 65.0  # agentd bounds the handoff at 60 s
 CONNECT_CHECK_WAIT_S = 30.0  # agentd bounds the check at 25 s
 _AGENTD_GENERIC_ERROR = "Something went wrong."  # agentd's stand-in for an empty brain message
+TASK_OP_TIMEOUT_S = 15.0
+VOICE_TOKEN_FILE = "voice-token"  # written by macsvc next to app-token (tasks DESIGN D1)
+TASKS_NO_TOKEN = "Tasks are not available right now: Mac's background service is not running."
+TASKS_WHICH_TASK = "Which task? Call mcp__mac__task_list and give its task_id."
 
 _ERROR_KINDS = {k.value: k for k in BrainErrorKind}
 
@@ -59,12 +69,17 @@ def agent_sock_path() -> Path:
 
 def voice_token(lifeline_line: str | None = None) -> str | None:
     """The voice token: `{"token": ...}`, the first line Mac.app writes on macd's lifeline (stdin);
-    for development without the app, `dev-tokens.json` that `agentd --dev` writes (api §3)."""
+    under macsvc, `run/voice-token` (0600, removed at stop; tasks D1); for development without
+    the app, `dev-tokens.json` that `agentd --dev` writes (api §3)."""
     if lifeline_line:
         with contextlib.suppress(ValueError, AttributeError):
             tok = json.loads(lifeline_line).get("token")
             if isinstance(tok, str) and tok:
                 return tok
+    with contextlib.suppress(OSError, ValueError):
+        tok = (config.RUN_DIR / VOICE_TOKEN_FILE).read_text().strip()
+        if tok:
+            return tok
     with contextlib.suppress(OSError, ValueError, AttributeError):
         tok = json.loads((config.RUN_DIR / "dev-tokens.json").read_text()).get("voice")
         if isinstance(tok, str) and tok:
@@ -186,6 +201,33 @@ async def stop_other_once(token: str | None, epoch: str, sock_path: Path | None 
         await link.open(token, epoch, [])
         data = await link.call(s.StopOther())
         return [str(c) for c in data.get("stopped", [])]
+    finally:
+        await link.close()
+
+
+async def task_call_once(token: str | None, epoch: str, op: str, args: dict[str, Any],
+                         sock_path: Path | None = None) -> dict[str, Any]:
+    """Local mode's TaskApi (tasks DESIGN 9.1): one short voice-token connection per task op,
+    naming no conversation (agentd derives the voice origin from the token). Returns the op's
+    data; every failure is a TaskApiError with plain words for the model."""
+    if op not in TASK_OPS:
+        raise TaskApiError("internal", f"Unknown task op {op}.")
+    if not token:
+        raise TaskApiError("unauthorized", TASKS_NO_TOKEN)
+    try:
+        request = s.from_dict(s.OPS[op], dict(args))
+    except s.SchemaError as e:
+        message = TASKS_WHICH_TASK if str(e).startswith("task_id") else str(e)
+        raise TaskApiError(e.code.value, message) from None
+    link = AgentLink(sock_path or agent_sock_path())
+    try:
+        await link.open(token, epoch, [])
+        return await link.call(request, TASK_OP_TIMEOUT_S)
+    except RemoteError as e:
+        raise TaskApiError(e.code, e.message or TASKS_NO_TOKEN) from None
+    except (ConnectionError, OSError, TimeoutError) as e:
+        log.warning("task op %s: agentd unreachable (%s)", op, type(e).__name__)
+        raise TaskApiError("unreachable", TASKS_NO_TOKEN) from None
     finally:
         await link.close()
 
@@ -372,6 +414,10 @@ class RemoteBrain:
 
     async def sleep(self) -> None:
         await self._call(s.Sleep(conv=CONV))
+
+    async def summarize(self, prompt: str, timeout: float) -> str | None:
+        """Voice never summarises a task session; agentd does that on its own brains."""
+        return None
 
     async def handoff(self) -> bool:
         link = self._link

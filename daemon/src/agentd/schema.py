@@ -22,7 +22,9 @@ from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from functools import cache
 from typing import Any, ClassVar, Literal, Union, get_args, get_origin, get_type_hints
 
-API_VERSION = "1.2"
+from macd import contracts
+
+API_VERSION = "1.3"
 MAX_LINE_BYTES = 1 << 20  # 1 MiB per line
 REPLAY_BUFFER_EVENTS = 2_000  # per conversation
 CLIENT_QUEUE_EVENTS = 10_000  # per connection, then slow_client
@@ -58,6 +60,10 @@ class ErrorCode(str, enum.Enum):
     NEVER_LISTED = "never_listed"
     WORKSPACE_NOT_APPROVED = "workspace_not_approved"
     PROFILES_UNAVAILABLE = "profiles_unavailable"
+    TASK_NOT_FOUND = "task_not_found"  # 1.3
+    TASK_CONFLICT = "task_conflict"
+    TASK_EXISTS = "task_exists"
+    TASK_LIMIT = "task_limit"
     GAP = "gap"
     SLOW_CLIENT = "slow_client"
     INTERNAL = "internal"
@@ -570,11 +576,73 @@ class ProfileCommand(Op):
     capability: str | None = None
 
 
+# 4.7 scheduled tasks (1.3). `schedule`: exactly one of in_min, once, at (+days), every_min; agentd
+# validates it (DESIGN 4.1). TaskView and RunRecord are plain objects (DESIGN 3.1, 3.2).
+@dataclass(kw_only=True)
+class TaskList(Op):
+    OP: ClassVar[str] = "task_list"
+
+
+@dataclass(kw_only=True)
+class TaskCreate(Op):
+    OP: ClassVar[str] = "task_create"
+    title: str
+    description: str
+    schedule: dict[str, Any]
+    kind: Literal["task", "reminder"] | None = None
+
+
+@dataclass(kw_only=True)
+class TaskUpdate(Op):
+    OP: ClassVar[str] = "task_update"
+    task_id: str
+    rev: int | None = None  # the task's rev as last seen; a mismatch is `task_conflict`
+    title: str | None = None
+    description: str | None = None
+    schedule: dict[str, Any] | None = None
+    paused: bool | None = None
+
+
+@dataclass(kw_only=True)
+class TaskDelete(Op):
+    OP: ClassVar[str] = "task_delete"
+    task_id: str
+    rev: int | None = None
+
+
+@dataclass(kw_only=True)
+class TaskRun(Op):
+    OP: ClassVar[str] = "task_run"
+    task_id: str
+
+
+@dataclass(kw_only=True)
+class TaskContinue(Op):
+    OP: ClassVar[str] = "task_continue"
+    task_id: str
+
+
+@dataclass(kw_only=True)
+class TaskStop(Op):
+    OP: ClassVar[str] = "task_stop"
+    task_id: str
+
+
+@dataclass(kw_only=True)
+class TaskHistory(Op):
+    OP: ClassVar[str] = "task_history"
+    task_id: str
+    limit: int | None = None  # 1..20, default 5
+
+
+TASK_OPS = frozenset(contracts.TASK_OPS)  # the seam shared with the model side (macd.contracts)
+
 OPS: dict[str, type[Op]] = {c.OP: c for c in (
     Hello, Ask, Steer, Interrupt, NewSession, Reset, Warm, Sleep, Handoff, Cancel, StopOther,
     Confirm, RevokeAll, QuestionPosted, Reply, SetContext, SetLanguage, SetName, VoiceSettings,
     ConnectCheck, Subscribe, Ack, Status, Pause, WsList, WsApprove, WsRemove,
-    ProfileList, ProfileCreate, ProfileSet, ProfileDelete, ProfileCommand)}
+    ProfileList, ProfileCreate, ProfileSet, ProfileDelete, ProfileCommand,
+    TaskList, TaskCreate, TaskUpdate, TaskDelete, TaskRun, TaskContinue, TaskStop, TaskHistory)}
 
 
 # ----------------------------------------------------------------------------- response data
@@ -679,6 +747,43 @@ class ProfileCommandData:
 
 
 @dataclass(kw_only=True)
+class TaskListData:
+    rev: int  # the store-wide tasks rev (tasks_changed carries the same counter)
+    now: float  # the local clock as an epoch, with `tz`, so the model can date a `once` (AT3)
+    tz: str
+    tasks: list[dict[str, Any]]  # TaskView objects (DESIGN 3.1)
+
+
+@dataclass(kw_only=True)
+class TaskData:  # task_create, task_update, task_run
+    task: dict[str, Any]
+    now: float | None = None  # create and update: the local clock the schedule was checked against (AT3)
+    tz: str | None = None
+
+
+@dataclass(kw_only=True)
+class TaskDeleteData:
+    deleted: bool
+
+
+@dataclass(kw_only=True)
+class TaskContinueData:
+    task: dict[str, Any]
+    starts_at: float
+
+
+@dataclass(kw_only=True)
+class TaskStopData:
+    task: dict[str, Any]
+    stopped: bool
+
+
+@dataclass(kw_only=True)
+class TaskHistoryData:
+    runs: list[dict[str, Any]]  # RunRecord objects, newest first (DESIGN 3.2)
+
+
+@dataclass(kw_only=True)
 class GapData:
     """`data` of a `gap` error response."""
 
@@ -696,6 +801,9 @@ RESPONSE_DATA: dict[str, Any] = {
     "pause": PauseData, "ws_list": WsListData, "ws_approve": WsApproveData, "ws_remove": Empty,
     "profile_list": ProfileListData, "profile_create": ProfileData, "profile_set": ProfileData,
     "profile_delete": Empty, "profile_command": ProfileCommandData,
+    "task_list": TaskListData, "task_create": TaskData, "task_update": TaskData, "task_delete": TaskDeleteData,
+    "task_run": TaskData, "task_continue": TaskContinueData, "task_stop": TaskStopData,
+    "task_history": TaskHistoryData,
 }
 
 
@@ -854,19 +962,44 @@ class ProfileChanged:
     deleted: bool | None = None
 
 
-NOTICES: dict[str, type[Any]] = {ProfileChanged.EV: ProfileChanged}
+@dataclass(kw_only=True)
+class TasksChanged:
+    """1.3, to app clients: after every TaskView-visible change. The app reloads with `task_list`
+    when `rev` is newer than its own."""
+
+    EV: ClassVar[str] = "tasks_changed"
+    rev: int
+    task_id: str
+    deleted: bool | None = None
+
+
+@dataclass(kw_only=True)
+class TaskReport:
+    """1.3, to app clients: a scheduled task of voice or the app finished a run (a notification)."""
+
+    EV: ClassVar[str] = "task_report"
+    task_id: str
+    run_id: str
+    title: str
+    body: str
+    status: str
+    kind: str = "task"  # task | reminder: a reminder's notification makes a sound (UX-10)
+
+
+NOTICES: dict[str, type[Any]] = {ProfileChanged.EV: ProfileChanged, TasksChanged.EV: TasksChanged,
+                                 TaskReport.EV: TaskReport}
 
 
 # ----------------------------------------------------------------------------- policy (api §3)
 
 _VOICE_OPS = frozenset({"ask", "steer", "interrupt", "confirm", "revoke_all", "reset", "warm", "sleep",
                         "handoff", "set_context", "set_language", "set_name", "voice_settings",
-                        "connect_check", "status", "subscribe", "stop_other"})
+                        "connect_check", "status", "subscribe", "stop_other"}) | TASK_OPS
 _CHAT_OPS = frozenset({"ask", "steer", "interrupt", "reply", "question_posted", "new_session", "reset",
                        "set_context", "status", "subscribe", "ack", "pause", "ws_list", "profile_list",
-                       "profile_command"})
+                       "profile_command"})  # task tools run inside agentd for chat (D3): no task ops
 _APP_OPS = frozenset({"status", "cancel", "pause", "ws_list", "ws_approve", "ws_remove", "profile_list",
-                      "profile_create", "profile_set", "profile_delete"})
+                      "profile_create", "profile_set", "profile_delete"}) | TASK_OPS
 
 KIND_OPS: dict[ClientKind, frozenset[str]] = {
     ClientKind.VOICE: _VOICE_OPS | {"hello"},

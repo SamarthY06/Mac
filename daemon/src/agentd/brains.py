@@ -23,13 +23,15 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Profile:
-    name: str  # "voice" | "chat"
+    name: str  # "voice" | "chat" | "task"
     confirm_window_s: float
     desktop_label: str
 
 
 VOICE = Profile("voice", confirm_window_s=10.0, desktop_label="voice")
 CHAT = Profile("chat", confirm_window_s=600.0, desktop_label="chat")
+TASK = Profile("task", confirm_window_s=0.0, desktop_label="task")  # unattended: confirmations refused at once
+TASK_CAPS = frozenset({"files_read", "files_write", "web", "chrome", "desktop"})
 
 
 @dataclass
@@ -69,6 +71,9 @@ class BrainSpec:
     on_rename: Callable[[str], str | None] | None = None  # voice: the model renamed the assistant
     on_reset_voice: Callable[[], str | None] | None = None  # voice: back to the standard voice
     on_go_to_sleep: Callable[[], str | None] | None = None  # voice: the model ends the conversation
+    # scheduled tasks: live "nobody is watching" (outward steps refused at once); the task tools' seam
+    unattended: Callable[[], bool] | None = None
+    task_api: Callable[[str, dict[str, Any]], Any] | None = None  # TaskApi (DESIGN 9.1); None in a run
     extra: dict[str, Any] = field(default_factory=dict)
 
     def key(self) -> tuple[Any, ...]:
@@ -111,7 +116,7 @@ CLAUDE_ARGS = ("cwd", "session_store", "memory_file", "recent_user_text", "steer
                "desktop_wait_s", "desktop_busy_reason", "confirm_timeout_s")
 
 
-CHAT_SAFETY_ARGS = ("capabilities", "confirm_send_file", "never_chat_names")
+CHAT_SAFETY_ARGS = ("capabilities", "confirm_send_file", "never_chat_names", "unattended")
 
 
 def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
@@ -125,7 +130,7 @@ def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
         raise RuntimeError(f"ClaudeBrain lacks the profile arguments agentd needs: {', '.join(missing)}")
 
     def make(spec: BrainSpec) -> Brain:
-        base = chat_cfg if (spec.profile is CHAT and chat_cfg is not None) else cfg.brain
+        base = chat_cfg if (spec.profile in (CHAT, TASK) and chat_cfg is not None) else cfg.brain
         brain_cfg = dataclasses.replace(base, model=spec.model or base.model, chrome=spec.chrome,
                                         setting_sources=list(spec.setting_sources))
         c = dataclasses.replace(cfg, brain=brain_cfg)
@@ -137,14 +142,17 @@ def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
             # the transitional flock stays while local voice mode exists (W3.4); deleted with it
             "desktop_locks": [spec.desktop, *hooks.default_desktop_locks()]}
         kw.update(spec.extra)  # N5: first, so nothing in it can replace a safety argument below
-        if spec.profile is CHAT:
-            # safety arguments fail CLOSED: a brain that cannot take them is never built for chat
+        if spec.profile in (CHAT, TASK):
+            # safety arguments fail CLOSED: a brain that cannot take them is never built for chat or a task
             missing = [a for a in CHAT_SAFETY_ARGS if a not in params]
-            if missing or spec.capabilities is None or spec.confirm_send_file is None or not spec.never_chat_names:
-                raise RuntimeError(f"refusing to build a chat brain without {', '.join(missing) or 'its policy'}")
-            kw.update(cb.CHAT_PROFILE)
+            if (missing or spec.capabilities is None or spec.confirm_send_file is None or not spec.never_chat_names
+                    or spec.unattended is None):
+                raise RuntimeError(f"refusing to build a {spec.profile.name} brain without "
+                                   f"{', '.join(missing) or 'its policy'}")
+            kw.update(cb.TASK_PROFILE if spec.profile is TASK else cb.CHAT_PROFILE)
             kw.update(env_exempt_dir=spec.cwd, never_chat_names=list(spec.never_chat_names),
-                      capabilities=spec.capabilities, confirm_send_file=spec.confirm_send_file)
+                      capabilities=spec.capabilities, confirm_send_file=spec.confirm_send_file,
+                      unattended=spec.unattended)
             optional = {"chat_persona": spec.chat_persona, "display_name": spec.display_name,
                         "chat_shared": spec.chat_shared, "on_set_persona": spec.on_set_persona,
                         "snapshot": False}  # W10.7: a persona edit must apply to a resumed session
@@ -156,6 +164,8 @@ def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
             kw.update({k: v for k, v in optional.items() if v is not None and k in params})
         if spec.on_alive is not None and "on_alive" in params:  # push liveness when B's brain offers it
             kw["on_alive"] = spec.on_alive
+        if spec.task_api is not None and "task_api" in params:  # the task tools (voice and chat, never a run)
+            kw["task_api"] = spec.task_api
         return cb.ClaudeBrain(c, spec.gate, **kw)
 
     return make

@@ -200,8 +200,15 @@ class Daemon:
 
         return ClaudeBrain(self.cfg, gate, chrome_status_cb=chrome_status, on_notify=self._notify_app,
                            on_rename=self._rename, on_reset_voice=self._reset_voice,
-                           on_go_to_sleep=self._go_to_sleep,
+                           on_go_to_sleep=self._go_to_sleep, task_api=self._task_api,
                            recent_user_text=lambda n=10: self.orch.recent_user_text(n) if self.orch else [])
+
+    async def _task_api(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Local mode's task tools (tasks DESIGN 9.1): each op is one short voice-token
+        connection to agentd, like `_stop_other`. A missing token is a plain TaskApiError."""
+        from macd.brain.remote import task_call_once, voice_token
+
+        return await task_call_once(voice_token(self.lifeline_line), self.client_epoch, op, args)
 
     async def _stop_other(self) -> list[str]:
         """"Hey Mac, stop the other task" (W6): agentd's stop_other in both brain modes. Remote mode

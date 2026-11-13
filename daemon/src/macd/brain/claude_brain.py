@@ -64,7 +64,13 @@ from claude_agent_sdk import (
 
 from macd import config
 from macd.brain import errors, mac_tools, memory, prompts
-from macd.brain.gate import MAC_SEND_FILE, ConfirmationGate, GateContext, analyze
+from macd.brain.gate import (
+    MAC_SEND_FILE,
+    ConfirmationGate,
+    GateContext,
+    analyze,
+    is_unattended,
+)
 from macd.brain.hooks import (
     CHAT_DESKTOP_WAIT_S,
     CONFIRM_TOOL,
@@ -73,6 +79,7 @@ from macd.brain.hooks import (
     REASON_DESKTOP_BUSY_CHAT,
     REASON_DESKTOP_BUSY_VOICE,
     REASON_OUTWARD,
+    REASON_UNATTENDED,
     VOICE_DESKTOP_WAIT_S,
     ActionFingerprint,
     DesktopGuard,
@@ -84,7 +91,13 @@ from macd.brain.hooks import (
 )
 from macd.brain.mac_tools import MacTools
 from macd.brain.narration import describe_tool
-from macd.contracts import BrainErrorKind, BrainEvent, BrainEventKind
+from macd.contracts import (
+    BrainErrorKind,
+    BrainEvent,
+    BrainEventKind,
+    RateLimited,
+    TaskApi,
+)
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +106,9 @@ _SILENT_TOOLS = {SAY_TOOL, CONFIRM_TOOL}
 _SWITCH_TOOL = "mcp__mac__switch_workspace"
 HANDOFF_TURN = -1  # turn id of the silent session-handoff query (never emitted)
 PROBE_TURN = -2  # turn id of the silent connect_check probe query (never emitted)
+SUMMARY_TURN = -3  # turn id of a task's notes query (`summarize`, tasks DESIGN 6.4; never emitted)
+SUMMARY_RESTRICT = "Notes only: call no tools."
+DEFAULT_CONTEXT_WINDOW = 200_000
 # Claude Code starts a query of its own when a background task (an Agent, a background Bash) it
 # launched finishes. Those turns get ids from here up; agentd delivers them as a new answer.
 WAKE_TURN_BASE = 1_000_000
@@ -181,6 +197,9 @@ CHAT_PROFILE: dict[str, Any] = {
     "channel": "chat", "desktop_wait_s": CHAT_DESKTOP_WAIT_S,
     "desktop_busy_reason": REASON_DESKTOP_BUSY_CHAT, "confirm_timeout_s": 600.0,
 }
+# An unbound scheduled task's conversation (tasks DESIGN 6.1): the chat column, with nowhere to
+# send a file to and no folder to move to. agentd adds capabilities, unattended and the cwd.
+TASK_PROFILE: dict[str, Any] = {**CHAT_PROFILE, "send_file": False, "switch_workspace": False, "channel": "task"}
 
 
 @dataclass
@@ -209,9 +228,11 @@ class _Turn:
     queries: int = 1
     handoff: bool = False  # silent, memory-tools-only query (session handoff)
     probe: bool = False  # silent, tool-less connect_check query
+    summary: bool = False  # silent, tool-less notes query (tasks 6.4); `texts` collects the answer
+    usage: dict[str, Any] | None = None  # the last main-thread assistant usage (context size, D5)
     switch: tuple[str, str] | None = None  # (folder, mode) the model asked to move to (AG1)
     after: Callable[[], Any] | None = None  # deferred action once a handoff turn ends
-    future: asyncio.Future[bool] | None = None
+    future: asyncio.Future[Any] | None = None
 
     @property
     def draining(self) -> bool:
@@ -285,7 +306,7 @@ class ClaudeBrain:
                  display_name: str = "",
                  chat_shared: bool = False,
                  snapshot: bool | None = None,
-                 channel: Literal["voice", "chat"] = "voice",
+                 channel: Literal["voice", "chat", "task"] = "voice",
                  channel_note: str = "",
                  send_file: bool = False,
                  test_tools: bool = False,
@@ -298,7 +319,9 @@ class ClaudeBrain:
                  on_reset_voice: mac_tools.SettingCallback | None = None,
                  on_go_to_sleep: mac_tools.SettingCallback | None = None,
                  on_alive: Callable[[bool], None] | None = None,
-                 on_set_persona: mac_tools.SettingCallback | None = None) -> None:
+                 on_set_persona: mac_tools.SettingCallback | None = None,
+                 unattended: Callable[[], bool] | None = None,
+                 task_api: TaskApi | None = None) -> None:
         self.cfg = cfg
         self.gate = gate
         self.chrome_status_cb = chrome_status_cb
@@ -380,7 +403,7 @@ class ClaudeBrain:
             "ask": self._on_ask, "steer": self._on_steer, "interrupt": self._on_interrupt,
             "reset": self._on_reset, "warm": self._on_warm, "sleep": self._on_sleep,
             "msg": self._on_msg, "reader_done": self._on_reader_done, "handoff": self._on_handoff,
-            "connect_check": self._on_connect_check,
+            "connect_check": self._on_connect_check, "summarize": self._on_summarize,
         }
         locks = default_desktop_locks() if desktop_locks is None else list(desktop_locks)
         self.desktop: DesktopGuard | None = DesktopGuard(
@@ -398,7 +421,11 @@ class ClaudeBrain:
                               memory=self._memory, on_attach=self._on_attach if send_file else None,
                               test_tools=test_tools, on_rename=on_rename, on_reset_voice=on_reset_voice,
                               on_go_to_sleep=on_go_to_sleep, on_set_persona=on_set_persona,
-                              on_switch_workspace=self._on_switch_workspace if switch_workspace else None)
+                              on_switch_workspace=self._on_switch_workspace if switch_workspace else None,
+                              task_api=task_api, recent_user_text=self._user_text,
+                              unattended=lambda: is_unattended(self.hook.context))
+        # Tasks (DESIGN 9.3, 9.5): `unattended` (a scheduled run) is read by the gate per decision;
+        # task_api gives the model the task_* tools (never for a task conv's own brain).
         self.hook.context = GateContext(
             workspace=str(self.cwd), element_label=self.tools.registry.label,
             chrome_ref_label=self.tools.chrome_refs.label, chrome_tab_host=self.tools.chrome_tabs.host,
@@ -406,7 +433,7 @@ class ClaudeBrain:
             never_chat_names=tuple(never_chat_names),
             env_exempt_dir=str(env_exempt_dir) if env_exempt_dir is not None else None,
             memory_path=str(self.memory_path), confirm_send_file=confirm_send_file,
-            capabilities=capabilities, display_name=display_name)
+            capabilities=capabilities, display_name=display_name, unattended=unattended)
 
     # ------------------------------------------------------------------ Brain protocol
     async def start(self) -> None:
@@ -507,6 +534,52 @@ class ClaudeBrain:
             return await asyncio.wait_for(fut, HANDOFF_TIMEOUT_S + 15)
         except TimeoutError:
             return False
+
+    async def summarize(self, prompt: str, timeout: float) -> str | None:
+        """Tasks 6.4: one restricted, tool-less query on the current session whose answer text
+        is the notes for a fresh session. None at once when the brain is busy or the CLI is down;
+        None on timeout (the query is interrupted) or any failure. Raises RateLimited(reset_at)
+        when the answer is a usage-limit error. A cancelled caller interrupts the query too."""
+        if self._task is None:
+            return None
+        fut: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        self._put(_Cmd("summarize", text=prompt, payload=(fut, float(timeout))))
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout + DRAIN_TIMEOUT_S + 5)
+        except TimeoutError:
+            fut.cancel()  # nobody awaits it any more: a late answer or RateLimited is dropped
+            self._put(_Cmd("interrupt", SUMMARY_TURN))
+            return None
+        except asyncio.CancelledError:
+            fut.cancel()
+            self._put(_Cmd("interrupt", SUMMARY_TURN))
+            raise
+
+    async def _on_summarize(self, cmd: _Cmd) -> None:
+        fut, timeout = cmd.payload
+        if fut.done():
+            return
+        if self._client is None or self._active is not None:  # busy or down: the caller keeps its notes
+            fut.set_result(None)
+            return
+        self._active = _Turn(SUMMARY_TURN, self._clock() + max(1.0, timeout), texts=[], summary=True, future=fut)
+        log.info("brain: task notes query started")
+        try:
+            await self._client.query(cmd.text)
+        except Exception as e:  # noqa: BLE001
+            await self._fail_active(errors.classify_exception(e, self.stderr_tail()), reconnect=True)
+
+    def _end_summary(self, a: _Turn, err: errors.ClassifiedError | None, ok: bool = False) -> None:
+        """Resolve the summary future: the answer text, None, or RateLimited."""
+        fut = a.future
+        if fut is None or fut.done():
+            return
+        if err is not None and err.kind is BrainErrorKind.RATE_LIMIT:
+            fut.set_exception(RateLimited(self._error_data(err, {}).get("reset_at")))
+            return
+        text = "\n".join(t for t in a.texts if t).strip() if ok and err is None else ""
+        log.info("brain: task notes query %s (%d chars)", "done" if text else "gave nothing", len(text))
+        fut.set_result(text or None)
 
     async def connect_check(self) -> dict[str, Any]:
         """Connect (if needed), read the CLI's init message and run one silent tool-less probe
@@ -643,6 +716,8 @@ class ClaudeBrain:
                 await self._end_handoff(a, ok=False)
             elif a is not None and a.probe:
                 self._end_probe(a, errors.ClassifiedError(BrainErrorKind.INTERNAL, "Brain closed."))
+            elif a is not None and a.summary:
+                self._end_summary(a, None)
             elif a is not None and not a.timed_out:
                 self._emit(BrainEventKind.DONE, a.turn_id, data={"interrupted": True})
             self._active = None
@@ -702,7 +777,7 @@ class ClaudeBrain:
         anti-injection guard: a fact must come from what the user said. Whether they ASKED to keep it
         is the model's call (remember's `explicit` argument, AG14)."""
         a = self._active
-        if a is None or a.draining:
+        if a is None or a.draining or a.summary:
             return False, "no active turn"
         if tool == "rewrite_memory":
             return (True, "handoff") if a.handoff else (False, "only during a session handoff")
@@ -714,10 +789,20 @@ class ClaudeBrain:
             return True, "grounded"
         return False, "memory must come from the user (what they said), not from pages or tool results"
 
+    def _user_text(self) -> list[str] | str:
+        """What the user said lately (grounding for task tools, 9.2): agentd's hook or this
+        turn's own asks; nothing while no turn runs or a silent query does."""
+        a = self._active
+        if a is None or a.draining or a.turn_id < 0:
+            return []
+        return self._recent_user_text() if self._recent_user_text else a.texts
+
     def _restrict(self, tool: str) -> str | None:
         a = self._active
         if a is not None and a.probe:
             return "Connection check: no tools; just reply OK."
+        if a is not None and a.summary:
+            return SUMMARY_RESTRICT
         if a is not None and a.handoff and tool not in MEMORY_TOOLS:
             return "Session handoff: only mcp__mac__remember / forget / rewrite_memory may be called."
         if a is not None and a.switch is not None:
@@ -1178,6 +1263,9 @@ class ClaudeBrain:
             return PermissionResultAllow()
         if self.is_cancelled(turn):
             return PermissionResultDeny(message="The user cancelled this request. Stop now and do not call any more tools.")
+        if is_unattended(self.hook.context):  # a scheduled run: nobody to ask, nothing pending (9.3)
+            log.info("auto mode: Claude's classifier escalated %s during a scheduled run; refused", tool_name)
+            return PermissionResultDeny(message=REASON_UNATTENDED)
         self.hook.pending_action = fp
         log.info("auto mode: Claude's classifier escalated %s; asking the user", tool_name)
         reason = str(getattr(context, "decision_reason", "") or "")
@@ -1263,7 +1351,9 @@ class ClaudeBrain:
             await self._start_handoff(after=self._do_reset)  # save context, then start fresh
             return
         if a is not None:
-            if not a.timed_out:
+            if a.summary:
+                self._end_summary(a, None)
+            elif not a.timed_out:
                 self._emit(BrainEventKind.DONE, a.turn_id, data={"interrupted": True})
             self._active = None
         if hard:  # "stop everything": queued asks die too, and the hook refuses stragglers
@@ -1312,6 +1402,8 @@ class ClaudeBrain:
                 await self._end_handoff(a, ok=False)
             elif a.probe:
                 self._end_probe(a, errors.ClassifiedError(BrainErrorKind.TIMEOUT, "Claude did not answer."))
+            elif a.summary:
+                self._end_summary(a, None)
             await self._next_pending()
         elif not a.draining and now >= a.deadline:
             log.warning("brain: turn %d exceeded max_turn_s", a.turn_id)
@@ -1330,6 +1422,9 @@ class ClaudeBrain:
             await self._end_handoff(a, ok=False)
         elif a is not None and a.probe:
             self._end_probe(a, err)
+        elif a is not None and a.summary:
+            self._cancelled.discard(a.turn_id)
+            self._end_summary(a, err)
         elif a is not None:
             self._cancelled.discard(a.turn_id)
             if a.interrupted and not a.timed_out:
@@ -1492,10 +1587,14 @@ class ClaudeBrain:
             return  # sub-agent internals are not spoken
         if msg.error:
             a.assistant_error = str(msg.error)
+        if isinstance(msg.usage, dict):
+            a.usage = msg.usage  # the last main-thread message is the context size (D5)
         streamed = a.saw_delta
         for block in msg.content:
             if isinstance(block, TextBlock):
-                if not streamed and block.text:
+                if a.summary:
+                    a.texts.append(block.text)  # the notes; never emitted (negative turn id)
+                elif not streamed and block.text:
                     if a.emitted_text:
                         self._emit(BrainEventKind.TEXT, a.turn_id, text="\n", data={"block_start": True})
                     a.emitted_text = True
@@ -1571,9 +1670,19 @@ class ClaudeBrain:
                 self._record_failure(err)
             await self._next_pending()
             return
+        if a.summary:
+            err = errors.classify_result(msg, self.stderr_tail(10))
+            if err is None and a.assistant_error:
+                err = errors.classify_assistant_error(a.assistant_error, msg.result or "")
+            if err is not None and err.kind is BrainErrorKind.RATE_LIMIT and self._rate_reset_at:
+                err = errors.ClassifiedError(err.kind, errors.classify_text(
+                    "usage limit", resets_at=self._rate_reset_at).message, err.detail)
+            self._end_summary(a, err, ok=not a.draining)
+            await self._next_pending()
+            return
         data = {"session_id": msg.session_id, "cost_usd": msg.total_cost_usd,
                 "duration_ms": msg.duration_ms, "num_turns": msg.num_turns,
-                "interrupted": a.draining}
+                "interrupted": a.draining, **_context_data(a.usage, msg.model_usage)}
         if a.timed_out:
             pass  # ERROR(timeout) was already emitted
         elif a.interrupted:
@@ -1593,6 +1702,24 @@ class ClaudeBrain:
                 self._record_success()
                 self._emit(BrainEventKind.DONE, a.turn_id, data=data)
         await self._next_pending()
+
+
+def _context_data(usage: dict[str, Any] | None, model_usage: Any) -> dict[str, Any]:
+    """Tasks D5: the session's context size from the last main-thread assistant usage (input +
+    cache read + cache creation) and the largest model window the result reports."""
+    if not isinstance(usage, dict):
+        return {}
+    tokens = 0
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        v = usage.get(key)
+        if isinstance(v, int | float) and not isinstance(v, bool):
+            tokens += int(v)
+    window = DEFAULT_CONTEXT_WINDOW
+    if isinstance(model_usage, dict):
+        windows = [int(m.get("contextWindow") or 0) for m in model_usage.values() if isinstance(m, dict)]
+        if any(windows):
+            window = max(windows)
+    return {"context_tokens": tokens, "context_window": window}
 
 
 def _result_text(content: Any) -> str:

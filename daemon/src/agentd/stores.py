@@ -21,11 +21,16 @@ log = logging.getLogger(__name__)
 
 def atomic_write_json(path: Path, obj: Any) -> None:
     """Blocking: write `obj` as JSON to `path` atomically (0600). Call it from a thread."""
+    atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=1, sort_keys=True))
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Blocking: write `text` to `path` atomically (0600, fsync, replace). Call it from a thread."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=1, sort_keys=True)
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, 0o600)

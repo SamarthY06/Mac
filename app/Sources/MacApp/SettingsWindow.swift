@@ -219,12 +219,13 @@ final class SettingsStore: ObservableObject {
 // MARK: - Window
 
 enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
-    case general, voice, appearance, connections, permissions, phone, advanced
+    case general, voice, tasks, appearance, connections, permissions, phone, advanced
     var id: String { rawValue }
     var title: String {
         switch self {
         case .general: return "General"
         case .voice: return "Voice"
+        case .tasks: return "Tasks"
         case .appearance: return "Appearance"
         case .connections: return "Connections"
         case .permissions: return "Permissions"
@@ -236,6 +237,7 @@ enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .general: return "gearshape"
         case .voice: return "waveform.circle"
+        case .tasks: return "clock"
         case .appearance: return "person.crop.circle"
         case .connections: return "link.circle"
         case .permissions: return "lock.shield"
@@ -252,6 +254,7 @@ final class SettingsWindow {
     struct Deps {
         var model: AppModel
         var control: ControlClient
+        var tasks: TasksClient
         var perms: Permissions
         var phone: PhonePanel
         var openVoicePanel: () -> Void
@@ -288,7 +291,7 @@ final class SettingsWindow {
             w.isReleasedWhenClosed = false
             w.minSize = NSSize(width: 640, height: 480)
             w.setAccessibilityLabel("Mac Settings")
-            let root = SettingsView(store: store, nav: nav, model: deps.model, perms: deps.perms, phone: deps.phone,
+            let root = SettingsView(store: store, nav: nav, model: deps.model, tasks: deps.tasks, perms: deps.perms, phone: deps.phone,
                                     openVoicePanel: deps.openVoicePanel, resetConversation: deps.resetConversation,
                                     voiceReset: deps.voiceReset)
             w.contentViewController = NSHostingController(rootView: root)
@@ -402,6 +405,7 @@ struct SettingsView: View {
     @ObservedObject var store: SettingsStore
     @ObservedObject var nav: SettingsNav
     @ObservedObject var model: AppModel
+    let tasks: TasksClient
     @ObservedObject var perms: Permissions
     let phone: PhonePanel
     var openVoicePanel: () -> Void
@@ -453,6 +457,7 @@ struct SettingsView: View {
         switch nav.section {
         case .general: GeneralSettings(store: store)
         case .voice: VoiceSettings(store: store, model: model, openVoicePanel: openVoicePanel, voiceReset: voiceReset)
+        case .tasks: TasksSettings(client: tasks)
         case .appearance: AppearanceSettings()
         case .connections:
             Card { ConnectRows(model: model) }

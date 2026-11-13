@@ -105,17 +105,18 @@ async def serve(args: argparse.Namespace, tokens: dict[str, s.ClientKind], stop:
 
     paths = AgentPaths.default()
     owner_name = ""
+    cfg = config.load(write_default=False)
     if args.fake_brain:
         factory, model = fake_factory(), None
     else:
         from macd.brain.claude_brain import default_cli_path
 
-        cfg = config.load(write_default=False)
         chat_cfg = _chat_brain_cfg(paths.mac_home / "agent" / "config.toml", config.BrainConfig())
         factory = claude_factory(cfg, chat_cfg)
         model = WarmHaiku(default_cli_path(cfg))
         owner_name = cfg.user_name
-    svc = Service(paths, factory, router_model=model, memory_file=MemoryFile(paths.memory), owner_name=owner_name)
+    svc = Service(paths, factory, router_model=model, memory_file=MemoryFile(paths.memory), owner_name=owner_name,
+                  task_settings=cfg.tasks)
     await svc.start()
     server = Server(svc, tokens, Path(args.socket) if args.socket else paths.sock)
     await server.start()

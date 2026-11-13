@@ -91,6 +91,10 @@ class FakeBrain:
         self.sleeps = 0
         self.handoffs = 0
         self.connect_checks = 0
+        # summarize() (tasks DESIGN 6.4): the scripted notes (None = nothing), or an exception to
+        # raise (e.g. claude_brain.RateLimited); `summaries` records every (prompt, timeout).
+        self.summary_reply: str | None | BaseException = "Notes from the fake brain."
+        self.summaries: list[tuple[str, float]] = []
         self.check_result: dict[str, Any] = {
             "auth": "ok", "auth_detail": "", "chrome": "connected", "chrome_detail": "",
             "cli_version": "fake", "session_ok": True}
@@ -159,6 +163,16 @@ class FakeBrain:
     async def handoff(self) -> bool:
         self.handoffs += 1
         return True
+
+    async def summarize(self, prompt: str, timeout: float) -> str | None:
+        """Scripted notes query (6.4): None while a turn runs, like ClaudeBrain."""
+        self.summaries.append((prompt, timeout))
+        if self._active is not None:
+            return None
+        reply = self.summary_reply
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
 
     async def set_context(self, locked: bool) -> None:
         self.locked = locked

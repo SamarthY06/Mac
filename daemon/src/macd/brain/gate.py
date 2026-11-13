@@ -309,6 +309,14 @@ MAC_TEST_OUTWARD = "mcp__mac__test_outward"
 MAC_CONFIRM = "mcp__mac__request_confirmation"
 MAC_SET_PERSONA = "mcp__mac__set_persona"
 CAPABILITY = "capability"  # reason code prefix: capability:<name> (W9.5)
+# A scheduled run (tasks DESIGN 9.3): nobody is there to say yes, so an outward step is refused at
+# once and the model lists it in its report instead.
+UNATTENDED_REASON = ("a scheduled task can't send, post, pay, delete or change things outside the Mac "
+                     "on its own. Skip this step and list it in your report under 'Waiting for your OK:'")
+
+# Mapped tools whose free-text input still gets the X1 never-list and secret-path scan (a skill's
+# arguments reach other tools; tasks D8 keeps Skill in the "" row, not the unclassified rule).
+_UNPARSED_TOO = frozenset({"Skill"})
 
 UI_RETURN_COMBOS = {"return", "enter", "cmd+return", "cmd+enter", "ctrl+return", "ctrl+enter",
                     "shift+return", "shift+enter", "cmd+shift+d", "kp_enter"}
@@ -340,6 +348,8 @@ class GateContext:
     # None = voice: no capability check at all.
     capabilities: frozenset[str] | Callable[[], frozenset[str]] | None = None
     display_name: str = ""  # the chat's name, for capability denials and the set_persona target
+    # Scheduled runs (tasks 9.3): True while nobody can answer a confirmation; read per decision.
+    unattended: Callable[[], bool] | None = None
 
 
 def _read_small_file(path: str, limit: int = 256 * 1024) -> str | None:
@@ -1428,7 +1438,7 @@ def analyze(tool_name: str, tool_input: dict[str, Any] | None,
             never = _never_chat(tool_name, inp, d, ctx)
             if never is not None:
                 return never
-        if not map_rows(tool_name):
+        if not map_rows(tool_name) or tool_name in _UNPARSED_TOO:
             unparsed = _unparsed(tool_name, inp, d, ctx)
             if unparsed is not None:
                 return unparsed
@@ -1481,7 +1491,11 @@ def _analyze_tool(tool_name: str, inp: dict[str, Any], ctx: GateContext, paths: 
 TOOL_MAP: dict[str, tuple[str, ...]] = {
     "": ("mcp__mac__say", "mcp__mac__request_confirmation", "mcp__mac__notify",
          "mcp__mac__switch_workspace", "mcp__mac__set_persona", "TodoWrite", "Task", "Agent",
-         "ToolSearch"),  # ToolSearch only loads deferred tools; each one is gated when called
+         "ToolSearch",  # ToolSearch only loads deferred tools; each one is gated when called
+         "Skill",  # a skill only reaches other tools, each gated by its own row (tasks D8)
+         # task tools talk to agentd's task table; grounding in the user's words is their rule (9.2)
+         "mcp__mac__task_create", "mcp__mac__task_list", "mcp__mac__task_update", "mcp__mac__task_delete",
+         "mcp__mac__task_run_now", "mcp__mac__task_continue", "mcp__mac__task_stop", "mcp__mac__task_history"),
     "files_read": ("Read", "NotebookRead", "Glob", "Grep", "LS", "mcp__mac__remember", "mcp__mac__forget",
                    "mcp__mac__rewrite_memory"),
     "files_write": ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "BashOutput", "KillShell",
@@ -1536,6 +1550,19 @@ def _granted(ctx: GateContext) -> frozenset[str]:
         return frozenset()
 
 
+def is_unattended(ctx: GateContext | None) -> bool:
+    """True while a scheduled run owns this brain (nobody can answer a confirmation). An
+    unreadable flag counts as unattended (fail closed)."""
+    flag = ctx.unattended if ctx is not None else None
+    if flag is None:
+        return False
+    try:
+        return bool(flag())
+    except Exception:
+        log.exception("gate: unattended flag unavailable")
+        return True
+
+
 def _capability(tool_name: str, d: GateDecision, commands: frozenset[str],
                 ctx: GateContext) -> GateDecision | None:
     granted = _granted(ctx)  # one read of the live profile per decision
@@ -1547,6 +1574,8 @@ def _capability(tool_name: str, d: GateDecision, commands: frozenset[str],
         if not off:
             log.info("gate: unmapped tool %s in a chat: allowed (all levers on)", tool_name)
             return None
+        if off == ["outward_sends"] and is_unattended(ctx):  # a run: only sending is off, say why (9.3)
+            return GateDecision("sensitive_read", f"{CAPABILITY}:outward_sends", UNATTENDED_REASON, target="outward_sends")
         w = CAPABILITY_WORDS[off[0]]
         return GateDecision("sensitive_read", f"{CAPABILITY}:{off[0]}",
                             f"this chat has {w} off, so tools Mac can't classify are off too. You can turn "
@@ -1556,6 +1585,8 @@ def _capability(tool_name: str, d: GateDecision, commands: frozenset[str],
     if not missing:
         return None
     cap = missing[0]  # `code` stays internal; the reason is plain words the model relays (UX5)
+    if cap == "outward_sends" and is_unattended(ctx):  # a run: nobody to ask, say so plainly (9.3)
+        return GateDecision("sensitive_read", f"{CAPABILITY}:{cap}", UNATTENDED_REASON, target=cap)
     return GateDecision("sensitive_read", f"{CAPABILITY}:{cap}",
                         f"this chat can't use {CAPABILITY_WORDS[cap]}. You can turn it on in {where}, "
                         f'or say "Mac, allow {CAPABILITY_WORDS[cap]}"', target=cap)

@@ -1223,3 +1223,166 @@ def test_no_dashes_in_spoken_strings(tmp_path: Path) -> None:
                  mac_tools.DECLINED, mac_tools.ALREADY_PENDING, mac_tools.NOTHING_TO_CONFIRM,
                  cb.LOCKED_NOTE, cb.CHROME_DOWN_NOTE, cb.HANDOFF_PROMPT]:
         assert "\u2014" not in text and "\u2013" not in text, text
+
+
+# ----------------------------------------------------------------------------- tasks: summarize (DESIGN 6.4) and context size (D5)
+
+NOTES = "Done so far: scanned 40 postings. Avoid: re-reading LinkedIn page 1. Results: ~/Documents/Mac/jobs.md"
+
+
+async def test_summarize_is_a_restricted_query_that_returns_the_text(make_brain) -> None:
+    seen: dict[str, Any] = {}
+
+    async def r(c: MockClient, prompt: str) -> None:
+        if prompt.startswith("Before this task continues"):
+            seen["restrict"] = await brain.hook({"hook_event_name": "PreToolUse", "tool_name": "Read",
+                                                 "tool_input": {"file_path": "/tmp/x"}}, "t", {})
+            seen["memory"] = await brain.tools.remember({"fact": "scanned 40 postings", "kind": "context"})
+            c.push(delta("ignored stream"), assistant(TextBlock(NOTES)), result(session="sess-1"))
+        else:
+            c.push(delta("ok"), result(session="sess-1"))
+
+    brain = make_brain(r)
+    await brain.start()
+    assert await brain.summarize("Before this task continues, write notes.", 5) is None  # CLI down: nothing
+    await brain.ask(1, "x")
+    evs = await collect(brain)
+    n_events = len(brain._out._queue)
+    text = await brain.summarize("Before this task continues, write notes.", 5)
+    assert text == NOTES
+    assert len(brain._out._queue) == n_events and evs[-1].kind == K.DONE  # nothing emitted
+    assert seen["restrict"]["hookSpecificOutput"]["permissionDecisionReason"] == cb.SUMMARY_RESTRICT
+    assert seen["memory"].get("is_error")  # the notes are the model's words, never memory
+    assert brain._session_id == "sess-1" and brain.alive
+    await brain.ask(2, "y")  # the session goes on as usual afterwards
+    assert [e.kind for e in await collect(brain)] == [K.TEXT, K.DONE]
+    await brain.close()
+
+
+async def test_summarize_is_none_while_busy_and_never_interrupts_the_turn(make_brain) -> None:
+    hold = asyncio.Event()
+
+    async def r(c: MockClient, prompt: str) -> None:
+        await hold.wait()
+        c.push(delta("ok"), result())
+
+    brain = make_brain(r)
+    await brain.start()
+    await brain.ask(1, "x")
+    await settle(brain)
+    assert await brain.summarize("notes", 5) is None
+    assert MockClient.instances[0].interrupts == 0 and brain._active is not None and brain._active.turn_id == 1
+    hold.set()
+    assert [e.kind for e in await collect(brain)] == [K.TEXT, K.DONE]
+    await brain.close()
+
+
+async def test_summarize_timeout_interrupts_and_returns_none(make_brain, monkeypatch) -> None:
+    clock = {"t": 1000.0}
+
+    async def r(c: MockClient, prompt: str) -> None:
+        if prompt == "notes":
+            c.on_interrupt = lambda cl: cl.push(assistant(TextBlock("late notes")),
+                                                result(terminal_reason="aborted_streaming"))
+        else:
+            c.push(delta("ok"), result())
+
+    brain = make_brain(r, clock=lambda: clock["t"])
+    await brain.start()
+    await brain.ask(1, "x")
+    await collect(brain)
+    task = asyncio.create_task(brain.summarize("notes", 3))
+    await settle(brain)
+    clock["t"] += 4  # the query's own deadline: interrupted, drained, None
+    await brain._on_tick()
+    assert await asyncio.wait_for(task, 2) is None
+    assert MockClient.instances[0].interrupts == 1 and brain._active is None and brain.alive
+    await brain.close()
+
+
+async def test_summarize_cancelled_caller_interrupts_the_query(make_brain) -> None:
+    hold = asyncio.Event()
+
+    async def r(c: MockClient, prompt: str) -> None:
+        if prompt == "notes":
+            c.on_interrupt = lambda cl: cl.push(result(terminal_reason="aborted_streaming"))
+            await hold.wait()
+        else:
+            c.push(delta("ok"), result())
+
+    brain = make_brain(r)
+    await brain.start()
+    await brain.ask(1, "x")
+    await collect(brain)
+    task = asyncio.create_task(brain.summarize("notes", 30))
+    await settle(brain)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await settle(brain)
+    assert MockClient.instances[0].interrupts == 1
+    for _ in range(50):
+        if brain._active is None:
+            break
+        await asyncio.sleep(0.01)
+    assert brain._active is None
+    await brain.ask(2, "y")
+    assert [e.kind for e in await collect(brain)] == [K.TEXT, K.DONE]
+    await brain.close()
+
+
+async def test_summarize_rate_limit_raises_rate_limited(make_brain) -> None:
+    from claude_agent_sdk import RateLimitEvent, RateLimitInfo
+
+    def r(c: MockClient, prompt: str) -> None:
+        if prompt == "notes":
+            c.push(RateLimitEvent(RateLimitInfo(status="rejected", resets_at=1_900_000_000), "u", "s"),
+                   result(is_error=True, result="usage limit reached", api_error_status=429))
+        elif prompt == "fail":
+            c.push(result(is_error=True, result="Something broke", api_error_status=500))
+        else:
+            c.push(delta("ok"), result())
+
+    brain = make_brain(r)
+    await brain.start()
+    await brain.ask(1, "x")
+    await collect(brain)
+    with pytest.raises(cb.RateLimited) as info:
+        await brain.summarize("notes", 5)
+    assert info.value.reset_at == 1_900_000_000.0
+    assert len(brain._out._queue) == 0  # no ERROR event for a silent query
+    assert await brain.summarize("fail", 5) is None  # any other failure: None, never raises
+    await brain.close()
+
+
+async def test_done_carries_the_context_size_from_main_thread_usage_only(make_brain) -> None:
+    def r(c: MockClient, prompt: str) -> None:
+        main1 = assistant(TextBlock("a"), mid="m1")
+        main1.usage = {"input_tokens": 1000, "cache_read_input_tokens": 50_000, "cache_creation_input_tokens": 500,
+                       "output_tokens": 10}
+        sub = AssistantMessage(content=[TextBlock("sub")], model="m", parent_tool_use_id="toolu_9",
+                               usage={"input_tokens": 999_999, "cache_read_input_tokens": 0})
+        main2 = assistant(TextBlock("b"), mid="m2")
+        main2.usage = {"input_tokens": 1200, "cache_read_input_tokens": 60_000, "cache_creation_input_tokens": 0,
+                       "output_tokens": 20}
+        res = result()
+        res.model_usage = {"claude-x": {"contextWindow": 200_000}, "claude-y": {"contextWindow": 1_000_000}}
+        c.push(main1, sub, main2, res)
+
+    brain = make_brain(r)
+    await brain.start()
+    await brain.ask(1, "x")
+    (done,) = [e for e in await collect(brain) if e.kind == K.DONE]
+    await brain.close()
+    assert done.data["context_tokens"] == 61_200 and done.data["context_window"] == 1_000_000
+    assert done.data["session_id"] == "sess-1"
+
+
+async def test_done_has_no_context_size_without_usage(make_brain) -> None:
+    brain = make_brain(simple("ok"))
+    await brain.start()
+    await brain.ask(1, "x")
+    (done,) = [e for e in await collect(brain) if e.kind == K.DONE]
+    await brain.close()
+    assert "context_tokens" not in done.data and "context_window" not in done.data
+    assert cb._context_data({"input_tokens": 5}, None) == {"context_tokens": 5, "context_window": cb.DEFAULT_CONTEXT_WINDOW}

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from macd.brain import fake_brain as fb
 from macd.contracts import BrainErrorKind, BrainEvent
 from macd.contracts import BrainEventKind as K
@@ -131,3 +133,22 @@ async def test_reset_and_records() -> None:
     assert brain.name == "Jarvis" and brain.lang == "hi"
     await brain.close()
     assert brain.closed
+
+
+async def test_summarize_is_scripted_and_none_while_busy() -> None:
+    brain = fb.FakeBrain()
+    await brain.start()
+    assert await brain.summarize("notes please", 120) == "Notes from the fake brain."
+    brain.summary_reply = None
+    assert await brain.summarize("again", 5) is None
+    brain.summary_reply = RuntimeError("limit")
+    with pytest.raises(RuntimeError):
+        await brain.summarize("x", 1)
+    brain.summary_reply = "late notes"
+    brain._script = lambda t: [fb.text("slow reply", delay=0.3)]
+    await brain.ask(1, "slow")
+    await asyncio.sleep(0.05)  # a turn in flight: the notes query is refused, nothing is interrupted
+    assert await brain.summarize("busy", 1) is None
+    await collect(brain)
+    await brain.close()
+    assert [p for p, _ in brain.summaries] == ["notes please", "again", "x", "busy"]

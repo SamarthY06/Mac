@@ -204,6 +204,23 @@ PROFILE = {"channel": "whatsapp", "chat_id": "1203...@g.us", "display_name": "In
            "created_at": 1762790000.0, "updated_at": 1762790001.5}
 
 
+def test_task_notice_examples_round_trip():
+    lines = [json.loads(ln) for ln in DOC.splitlines() if ln.startswith(('{"ev": "tasks_changed"', '{"ev": "task_report"'))]
+    assert [n["ev"] for n in lines] == ["tasks_changed", "tasks_changed", "task_report"]
+    for wire in lines:
+        n = s.decode_notice(wire)
+        assert s.encode_notice(n) == wire and "conv" not in wire and "seq" not in wire
+    assert s.decode_notice(lines[1]).deleted is True and s.decode_notice(lines[2]).body == "Found 3 jobs."
+
+
+def test_task_view_and_run_record_shapes_match_doc():
+    sec = _section("4. Ops")
+    view = re.search(r"TaskView = \{(.*?)\}\nRunRecord", sec, flags=re.DOTALL).group(1)
+    assert _names(_strip_nested(view).replace("\n", " ")) == set(TASK)
+    run = re.search(r"RunRecord = \{(.*?)\}\nschedule", sec, flags=re.DOTALL).group(1)
+    assert _names(run.replace("\n", " ")) == set(RUN)
+
+
 def test_profile_changed_notice_examples_round_trip():
     (block,) = [b for b in _raw_blocks() if "profile_changed" in b]
     lines = [json.loads(ln.replace("{...}", json.dumps(PROFILE))) for ln in block.strip().splitlines()]
@@ -248,14 +265,14 @@ def test_status_reply_example_round_trips():
 
 
 def test_version_mismatch_text_is_the_doc_text():
-    m = re.search(r'`error: "(agentd speaks API 1\.2 but this client speaks 1\.1[^"]+)"`', DOC)
+    m = re.search(r'`error: "(agentd speaks API 1\.3 but this client speaks 1\.2[^"]+)"`', DOC)
     assert m and "Restart Mac to update all parts together." in m.group(1)
 
 
 # ----------------------------------------------------------------------------- every op, response and event
 
 REQUESTS = {
-    "hello": {"api": "1.2", "token": "ab" * 32, "client": "chatd/0.9.0", "client_epoch": "cd" * 16,
+    "hello": {"api": "1.3", "token": "ab" * 32, "client": "chatd/0.9.0", "client_epoch": "cd" * 16,
               "conversations": ["whatsapp:1203@g.us"]},
     "ask": {"conv": "whatsapp:1203@g.us", "turn": 3, "text": "find me 20 jobs",
             "attachments": [{"path": "/tmp/a.pdf", "kind": "document", "name": "a.pdf"}],
@@ -291,10 +308,29 @@ REQUESTS = {
     "profile_delete": {"channel": "whatsapp", "chat_id": "1203@g.us"},
     "profile_command": {"conv": "whatsapp:1203@g.us", "command": "add", "subject": "Book club",
                         "chat_id": "999@g.us", "owner_only": True},
+    "task_list": {},
+    "task_create": {"title": "Job search", "description": "find 20 jobs", "kind": "task",
+                    "schedule": {"at": ["08:00"], "days": ["mon", "tue", "wed", "thu", "fri"]}},
+    "task_update": {"task_id": "t3f9a2c", "rev": 7, "title": "Jobs", "paused": True},
+    "task_delete": {"task_id": "t3f9a2c", "rev": 7}, "task_run": {"task_id": "t3f9a2c"},
+    "task_continue": {"task_id": "t3f9a2c"}, "task_stop": {"task_id": "t3f9a2c"},
+    "task_history": {"task_id": "t3f9a2c", "limit": 5},
 }
 
+TASK = {"id": "t3f9a2c", "rev": 7, "title": "Job search", "description": "find 20 jobs", "kind": "task",
+        "schedule": {"at": ["08:00"]}, "schedule_text": "Every day at 8:00 AM", "conv": "task:t3f9a2c",
+        "report_to": "voice:local", "bound": False, "created_by": "voice", "created_at": 1763020000.0,
+        "updated_at": 1763020400.0, "state": "active", "next_run": 1763100000.0, "not_before": None, "runs": 12,
+        "current": None, "last_run": {"run_id": "r12", "n": 12, "status": "ok", "ended_at": 1763014500.0,
+                                      "summary": "Found 3 jobs."},
+        "context": None, "pause_reason": "", "where": "Notifies on this Mac"}
+RUN = {"run_id": "r12", "n": 12, "trigger": "schedule", "slot": 1763013600.0, "queued_at": 1763013601.0,
+       "started_at": 1763013602.0, "ended_at": 1763014500.0, "status": "ok", "ended": True, "error_kind": "",
+       "turn_uid": "00ff:task:t3f9a2c:task:4", "report": "Found 3 jobs.", "note": "", "reset_at": None,
+       "delivery": "notified"}
+
 RESPONSES = {
-    "hello": {"api": "1.2", "server": "agentd/0.9.0", "kind": "chat", "boot": "00ff",
+    "hello": {"api": "1.3", "server": "agentd/0.9.0", "kind": "chat", "boot": "00ff",
               "conversations": ["whatsapp:1203@g.us"], "interrupted": []},
     "ask": {"turn_uid": "00ff:whatsapp:1203@g.us:cdcd:3"}, "steer": {"accepted": False},
     "interrupt": {"stopped": True}, "new_session": {}, "reset": {}, "warm": {}, "sleep": {},
@@ -309,6 +345,10 @@ RESPONSES = {
     "ws_approve": {"settings_hash": "ab" * 32}, "ws_remove": {},
     "profile_list": {"rev": 7, "profiles": [PROFILE]}, "profile_create": {"profile": PROFILE},
     "profile_set": {"profile": PROFILE}, "profile_delete": {}, "profile_command": {"question_id": "q9"},
+    "task_list": {"rev": 41, "now": 1763100000.0, "tz": "EST", "tasks": [TASK]},
+    "task_create": {"task": TASK, "now": 1763100000.0, "tz": "EST"}, "task_update": {"task": TASK}, "task_delete": {"deleted": True},
+    "task_run": {"task": TASK}, "task_continue": {"task": TASK, "starts_at": 1763020000.0},
+    "task_stop": {"task": TASK, "stopped": True}, "task_history": {"runs": [RUN]},
 }
 
 T = {"conv": "voice:local", "boot": "00ff", "seq": 7, "turn": 2, "turn_uid": "00ff:voice:local:cdcd:2"}

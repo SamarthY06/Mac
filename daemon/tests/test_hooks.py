@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from macd.brain.gate import ConfirmationGate, GateContext
-from macd.brain.hooks import CONFIRM_TOOL, PreToolHook
+from macd.brain.hooks import CONFIRM_TOOL, REASON_UNATTENDED, PreToolHook
 
 HOME = "/Users/alice"
 WS = f"{HOME}/.mac-agent/workspace"
@@ -181,3 +181,24 @@ async def test_confirm_outward_off_lets_outward_through_but_still_blocks_danger(
     assert hook.decisions[-1].allowed and "judgement" in hook.decisions[-1].reason
     assert decision(await hook(pre("Bash", {"command": "rm -rf ~"}), "t", {})) == "deny"
     assert decision(await hook(pre("Bash", {"command": "cat ~/.ssh/id_rsa"}), "t", {})) == "deny"
+
+
+async def test_unattended_request_confirmation_is_refused_without_a_gate_wait() -> None:
+    """Tasks 9.3: during a scheduled run mac.request_confirmation answers at once; nothing waits,
+    nothing is pending, no CONFIRM event goes out."""
+    from macd.brain import mac_tools as mt
+
+    gate = ConfirmationGate()
+    confirms: list[Any] = []
+    flag = {"on": True}
+    tools = mt.MacTools(gate=gate, current_turn=lambda: 3, memory_check=lambda t, a: (False, ""),
+                        on_say=lambda t: None, on_confirm=lambda *a: confirms.append(a),
+                        pending_action=lambda turn: None, confirm_outward=lambda: False,
+                        unattended=lambda: flag["on"])
+    res = await asyncio.wait_for(tools.request_confirmation({"summary": "send Bob hi", "question": "Send it?"}), 1)
+    assert res.get("is_error") and res["content"][0]["text"] == REASON_UNATTENDED
+    assert confirms == [] and gate.pending is None
+    flag["on"] = False  # attended again (judgement mode): the usual ask
+    asyncio.get_running_loop().call_later(0.01, gate.resolve, True)
+    res = await tools.request_confirmation({"summary": "send Bob hi", "question": "Send it?"})
+    assert res["content"][0]["text"] == mt.APPROVED and len(confirms) == 1

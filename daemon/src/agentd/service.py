@@ -32,6 +32,8 @@ from agentd import profiles as pf
 from agentd import schema as s
 from agentd.brains import (
     CHAT,
+    TASK,
+    TASK_CAPS,
     VOICE,
     BrainFactory,
     BrainSpec,
@@ -47,6 +49,7 @@ from agentd.records import ConversationRecord, OpenQuestion, RunningTurn
 from agentd.router import Route, Router, RouterModel
 from agentd.stores import JsonStore
 from agentd.stream import GapError, LagMonitor, Stream
+from agentd.tasks import SWITCH_REFUSED, Origin, TaskManager, TaskSettings, is_task_uid
 from agentd.workspaces import (
     CHAT_APPROVAL_MAX_BYTES,
     WorkspaceStore,
@@ -176,8 +179,18 @@ class Turn:
     torn: bool = False  # its profile was disabled or deleted: nothing more of it is shown (P3)
     switch_tools: int = 0  # tools the moving run had already used: the user decides first
     context: s.AskContext | None = None  # chat (1.2): validated; framed as a per-session delta (V1)
+    run_id: str = ""  # a scheduled task's run (or a canned message of one): never in `recent`, unattended
+    canned: str = ""  # the whole answer, delivered without a brain (reminders, limit messages)
+    outcome: str = ""  # done | interrupted | error, set by `finish`
+    error_kind: str = ""
     done: asyncio.Event = field(default_factory=asyncio.Event)
     ended: asyncio.Event = field(default_factory=asyncio.Event)  # finished, or the brain turn held
+
+
+def conv_kind(conv: str) -> str:
+    if conv == s.VOICE_CONV:
+        return "voice"
+    return "task" if conv.startswith("task:") else "chat"
 
 
 class Conversation:
@@ -185,7 +198,8 @@ class Conversation:
         self.svc = svc
         self.conv = record.conv
         self.record = record
-        self.profile: Profile = VOICE if record.conv == s.VOICE_CONV else CHAT
+        self.kind = conv_kind(record.conv)  # "voice" | "chat" | "task"
+        self.profile: Profile = {"voice": VOICE, "task": TASK}.get(self.kind, CHAT)
         self.voice = self.profile is VOICE
         self.stream = Stream(self.conv, svc.boot)
         self.gate = ConfirmationGate()
@@ -250,8 +264,23 @@ class Conversation:
         return True if p is None else bool(p.confirm_files)
 
     def _capabilities(self) -> frozenset[str]:
-        """Live (W9.4): the gate reads this at every tool call, so narrowing applies at once."""
-        return self.svc.live_caps(self.conv)
+        """Live (W9.4): the gate reads this at every tool call, so narrowing applies at once. A
+        task conversation has the fixed task set; a bound group loses `outward_sends` while a
+        scheduled run holds it (nobody is there to say yes)."""
+        if self.kind == "task":
+            return TASK_CAPS
+        caps = self.svc.live_caps(self.conv)
+        return caps - {"outward_sends"} if self._unattended() else caps
+
+    def _unattended(self) -> bool:
+        t = self.running()
+        return self.kind == "task" or bool(t is not None and t.run_id)
+
+    async def _task_api(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        """The model's task tools (9.1): the origin is this conversation, never a payload."""
+        t = self.running()
+        origin = Origin(conv=self.conv, kind=self.kind, run_turn=bool(t is not None and t.run_id))
+        return await self.svc.tasks.call(origin, op, args)
 
     async def _on_set_persona(self, text: str) -> str | None:
         """The model's set_persona, after the owner's bound yes (B's tool asks): write the row."""
@@ -296,23 +325,27 @@ class Conversation:
 
     async def ensure_brain(self, cwd: Path, sources: list[str], *, rebuild: bool = False) -> Brain:
         vs, svc = self.svc.voice_settings, self.svc
-        prof = None if self.voice else svc.profile_of(self.conv)
+        task = self.kind == "task"
+        prof = None if self.voice or task else svc.profile_of(self.conv)
         caps = pf.granted(prof)
         spec = BrainSpec(
             conv=self.conv, profile=self.profile, cwd=cwd, setting_sources=list(sources), gate=self.gate,
             session_store=RecordSessionStore(self._session_get, self._session_put),
             memory_file=self.svc.memory_file, desktop=self.desktop, recent_user_text=lambda: list(self.recent),
-            model=vs.model if self.voice else "", chrome=vs.chrome if self.voice else "chrome" in caps,
+            model=vs.model if self.voice or task else "",
+            chrome=vs.chrome if self.voice else (True if task else "chrome" in caps),
             name=vs.name, language=vs.language, on_alive=self._on_alive,
             never_chat_names=() if self.voice else svc.never.names,
             capabilities=None if self.voice else self._capabilities,
-            confirm_send_file=self._confirm_files,
+            confirm_send_file=(lambda: False) if task else self._confirm_files,
             chat_persona=prof.persona if prof else "", display_name=prof.display_name if prof else "",
             chat_shared=bool(prof and prof.shared),
-            on_set_persona=None if self.voice else self._on_set_persona,
+            on_set_persona=None if self.voice or task else self._on_set_persona,
             on_rename=self._on_rename if self.voice else None,
             on_reset_voice=self._on_reset_voice if self.voice else None,
-            on_go_to_sleep=self._on_go_to_sleep if self.voice else None)
+            on_go_to_sleep=self._on_go_to_sleep if self.voice else None,
+            unattended=self._unattended,
+            task_api=None if task else self._task_api)  # a run cannot manage tasks
         busy = any(t.in_brain and not t.finished for t in self.turns.values())
         if self.brain is not None and (busy or (not rebuild and spec.key() == self.brain_key)):
             return self.brain  # never swap a brain under a running turn
@@ -356,7 +389,7 @@ class Conversation:
                 if crashed and t.in_brain and not t.finished:
                     self.emit(s.ErrorEvent, t, kind=s.EventErrorKind.INTERNAL,
                               message="Mac's brain stopped unexpectedly.")
-                    await self.finish(t, error=True)
+                    await self.finish(t, error=True, error_kind="internal")
             if crashed and self.brain is brain:  # the next turn starts a new brain
                 self.brain, self.brain_key, self._pump = None, None, None
                 self.check_alive()
@@ -410,17 +443,22 @@ class Conversation:
             if data:
                 self.emit(s.StatusEvent, t, data=data)
         elif k is BrainEventKind.DONE:
+            # a run that finished while a stop was in flight is done, with its report (F14)
+            interrupted = bool(ev.data.get("interrupted")) or (t.stopping and not t.run_id)
             self.emit(s.DoneEvent, t, data=s.DoneData(
-                duration_s=round(time.monotonic() - t.started, 3),
-                interrupted=bool(ev.data.get("interrupted")) or t.stopping or None,
+                duration_s=round(time.monotonic() - t.started, 3), interrupted=interrupted or None,
                 cost=ev.data.get("cost_usd", ev.data.get("cost"))))
-            await self.finish(t, interrupted=bool(ev.data.get("interrupted")) or t.stopping)
+            self.svc.tasks.on_turn_done(self.conv, ev.data)  # a no-op for a conversation without a task
+            await self.finish(t, interrupted=interrupted)
         elif k is BrainEventKind.ERROR:
             kind = ev.error_kind.value if ev.error_kind else "internal"
             if kind == "rate_limit":
                 self.svc.breaker.trip(ev.data.get("reset_at") or ev.data.get("resets_at"))
+                if t.run_id:
+                    await self._end_as_limit(t)
+                    return
             self.emit(s.ErrorEvent, t, kind=s.EventErrorKind(kind), message=ev.text)  # "" passes through: voice speaks its own per-kind line
-            await self.finish(t, error=True)
+            await self.finish(t, error=True, error_kind=kind)
 
     def _resumed(self, ev: BrainEvent) -> Turn | None:
         """Voice: a steer that crossed the turn's DONE makes the brain run a new query on the
@@ -428,6 +466,9 @@ class Conversation:
         Chat: Claude reporting back on its own after a background task finished is a new turn."""
         if not self.voice:
             if ev.turn_id < WAKE_TURN_BASE or self.running() is not None:
+                return None
+            if self.kind == "task":  # a run finishes everything itself; a late wake turn has no reader
+                log.info("conv %s: wake turn dropped", self.conv)
                 return None
             return self.svc.wake_turn(self, ev.turn_id)
         last = self.last_finished
@@ -449,10 +490,12 @@ class Conversation:
         self.emit(s.AttachEvent, t, **item)
 
     # -- turn lifecycle --------------------------------------------------------------------
-    async def finish(self, t: Turn, *, interrupted: bool = False, error: bool = False) -> None:
+    async def finish(self, t: Turn, *, interrupted: bool = False, error: bool = False, error_kind: str = "") -> None:
         if t.finished:
             return
         t.finished = True
+        t.outcome = "interrupted" if interrupted else "error" if error else "done"
+        t.error_kind = error_kind if error else ""
         self.turns.pop(t.internal, None)
         q = self.question
         if q is not None and q.turn_internal == t.internal:
@@ -463,33 +506,46 @@ class Conversation:
         if r.running is not None and r.running.uid == t.uid:
             r.running = None
         if not self.voice and not t.torn:  # voice and torn turns never enter unacked
-            r.add_unacked({"turn_uid": t.uid, "answer": "".join(t.answer).strip(), "attaches": t.attaches})
+            evicted = r.add_unacked({"turn_uid": t.uid, "answer": "".join(t.answer).strip(), "attaches": t.attaches})
+            if evicted:
+                self.svc.tasks.on_evicted(self.conv, [str(u.get("turn_uid", "")) for u in evicted])
         if not interrupted and not error:
             r.last_answer_at = self.svc.clock()
         if self.turn is t:
             self.turn = None
+        if not self.voice:
+            # durable before any waiter runs (must-fix a): a task run finalises against a persisted unacked
+            # entry, and a stop-then-ask chain never sees a record that is still being written
+            await self.svc.persist()
         self.last_finished = t
         t.done.set()
         t.ended.set()
         if self.voice:
             self.svc.save_soon()  # off the pump: the next voice turn's first TEXT never waits on fsync
-        else:
-            await self.svc.persist()
+        self.svc.tasks.kick()  # a queued run may have been waiting for this conversation
 
     async def run_turn(self, t: Turn, meta: s.AskMeta | None, before: Turn | None) -> None:
         try:
             if before is not None:
                 await before.done.wait()  # a stopped turn drains first (one turn at a time)
-            if self.svc.breaker.is_open():
-                self.emit(s.ErrorEvent, t, kind=s.EventErrorKind.RATE_LIMIT, message=self.svc.breaker.message())
-                await self.finish(t, error=True)
+            if t.canned:  # a reminder or a limit message (7.1): the whole answer, no brain
+                t.answer = [t.canned]
+                self.emit(s.TextEvent, t, text=t.canned)
+                self.emit(s.DoneEvent, t, data=s.DoneData(duration_s=round(time.monotonic() - t.started, 3)))
+                await self.finish(t)
+                return
+            if await self._limit_command(t) or await self._limit_open(t):
                 return
             if self.voice:
                 await self.svc.ensure_voice_brain(self)
+            elif self.conv in self.svc.tasks.by_conv or self.kind == "task":
+                await self.svc.tasks.prepare_turn(self, t, meta)
             elif not await self._prepare_chat(t, meta):
                 return
             if t.stopping:
                 raise asyncio.CancelledError
+            if await self._limit_open(t):  # the summary may have tripped the breaker (6.4)
+                return
             assert self.brain is not None
             t.in_brain = True
             await self._ask_brain(t)
@@ -511,12 +567,54 @@ class Conversation:
             if not t.finished:
                 self.emit(s.ErrorEvent, t, kind=s.EventErrorKind.INTERNAL,
                           message="Something went wrong on my side, so I stopped.")
-                await self.finish(t, error=True)
+                await self.finish(t, error=True, error_kind="internal")
+
+    async def _limit_command(self, t: Turn) -> bool:
+        """AT1: while the breaker is open the model cannot read the owner's reply, so the exact
+        "continue <title>" / "stop <title>" of the limit message is answered here, canned. True
+        when the turn was ended here; any other message gets the usual limit error."""
+        if t.run_id or self.voice or not self.svc.breaker.is_open():
+            return False
+        reply = await self.svc.tasks.limit_command(self.conv, t.text)
+        if reply is None:
+            return False
+        t.answer = [reply]
+        self.emit(s.TextEvent, t, text=reply)
+        self.emit(s.DoneEvent, t, data=s.DoneData(duration_s=round(time.monotonic() - t.started, 3)))
+        await self.finish(t)
+        return True
+
+    async def _limit_open(self, t: Turn) -> bool:
+        """The plan breaker is open: a scheduled run waits at the limit (8); any other turn ends
+        with the usual rate-limit error. True when the turn was ended here."""
+        if not self.svc.breaker.is_open():
+            return False
+        if t.run_id:
+            await self._end_as_limit(t)
+        else:
+            self.emit(s.ErrorEvent, t, kind=s.EventErrorKind.RATE_LIMIT, message=self.svc.breaker.message())
+            await self.finish(t, error=True, error_kind="rate_limit")
+        return True
+
+    async def _end_as_limit(self, t: Turn) -> None:
+        """The one conversion point of a run turn into `waiting_limit` (8): the task state is
+        saved before the turn is finished (must-fix b); the message is the turn's own answer."""
+        message = await self.svc.tasks.mark_limit(t.run_id, self.svc.breaker.reset_at)
+        t.answer = [message]
+        self.emit(s.TextEvent, t, text=message)
+        self.emit(s.DoneEvent, t, data=s.DoneData(duration_s=round(time.monotonic() - t.started, 3)))
+        await self.finish(t, error=True, error_kind="rate_limit")
+
+    def _late_note(self, t: Turn, meta: s.AskMeta | None) -> None:
+        """AG5: a replayed ask older than CATCH_UP_NOTE_S tells the model when it was sent; the
+        model decides to ask or act."""
+        svc = self.svc
+        if meta is not None and meta.replayed and meta.sent_at and svc.clock() - meta.sent_at > CATCH_UP_NOTE_S:
+            t.note = _catch_up_note(meta.sent_at, svc.clock())
 
     async def _prepare_chat(self, t: Turn, meta: s.AskMeta | None) -> bool:
         svc, r = self.svc, self.record
-        if meta is not None and meta.replayed and meta.sent_at and svc.clock() - meta.sent_at > CATCH_UP_NOTE_S:
-            t.note = _catch_up_note(meta.sent_at, svc.clock())  # AG5: the model decides to ask or act
+        self._late_note(t, meta)
         current = Path(r.folder) if r.folder else None
         prof = svc.profile_of(self.conv)
         default = svc.default_workspace(prof)
@@ -568,7 +666,8 @@ class Conversation:
         if folder is not None:  # hash re-checked at every turn start (W3.5)
             trust = await svc.workspaces.trust(folder)
             digest = trust.scan.digest
-            if (trust.needs_approval and not svc.workspaces.was_declined(folder, digest)
+            # a scheduled run never asks: an unapproved folder is used with the user sources only
+            if (trust.needs_approval and not t.run_id and not svc.workspaces.was_declined(folder, digest)
                     and trust.scan.claude_bytes <= CHAT_APPROVAL_MAX_BYTES):
                 ans = await self.ask_question(t, s.QuestionKind.FOLDER_APPROVAL,
                                               approval_text(folder.name, trust.scan),
@@ -820,7 +919,8 @@ class Service:
                  workspaces: WorkspaceStore | None = None, memory_file: Any = None,
                  clock: Callable[[], float] = time.time, boot: str | None = None,
                  voice_grace_s: float = VOICE_GRACE_S, events: Any = None,
-                 lag_interval_s: float = 0.1, owner_name: str = "") -> None:
+                 lag_interval_s: float = 0.1, owner_name: str = "",
+                 task_settings: TaskSettings | None = None) -> None:
         self.paths = paths
         self.owner_name = owner_name  # macd's user_name: a member named like the owner is marked (V4)
         self.brain_factory = brain_factory
@@ -841,6 +941,8 @@ class Service:
         self.never = pf.NeverSet()
         self._never_torn: set[str] = set()
         self.notice_sink: Callable[[dict[str, Any]], None] = lambda _n: None  # the server broadcasts
+        self.app_notice_sink: Callable[[dict[str, Any]], int] = lambda _n: 0  # to app clients; returns how many
+        self.tasks = TaskManager(self, task_settings)
         self._notices: dict[str, list[s.InterruptedTurn]] = {}
         self._next_internal = 0
         self._save_pending = False
@@ -866,6 +968,7 @@ class Service:
         for c in self.convs.values():
             self._recover(c)
         await self.persist()  # notices are marked before any client can connect (W2.4)
+        await self.tasks.start()  # after the conversations: it reads `running` of task-epoch turns (5.3)
         self._lag_task = asyncio.create_task(self.lag.run(), name="agentd:lag")
         self.spawn(offload.warm())
 
@@ -876,6 +979,8 @@ class Service:
             r.question = None
         if r.running is None:
             return
+        if is_task_uid(r.running.uid):
+            return  # a scheduled run: TaskManager decides cut-vs-finished and clears it (R1)
         run, r.running = r.running, None
         if r.restart_notice_for == run.uid:
             return
@@ -895,6 +1000,7 @@ class Service:
 
     async def close(self) -> None:
         self.closing = True
+        await self.tasks.close()  # first: a run in flight stays `running` on disk and is recovered next boot
         if self._lag_task is not None:
             self._lag_task.cancel()
         if self._voice_timer is not None:
@@ -935,6 +1041,16 @@ class Service:
         if c is None:
             c = self.convs[conv] = Conversation(self, ConversationRecord(conv=conv))
         return c
+
+    def conv_idle(self, conv: str) -> bool:
+        """A scheduled run may start here (F1): no unfinished turn, stopping ones included."""
+        c = self.convs.get(conv)
+        return c is None or c.running() is None
+
+    def notify_app(self, notice: dict[str, Any]) -> int:
+        """A connection-level notice to every app client (`tasks_changed`, `task_report`); the
+        number of clients it was queued for."""
+        return self.app_notice_sink(notice)
 
     # -- identity --------------------------------------------------------------------------
     # -- profiles (W9) ----------------------------------------------------------------------
@@ -1205,6 +1321,8 @@ class Service:
         as at any turn start. Returns (folder, session) or why not."""
         if c.voice:
             return "voice requests do not move between folders"
+        if c.kind == "task" or c.conv in self.tasks.by_conv:
+            return SWITCH_REFUSED  # D10: the task's session is never switched
         if c.turn is not None and c.turn.moved:
             return "this request already moved once"
         if mode not in ("continue", "new"):
@@ -1352,7 +1470,8 @@ class Service:
         before = c.turn if c.turn is not None and not c.turn.finished else None
         c.turn = t
         c.turns[t.internal] = t
-        c.recent.append(t.text)
+        if not t.run_id:
+            c.recent.append(t.text)  # grounding only ever sees the owner's own words
         c.record.running = RunningTurn(t.uid, t.text, self.clock(), t.msg_ref)
         if c.voice:
             self.save_soon()  # voice: never on the path to the first TEXT; a lost notice fails quiet
@@ -1601,7 +1720,8 @@ class Service:
         return s.PauseData(paused=c.record.paused)
 
     def status(self, convs: list[str] | None) -> s.StatusAll:
-        names = list(self.convs) if convs is None else convs
+        """Without `convs` (app): every conversation but the task ones (they belong to `task_list`)."""
+        names = [n for n in self.convs if conv_kind(n) != "task"] if convs is None else convs
         return s.StatusAll(conversations=[self.conversation(n).status() for n in names])
 
     # -- workspaces ------------------------------------------------------------------------

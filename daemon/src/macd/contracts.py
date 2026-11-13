@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import enum
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -204,6 +204,12 @@ class Brain(Protocol):
         returns False (no-op) if the session is young or nothing happened. Never raises."""
         ...
 
+    async def summarize(self, prompt: str, timeout: float) -> str | None:
+        """Scheduled tasks (DESIGN 6.4): one restricted, tool-less query on the current session
+        whose answer text becomes the notes for a fresh session. None at once while a turn runs
+        or the process is down, None on timeout or failure; raises RateLimited at the usage limit."""
+        ...
+
     async def set_name(self, name: str) -> None:
         """Change the assistant's name for the next session (keeps context)."""
         ...
@@ -300,3 +306,31 @@ class Listener(Protocol):
     def close_window(self) -> None: ...
     def set_muted(self, muted: bool) -> None: ...
     def set_speaking(self, speaking: bool, current_text: str = "") -> None: ...
+
+
+# ----------------------------------------------------------------------------- scheduled tasks
+# The seam between the model-facing task tools (macd.brain.mac_tools) and agentd's TaskManager.
+# One definition for both sides: the tools compare codes and relay messages, agentd raises them.
+
+TASK_OPS: tuple[str, ...] = ("task_list", "task_create", "task_update", "task_delete", "task_run",
+                             "task_continue", "task_stop", "task_history")
+
+TaskApi = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+"""(op, args) -> response data; raises TaskApiError. op is one of TASK_OPS."""
+
+
+class TaskApiError(Exception):
+    """A task op refused: `code` is the wire ErrorCode value, `message` plain words for the model."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class RateLimited(Exception):
+    """A brain call hit the Claude usage limit; `reset_at` is a wall-clock epoch when known."""
+
+    def __init__(self, reset_at: float | None = None) -> None:
+        super().__init__("usage limit")
+        self.reset_at = reset_at

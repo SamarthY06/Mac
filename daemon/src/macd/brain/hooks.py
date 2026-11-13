@@ -35,10 +35,12 @@ from typing import Any, Protocol
 from macd.brain.gate import (
     CAPABILITY,
     MEMORY_WRITE,
+    UNATTENDED_REASON,
     ConfirmationGate,
     GateContext,
     GateDecision,
     analyze,
+    is_unattended,
 )
 
 log = logging.getLogger(__name__)
@@ -66,6 +68,8 @@ DESKTOP_TOOLS = {"mcp__mac__screenshot", "mcp__mac__open_app"}
 REASON_OUTWARD = ("This action needs the user's spoken confirmation. First call "
                   f"{CONFIRM_TOOL} with a one-sentence summary (who or what it goes to, and the gist). "
                   "If it says the user approved, retry exactly the same action. If declined, don't.")
+# A scheduled run (tasks 9.3): no confirmation wait, no pending action; the model carries on.
+REASON_UNATTENDED = f"Not allowed: {UNATTENDED_REASON}. Carry on without it."
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -351,12 +355,16 @@ class PreToolHook:
                       "tell the user you can't do that.")
         elif d.verdict == "sensitive_read" and d.code == MEMORY_WRITE:
             reason = REASON_MEMORY_WRITE
+        elif d.code.startswith(f"{CAPABILITY}:") and d.reason == UNATTENDED_REASON:
+            reason = REASON_UNATTENDED  # a run lost outward_sends: nobody to tell, carry on (9.3)
         elif d.code.startswith(f"{CAPABILITY}:"):  # W9.5: plain words the model relays once
             reason = (f"Not allowed: {d.reason}. Tell the user that in one short line, once, and carry on "
                       "without it. Don't try another way.")
         elif d.verdict == "sensitive_read":
             reason = (f"Blocked: {d.reason}. Reading or copying secrets, keys, keychains or browser "
                       "profiles is never allowed. Don't try another way; tell the user.")
+        elif d.verdict == "outward" and is_unattended(self.context):
+            reason = REASON_UNATTENDED  # a scheduled run: refused at once, never a pending action (9.3)
         elif d.verdict == "outward":
             fp = ActionFingerprint(turn, name, d.code, d.target, d.detail)
             if self.gate.consume(turn, fp.key):

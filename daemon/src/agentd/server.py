@@ -23,6 +23,7 @@ from typing import Any
 from agentd import schema as s
 from agentd.service import SERVER_NAME, ApiError, Service
 from agentd.stream import GapError, Stream
+from agentd.tasks import Origin, TaskApiError
 from macd.unixsock import bind_private_unix_socket, peer_uid
 
 log = logging.getLogger(__name__)
@@ -123,6 +124,7 @@ class Server:
         self._server: asyncio.base_events.Server | None = None
         self._handlers: set[asyncio.Task[Any]] = set()
         service.notice_sink = self._notice_chat_clients
+        service.app_notice_sink = self.notice_app
 
     async def start(self) -> None:
         sock = bind_private_unix_socket(self.sock_path)
@@ -147,6 +149,16 @@ class Server:
         for c in self.conns:
             if c.kind is s.ClientKind.CHAT:
                 c.send(notice)
+
+    def notice_app(self, notice: dict[str, Any]) -> int:
+        """`tasks_changed` / `task_report` to every app client; how many it was queued for (the
+        queue, not receipt: a stuck app connection counts, and history keeps the report)."""
+        n = 0
+        for c in self.conns:
+            if c.kind is s.ClientKind.APP and not c.closing:
+                c.send(notice)
+                n += 1
+        return n
 
     # -- connection ----------------------------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -356,9 +368,22 @@ class Server:
                 await svc.profile_delete(op)
             case s.ProfileCommand():
                 return await svc.profile_command(op)
+            case _ if op.OP in s.TASK_OPS:
+                return await self._task_op(conn, op)
             case _:
                 raise ApiError(s.ErrorCode.UNKNOWN_OP, f"unknown op {op.OP!r}")
         return None
+
+    async def _task_op(self, conn: Conn, op: s.Op) -> Any:
+        """The origin comes from the token kind (voice: `voice:local`; app: `app`), never from
+        the payload. Errors keep the manager's plain words."""
+        assert conn.kind is not None  # KIND_OPS already allowed only voice and app here
+        origin = Origin(conv=s.VOICE_CONV if conn.kind is s.ClientKind.VOICE else "app", kind=conn.kind.value)
+        try:
+            data = await self.svc.tasks.call(origin, op.OP, s.to_json(op))
+        except TaskApiError as e:
+            raise ApiError(s.ErrorCode(e.code), e.message) from None
+        return s.from_dict(s.RESPONSE_DATA[op.OP], data)
 
     def _subscribe(self, conn: Conn, op: s.Subscribe) -> _Subscribed:
         stream = self.svc.conversation(op.conv).stream

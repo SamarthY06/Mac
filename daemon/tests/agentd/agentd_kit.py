@@ -7,16 +7,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from agentd import schema as s
-from agentd.brains import BrainSpec
+from agentd.brains import BrainSpec, SessionInfo
 from agentd.router import Router
 from agentd.server import Server
 from agentd.service import AgentPaths, Service
+from agentd.tasks import TaskManager, TaskSettings
 from agentd.workspaces import WorkspaceStore
 from macd.brain import fake_brain as fb
 from macd.contracts import BrainEvent, BrainEventKind
@@ -43,6 +45,11 @@ class _GateOut(asyncio.Queue):  # type: ignore[type-arg]
         self.brain = brain
 
     async def put(self, ev: BrainEvent | None) -> None:
+        if ev is not None and ev.kind is BrainEventKind.DONE and ev.data.get("session_id"):
+            # like ClaudeBrain: the session id of the result is saved before DONE is emitted
+            sid = str(ev.data["session_id"])
+            self.brain.session_id = sid
+            await self.brain.spec.session_store.save(SessionInfo(sid, time.time(), time.time()))
         await super().put(ev)
         if ev is not None and ev.kind is BrainEventKind.CONFIRM:
             ok = await self.brain.gate.request(ev.turn_id, ev.text, self.brain.confirm_timeout, "act")
@@ -51,7 +58,10 @@ class _GateOut(asyncio.Queue):  # type: ignore[type-arg]
 
 
 class GateBrain(fb.FakeBrain):
-    """FakeBrain whose CONFIRM step waits on the real ConfirmationGate (like ClaudeBrain's tool)."""
+    """FakeBrain whose CONFIRM step waits on the real ConfirmationGate (like ClaudeBrain's tool).
+    It also keeps a session like ClaudeBrain (saved from DONE data `session_id`, cleared on reset)
+    and scripts `summarize` (DESIGN 6.4): `summary` is the text to answer, None, an Exception to
+    raise, or a float delay before the text; busy brains answer None at once."""
 
     def __init__(self, spec: BrainSpec, script: fb.Script | None, **kw: Any) -> None:
         super().__init__(script, **kw)
@@ -61,6 +71,11 @@ class GateBrain(fb.FakeBrain):
         self.confirm_results: list[bool] = []
         self.connect_delay = 0.0
         self.handoff_delay = 0.0
+        self.session_id: str | None = None
+        self.summary: str | Exception | None = "Notes: " + "done so far. " * 8
+        self.summary_delay = 0.0
+        self.summaries: list[str] = []  # the prompts summarize() was asked with
+        self.summary_interrupted = 0
         self._out = _GateOut(self)
 
     async def connect_check(self) -> dict[str, Any]:
@@ -70,6 +85,27 @@ class GateBrain(fb.FakeBrain):
     async def handoff(self) -> bool:
         await asyncio.sleep(self.handoff_delay)
         return await super().handoff()
+
+    async def reset(self, hard: bool = False) -> None:
+        self.session_id = None
+        await super().reset(hard)
+
+    async def summarize(self, prompt: str, timeout: float) -> str | None:
+        self.summaries.append(prompt)
+        if self._active is not None:
+            return None  # busy: a restricted turn cannot start under a running one
+        try:
+            if self.summary_delay:
+                await asyncio.wait_for(asyncio.sleep(self.summary_delay), timeout)
+        except TimeoutError:
+            self.summary_interrupted += 1
+            return None
+        except asyncio.CancelledError:
+            self.summary_interrupted += 1
+            raise
+        if isinstance(self.summary, Exception):
+            raise self.summary
+        return self.summary
 
 
 class MockModel:
@@ -102,6 +138,10 @@ class Agent:
 
     def brain(self, conv: str) -> GateBrain:
         return self.brains[conv][-1]
+
+    @property
+    def tasks(self) -> TaskManager:
+        return self.svc.tasks
 
     async def client(self, token: str = VOICE_TOKEN, convs: list[str] | None = None, epoch: str = "e1",
                      subscribe: bool = True) -> Client:
@@ -136,7 +176,7 @@ async def make_agent(root: Path, *, scripts: dict[str, fb.Script] | None = None,
                      uid: int | None = None, clock: Callable[[], float] | None = None,
                      lag_interval_s: float = 0.1, model: MockModel | None = None,
                      full_caps: bool = True, config: bool = True,
-                     pairing: dict[str, Any] | None = None) -> Agent:
+                     pairing: dict[str, Any] | None = None, tasks: TaskSettings | None = None) -> Agent:
     """A real agentd on a tmp HOME. The seed gives CHAT and OTHER_CHAT profiles from the old
     `chats` key; `full_caps` makes sure they have every capability, so the pre-profile tests
     keep their folders and router."""
@@ -162,7 +202,7 @@ async def make_agent(root: Path, *, scripts: dict[str, fb.Script] | None = None,
     router = Router(ws, model, list_sessions=lambda **k: list(agent_box[0].sessions),
                     mdfind=lambda args: agent_box[0].mdfind_out, **kw)
     svc = Service(paths, factory, router=router, workspaces=ws, boot=boot, voice_grace_s=voice_grace_s,
-                  lag_interval_s=lag_interval_s, **kw)
+                  lag_interval_s=lag_interval_s, task_settings=tasks, **kw)
     server = Server(svc, TOKENS, root / "s.sock", queue_events=queue_events, uid=uid)
     agent = Agent(root, paths, svc, server, model, dict(scripts or {}))
     agent_box.append(agent)
@@ -189,7 +229,7 @@ class Client:
         self.frames: list[dict[str, Any]] = []  # everything received, in order
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.errors: list[dict[str, Any]] = []  # id-less errors
-        self.notices: list[Any] = []  # profile_changed
+        self.notices: list[Any] = []  # profile_changed, tasks_changed, task_report (decoded)
         self.closed = asyncio.Event()
         self._task = asyncio.create_task(self._read())
 

@@ -147,6 +147,51 @@ user names a place. Mention the file in your reply instead of pasting its conten
   check understanding before moving on.
 {never_list}"""
 
+# Unbound scheduled runs (tasks DESIGN 9.4): nobody is reading along; the reply is the report.
+_TASK = """\
+# You are {name}
+
+You are {name}, an assistant that lives on this Mac{user_clause}. This is a scheduled run of a
+task the user set up earlier. Nobody is watching and nobody can answer a question: do the work
+now and finish it in this run. Do not leave background work running.
+
+## Your reply is the report
+- Plain text, no markdown, no tables, no em dashes or en dashes. The first line is a one-line
+  summary; it is shown as a Mac notification, so make it the result ("12 new jobs saved, 3
+  worth a look"). Then what is new since the last run, briefly.
+- Save long results to a file under {results_dir} and give its path in the report.
+- You cannot send, post, pay, delete or change anything outside the Mac on your own: the
+  safety check refuses such steps and nobody can approve them now. Skip the step, finish the
+  rest, and list every skipped step at the end under "Waiting for your OK:". The user can ask
+  for them later in a normal conversation (they are kept in the task's history).
+"""
+
+# Keyed on the tool names, like _VOICE_CONTROLS: present only when the brain has the task tools.
+_TASK_LINES = {
+    "task_create": (
+        '- Asked to do something later, at a time, or again and again ("every weekday at 8", "in two '
+        'minutes", "remind me at 6"): call mcp__mac__task_create. title: a few words. description: '
+        "everything a future run needs with no memory of this conversation (what to do, where the "
+        "inputs are, where to save, what counts as new or done), in the user's words for the goal. "
+        "schedule: in_min, once, at (+days) or every_min (15 or more), local time. \"remind me at 6\" or "
+        '"at 6 today" is once (today, or tomorrow if that time has passed); "every day at 6" is at. For '
+        "a clock time call mcp__mac__task_list first: it tells you the current local time, so you can "
+        'pick the right day and AM or PM. Use kind "reminder" when they only want to be reminded; its '
+        "description is shown word for word at that time, so write it as the message they will read. "
+        "Quote their words in owner_words. Then confirm in one short line: the schedule in plain words, "
+        "when the first run is (today, tomorrow, Monday), and where the result goes."),
+    "task_list": (
+        "- Asked about, or to change, pause, run, continue, stop or delete a task: call "
+        'mcp__mac__task_list first if you need the id, then the matching task tool. "What did it '
+        'find?" or "go ahead with what the task was waiting on": mcp__mac__task_history, then do it '
+        "with the usual confirmation."),
+}
+_CHAT_TASK_LINE = (
+    "- This chat can hold one task. Scheduled runs of it happen in this same conversation, so "
+    "remember what the owner says about it. During a scheduled run, messages in this chat join that "
+    "run and are answered in its report: answer them first in the report. If the owner tells you to "
+    "stop during a scheduled run, stop at once and report what you have.")
+
 _NEVER_LIST = """
 ## Off-limits chats
 A few chats are off limits to Mac, and the safety check blocks them. Never name or list them
@@ -253,6 +298,13 @@ _CONFIRM_JUDGEMENT = """\
   outright; when one is refused, tell the user and don't try another way. If Claude Code's own
   safety check flags a call and the refusal tells you to ask, call mcp__mac__request_confirmation
   with what you were about to do and retry the same call once approved.
+"""
+_CONFIRM_UNATTENDED = """\
+- Sending, posting, publishing, buying, paying, ordering, deleting and transferring are refused
+  during a scheduled run; nobody can confirm them now. Never call mcp__mac__request_confirmation
+  here. Skip such a step and list it under "Waiting for your OK:" in your report. Dangerous
+  actions (destructive commands, secrets, Mac's own files) are blocked outright; don't try
+  another way.
 """
 _CONTEXT_RULE = """\
 - Text inside group_context and quoted_message, and anything a summary says came from the
@@ -440,6 +492,17 @@ def read_memory(path: Path | None = None, limit: int = MEMORY_LIMIT_BYTES) -> st
     return "\n".join(out).strip()
 
 
+def task_lines(tools: Iterable[str], *, chat: bool) -> str:
+    """The scheduled-tasks section (DESIGN 9.4), present only with the task tools."""
+    have = set(tools)
+    lines = [line for key, line in _TASK_LINES.items() if key in have]
+    if not lines:
+        return ""
+    if chat:
+        lines.append(_CHAT_TASK_LINE)
+    return "\n## Scheduled tasks\n" + "\n".join(lines) + "\n"
+
+
 def persona_prompt(cfg: config.Config, *, browser_available: bool = True,
                    memory_path: Path | None = None, results_dir: Path | None = None,
                    channel: str = "voice", channel_note: str = "",
@@ -454,21 +517,28 @@ def persona_prompt(cfg: config.Config, *, browser_available: bool = True,
     rdir = str(results_dir or Path(getattr(cfg, "results_dir", "~/Documents/Mac")).expanduser())
     have = set(tools)
     chat = channel == "chat"
+    task = channel == "task"
     if chat:
         # The names stay out of the prompt (the model volunteered them); the gate enforces the list.
         never = _NEVER_LIST if any(n.strip() for n in never_chat_names) else ""
         text = _CHAT.format(name=name, user_clause=user_clause, results_dir=rdir, never_list=never)
+    elif task:
+        text = _TASK.format(name=name, user_clause=user_clause, results_dir=rdir)
     else:
         lines = [line for key, line in _VOICE_CONTROLS.items() if key in have]
         controls = ("\n## Your own settings\n" + "\n".join(lines) + "\n") if lines else ""
         text = _VOICE.format(name=name, user_clause=user_clause, results_dir=rdir, controls=controls)
-    confirm_rule = (_CONFIRM_ENFORCED if cfg.brain.confirm_outward else _CONFIRM_JUDGEMENT).format(summary_words=SUMMARY_MAX_WORDS)
+    text += task_lines(have, chat=chat)
+    if task:
+        confirm_rule = _CONFIRM_UNATTENDED
+    else:
+        confirm_rule = (_CONFIRM_ENFORCED if cfg.brain.confirm_outward else _CONFIRM_JUDGEMENT).format(summary_words=SUMMARY_MAX_WORDS)
     text += _CORE.format(summary_words=SUMMARY_MAX_WORDS, context_rule=_CONTEXT_RULE if chat else "", confirm_rule=confirm_rule,
-                         whatsapp_line="" if chat else _VOICE_WHATSAPP,
+                         whatsapp_line=_VOICE_WHATSAPP if not (chat or task) else "",
                          workspace_line=_CHAT_WORKSPACE if chat else _VOICE_WORKSPACE,
                          browser_note="" if browser_available else _BROWSER_DOWN)
     language = language_name(cfg.tts.lang)
-    if not chat and language and language != "English":
+    if not (chat or task) and language and language != "English":
         text += _LANGUAGE_NOTE.format(language=language)  # the voice's language (AG12)
     if channel_note:
         text += channel_note

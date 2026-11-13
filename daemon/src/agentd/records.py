@@ -73,9 +73,13 @@ class ConversationRecord:
         self.own_sessions.append(session_id)
         del self.own_sessions[:-OWN_SESSIONS_MAX]
 
-    def add_unacked(self, item: dict[str, Any]) -> None:
+    def add_unacked(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Append; returns the oldest entries dropped to stay within UNACKED_MAX (a scheduled
+        run's report among them is reported as `dropped`, F12)."""
         self.unacked.append(item)
+        evicted = self.unacked[:-UNACKED_MAX]
         del self.unacked[:-UNACKED_MAX]
+        return evicted
 
 
 def _build(cls: type, d: dict[str, Any]) -> Any:

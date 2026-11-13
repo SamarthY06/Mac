@@ -29,7 +29,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -667,6 +667,129 @@ def test_voice_token_sources(tmp_path: Path) -> None:
     config.RUN_DIR.mkdir(parents=True, exist_ok=True)
     (config.RUN_DIR / "dev-tokens.json").write_text(json.dumps({"voice": "v1", "chat": "c1"}))
     assert rb.voice_token(None) == "v1" and rb.voice_token('{"token": "abc"}') == "abc"
+    # under macsvc (tasks D1): run/voice-token, ahead of the dev file, behind the lifeline
+    (config.RUN_DIR / "voice-token").write_text("  \n")
+    assert rb.voice_token(None) == "v1"
+    (config.RUN_DIR / "voice-token").write_text("f" * 64 + "\n")
+    assert rb.voice_token(None) == "f" * 64 and rb.voice_token('{"token": "abc"}') == "abc"
+
+
+# ----------------------------------------------------------------------------- task ops over a one-shot link (tasks 9.1)
+
+
+@dataclass(kw_only=True)
+class _FakeTaskList(s.Op):
+    OP: ClassVar[str] = "task_list"
+
+
+@dataclass(kw_only=True)
+class _FakeTaskStop(s.Op):
+    OP: ClassVar[str] = "task_stop"
+    task_id: str
+
+
+@pytest.fixture
+def task_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The task ops as builder A ships them, or stand-ins with the same shape until then."""
+    ops = dict(s.OPS)
+    ops.setdefault("task_list", _FakeTaskList)
+    ops.setdefault("task_stop", _FakeTaskStop)
+    monkeypatch.setattr(s, "OPS", ops)
+
+
+async def _stub_agentd(sock: Path, seen: list[dict[str, Any]], reply: dict[str, Any]) -> asyncio.AbstractServer:
+    """A stand-in agentd: answers hello, then one op with `reply`, and records both frames."""
+
+    async def handle(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        try:
+            for _ in range(2):
+                line = await r.readline()
+                if not line:
+                    break
+                obj = s.parse_line(line)
+                seen.append(obj)
+                data = {} if obj.get("op") == "hello" else reply
+                w.write(s.encode_line({"id": obj["id"], "ok": True, "data": data}))
+                await w.drain()
+            await r.readline()  # the client's close
+        finally:
+            w.close()
+
+    return await asyncio.start_unix_server(handle, str(sock))
+
+
+async def test_task_call_once_builds_the_op_and_returns_data(task_ops: None, short_root: Path) -> None:
+    sock = short_root / "stub.sock"
+    seen: list[dict[str, Any]] = []
+    server = await _stub_agentd(sock, seen, {"task": {"id": "t1"}, "stopped": True})
+    try:
+        data = await rb.task_call_once(VOICE_TOKEN, "e-local", "task_stop", {"task_id": "t1", "junk": 1}, sock)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert data == {"task": {"id": "t1"}, "stopped": True}
+    hello, op = seen
+    assert hello["op"] == "hello" and hello["token"] == VOICE_TOKEN and hello["conversations"] == []
+    assert hello["client_epoch"] == "e-local" and hello["api"] == s.API_VERSION
+    assert op == {"id": 2, "op": "task_stop", "task_id": "t1"}  # unknown keys dropped by the schema
+
+
+async def test_task_call_once_maps_every_failure_to_plain_words(task_ops: None, short_root: Path) -> None:
+    from macd.contracts import TaskApiError
+
+    with pytest.raises(TaskApiError) as e:
+        await rb.task_call_once(None, "e", "task_list", {}, short_root / "none.sock")
+    assert e.value.code == "unauthorized" and e.value.message == rb.TASKS_NO_TOKEN
+    with pytest.raises(TaskApiError) as e:  # bad args are the schema's words; a missing id gets a hint
+        await rb.task_call_once(VOICE_TOKEN, "e", "task_stop", {}, short_root / "none.sock")
+    assert e.value.code == "bad_args" and e.value.message == rb.TASKS_WHICH_TASK
+    with pytest.raises(TaskApiError) as e:
+        await rb.task_call_once(VOICE_TOKEN, "e", "task_list", {}, short_root / "none.sock")  # agentd down
+    assert e.value.code == "unreachable" and e.value.message == rb.TASKS_NO_TOKEN
+    with pytest.raises(TaskApiError) as e:
+        await rb.task_call_once(VOICE_TOKEN, "e", "bogus_op", {}, short_root / "none.sock")
+    assert e.value.code == "internal"
+    # a real agentd: the voice token opens the link, the server's refusal comes back as code + words
+    agent = await kit.make_agent(short_root)
+    try:
+        if "task_list" in s.KIND_OPS[s.ClientKind.VOICE]:  # builder A's ops are in: the real answer
+            assert "tasks" in await rb.task_call_once(VOICE_TOKEN, "e", "task_list", {}, agent.sock)
+        else:  # until then the server refuses the stand-in op; the refusal is code + words
+            with pytest.raises(TaskApiError) as e:
+                await rb.task_call_once(VOICE_TOKEN, "e", "task_list", {}, agent.sock)
+            assert e.value.code == "forbidden" and e.value.message
+        with pytest.raises(TaskApiError) as e:
+            await rb.task_call_once("z" * 64, "e", "task_list", {}, agent.sock)  # a wrong token: unauthorized
+        assert e.value.code == "unauthorized"
+        await asyncio.sleep(0.05)
+        assert not [c for c in agent.svc.convs if c.startswith("task:")]  # named no conversation
+    finally:
+        await kit.stop_agent(agent)
+    for text in (rb.TASKS_NO_TOKEN, rb.TASKS_WHICH_TASK):
+        assert "\u2014" not in text
+
+
+async def test_daemon_task_api_without_a_token_is_a_plain_tool_error(task_ops: None) -> None:
+    """Local mode (the owner's setup): no voice token yet means the model hears plain words."""
+    from macd.brain import mac_tools as mt
+
+    d = _daemon()
+    d.lifeline_line = None
+    tools = mt.MacTools(gate=__import__("macd.brain.gate", fromlist=["ConfirmationGate"]).ConfirmationGate(),
+                        current_turn=lambda: 1, memory_check=lambda t, a: (False, ""), on_say=lambda t: None,
+                        on_confirm=lambda *a: None, task_api=d._task_api, recent_user_text=lambda: ["list my tasks"])
+    res = await tools.task_list({})
+    assert res.get("is_error") and res["content"][0]["text"] == rb.TASKS_NO_TOKEN
+    d.lifeline_line = json.dumps({"token": VOICE_TOKEN})  # a token but no agentd: still plain words
+    res = await tools.task_list({})
+    assert res.get("is_error") and res["content"][0]["text"] == rb.TASKS_NO_TOKEN
+
+
+def test_local_brain_gets_the_task_tools() -> None:
+    from macd.brain.gate import ConfirmationGate
+
+    brain = _daemon()._make_brain(ConfirmationGate())
+    assert {"task_create", "task_list", "task_history"} <= {t.name for t in brain.tools.tools()}
 
 
 # ----------------------------------------------------------------------------- stop the other task

