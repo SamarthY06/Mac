@@ -228,7 +228,7 @@ def _spy_factory(monkeypatch, names):
 
     class Spy:
         def __init__(self, cfg, gate, **kw):
-            seen.append({**kw, "_chrome": cfg.brain.chrome})
+            seen.append({**kw, "_chrome": cfg.brain.chrome, "_model": cfg.brain.model})
 
     params = [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
               inspect.Parameter("cfg", inspect.Parameter.POSITIONAL_OR_KEYWORD),

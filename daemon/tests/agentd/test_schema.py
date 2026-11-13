@@ -310,8 +310,9 @@ REQUESTS = {
                         "chat_id": "999@g.us", "owner_only": True},
     "task_list": {},
     "task_create": {"title": "Job search", "description": "find 20 jobs", "kind": "task",
-                    "schedule": {"at": ["08:00"], "days": ["mon", "tue", "wed", "thu", "fri"]}},
-    "task_update": {"task_id": "t3f9a2c", "rev": 7, "title": "Jobs", "paused": True},
+                    "schedule": {"at": ["08:00"], "days": ["mon", "tue", "wed", "thu", "fri"]}, "model": "sonnet",
+                    "effort": "high"},
+    "task_update": {"task_id": "t3f9a2c", "rev": 7, "title": "Jobs", "paused": True, "model": "", "effort": "low"},
     "task_delete": {"task_id": "t3f9a2c", "rev": 7}, "task_run": {"task_id": "t3f9a2c"},
     "task_continue": {"task_id": "t3f9a2c"}, "task_stop": {"task_id": "t3f9a2c"},
     "task_history": {"task_id": "t3f9a2c", "limit": 5},
@@ -323,7 +324,7 @@ TASK = {"id": "t3f9a2c", "rev": 7, "title": "Job search", "description": "find 2
         "updated_at": 1763020400.0, "state": "active", "next_run": 1763100000.0, "not_before": None, "runs": 12,
         "current": None, "last_run": {"run_id": "r12", "n": 12, "status": "ok", "ended_at": 1763014500.0,
                                       "summary": "Found 3 jobs."},
-        "context": None, "pause_reason": "", "where": "Notifies on this Mac"}
+        "context": None, "pause_reason": "", "model": "", "effort": "", "where": "Notifies on this Mac"}
 RUN = {"run_id": "r12", "n": 12, "trigger": "schedule", "slot": 1763013600.0, "queued_at": 1763013601.0,
        "started_at": 1763013602.0, "ended_at": 1763014500.0, "status": "ok", "ended": True, "error_kind": "",
        "turn_uid": "00ff:task:t3f9a2c:task:4", "report": "Found 3 jobs.", "note": "", "reset_at": None,

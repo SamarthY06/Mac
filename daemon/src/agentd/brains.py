@@ -55,7 +55,8 @@ class BrainSpec:
     memory_file: Any  # the single MemoryFile
     desktop: Any  # DesktopHandle (polled DesktopLock protocol)
     recent_user_text: Callable[[], list[str]]
-    model: str = ""
+    model: str = ""  # "" = the config's model; a task's own `model` otherwise
+    effort: str | None = None  # a task's own effort level; None = Claude Code's default
     chrome: bool = True
     name: str = "Mac"
     language: str = "en-us"
@@ -78,7 +79,7 @@ class BrainSpec:
 
     def key(self) -> tuple[Any, ...]:
         """Changing any of these needs a new brain process."""
-        return (str(self.cwd), tuple(self.setting_sources), self.model, self.chrome,
+        return (str(self.cwd), tuple(self.setting_sources), self.model, self.effort, self.chrome,
                 tuple(self.never_chat_names), self.chat_persona, self.display_name, self.chat_shared)
 
 
@@ -113,7 +114,7 @@ CLAUDE_ARGS = ("cwd", "session_store", "memory_file", "recent_user_text", "steer
                "rotate_after_idle_min", "handoff_enabled", "on_resume_fallback", "max_turn_s",
                "write_claude_md", "setting_sources", "env_exempt_dir", "whatsapp_ui_block",
                "never_chat_names", "channel_note", "send_file", "desktop_locks",
-               "desktop_wait_s", "desktop_busy_reason", "confirm_timeout_s")
+               "desktop_wait_s", "desktop_busy_reason", "confirm_timeout_s", "effort")
 
 
 CHAT_SAFETY_ARGS = ("capabilities", "confirm_send_file", "never_chat_names", "unattended")
@@ -166,6 +167,8 @@ def claude_factory(cfg: Any, chat_cfg: Any | None = None) -> BrainFactory:
             kw["on_alive"] = spec.on_alive
         if spec.task_api is not None and "task_api" in params:  # the task tools (voice and chat, never a run)
             kw["task_api"] = spec.task_api
+        if spec.effort:  # a task's own effort (its model is in `brain_cfg` above); unset = Claude Code's default
+            kw["effort"] = spec.effort
         return cb.ClaudeBrain(c, spec.gate, **kw)
 
     return make

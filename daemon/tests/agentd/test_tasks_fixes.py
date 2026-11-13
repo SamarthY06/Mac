@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from agentd_kit import APP_TOKEN, CHAT, CHAT_TOKEN, slow
 from tasks_kit import (
     IN_CHAT,
@@ -22,6 +23,7 @@ from tasks_kit import (
     report,
     settle,
     stop,
+    tasks_json,
     until,
 )
 
@@ -338,3 +340,117 @@ async def test_bound_run_rules_and_not_now_wording(env):
     assert "Put the top items in the message." in prompt and "give its path" not in prompt
     assert "If the owner asked you to stop, finish now with what you have" in tk.NOT_NOW
     assert s.TaskReport(task_id="t", run_id="r", title="x", body="b", status="ok").kind == "task"
+
+
+# ----------------------------------------------------------------------------- model and effort per task
+
+
+async def test_model_and_effort_round_trip_validate_and_old_records_load_empty(env):
+    a, _ = env
+    r = await a.tasks.call(VOICE, "task_create", {"title": "Jobs", "description": "find jobs", "schedule": {"every_min": 15},
+                                                   "model": "Sonnet", "effort": "high"})
+    task = a.tasks.tasks[r["task"]["id"]]
+    assert (r["task"]["model"], r["task"]["effort"]) == ("sonnet", "high") == (task.model, task.effort)
+    await until(lambda: tasks_json(a)["tasks"][task.id]["model"] == "sonnet")
+    assert tk.TaskRecord.from_dict({**tasks_json(a)["tasks"][task.id], "id": task.id}) == task
+    old = {k: v for k, v in task.to_dict().items() if k not in ("model", "effort")}  # a record from before
+    loaded = tk.TaskRecord.from_dict({**old, "id": "told"})
+    assert loaded.model == "" and loaded.effort == ""
+    for args, words in [({"model": "Claude Opus 4"}, "model must be a name"), ({"model": "-x"}, "model must be a name"),
+                        ({"model": "a" * 101}, "model must be a name"), ({"effort": "ultra"}, "effort must be"),
+                        ({"effort": 3}, "effort must be"), ({"model": 1}, "model must be text")]:
+        with pytest.raises(tk.TaskApiError, match=words):
+            await a.tasks.call(VOICE, "task_update", {"task_id": task.id, **args})
+    r = await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "model": "claude-opus-4-1", "effort": ""})
+    assert (r["task"]["model"], r["task"]["effort"]) == ("claude-opus-4-1", "") and task.rev == r["task"]["rev"] >= 2
+    for ok in ("opus[1m]", "us.anthropic.claude-opus-4-1-20250805-v1:0"):  # Claude Code and gateway spellings
+        assert (await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "model": ok}))["task"]["model"] == ok
+
+
+async def test_a_reminder_takes_no_model_and_a_model_change_shrinks_the_assumed_window(env):
+    a, _ = env
+    base = {"title": "Bank", "description": "Call the bank", "kind": "reminder", "schedule": {"every_min": 15}}
+    with pytest.raises(tk.TaskApiError, match="a reminder does not run Claude"):
+        await a.tasks.call(VOICE, "task_create", {**base, "model": "opus"})
+    r = await a.tasks.call(VOICE, "task_create", {**base, "model": "", "effort": ""})
+    with pytest.raises(tk.TaskApiError, match="a reminder does not run Claude"):
+        await a.tasks.call(VOICE, "task_update", {"task_id": r["task"]["id"], "effort": "high"})
+    await a.tasks.call(VOICE, "task_update", {"task_id": r["task"]["id"], "model": "", "title": "Bank call"})  # clearing is fine
+    r = await a.tasks.call(VOICE, "task_create", {"title": "Jobs", "description": "find jobs", "schedule": {"every_min": 15}})
+    task = a.tasks.tasks[r["task"]["id"]]
+    task.context = {"session": "s1", "tokens": 400_000, "window": 1_000_000}
+    await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "effort": "high"})  # same model: the window stands
+    assert task.context["window"] == 1_000_000
+    await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "model": "haiku"})  # measured on the old model
+    assert task.context == {"session": "s1", "tokens": 400_000, "window": tk.MIN_MODEL_WINDOW}
+    assert "model" in tk.ERROR_WORDS and "model" not in tk.RETRY_KINDS  # a missing model is said once, not retried
+
+
+async def test_spec_carries_the_tasks_model_and_effort_and_an_update_applies_at_the_next_run(env):
+    a, clock = env
+    app = await a.client(APP_TOKEN)
+    r = await a.tasks.call(VOICE, "task_create", {"title": "Jobs", "description": "find jobs", "schedule": {"every_min": 15},
+                                                   "model": "haiku", "effort": "low"})
+    task = a.tasks.tasks[r["task"]["id"]]
+    clock.advance(901)
+    await settle(a)
+    await finished(a, task)
+    spec = a.brain(task.conv).spec
+    assert spec.model == "haiku" and spec.effort == "low" and len(a.brains[task.conv]) == 1
+    c = a.svc.convs[task.conv]
+    assert c.brain is not None and c.running() is None
+    n = len(app_notices(app, "tasks_changed"))
+    rev = task.rev
+    await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "model": "opus"})  # applies at the next run
+    assert task.rev == rev + 1
+    await until(lambda: len(app_notices(app, "tasks_changed")) == n + 1)
+    clock.advance(900)
+    await settle(a)
+    await finished(a, task)
+    assert len(a.brains[task.conv]) == 2 and a.brain(task.conv).spec.model == "opus" and a.brain(task.conv).spec.effort == "low"
+    await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "model": "", "effort": ""})  # back to the defaults
+    clock.advance(900)
+    await settle(a)
+    await finished(a, task)
+    assert a.brain(task.conv).spec.model == "" and a.brain(task.conv).spec.effort is None
+    await app.close()
+
+
+async def test_model_change_during_a_run_applies_after_it(env):
+    a, clock = env
+    a.scripts[CHAT] = lambda text: slow("w", n=200, delay=0.01)
+    task = await create(a, IN_CHAT, schedule={"every_min": 15})
+    clock.advance(901)
+    await settle(a)
+    await until(lambda: CHAT in a.brains and a.brain(CHAT).asks)
+    c = a.svc.convs[CHAT]
+    first = c.brain
+    await a.tasks.call(IN_CHAT, "task_update", {"effort": "max"})
+    assert c.brain is first and task.effort == "max"  # no mid-run swap
+    await a.tasks.call(IN_CHAT, "task_stop", {})
+    await finished(a, task)
+    assert c.brain is first
+    cl = await a.client(CHAT_TOKEN, [CHAT])
+    await cl.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "hello"})
+    await cl.event("done")
+    assert c.brain is not first and c.brain.spec.effort == "max"  # the group's brain uses the task's values
+    assert first.closed
+    await cl.close()
+
+
+def test_factory_passes_model_and_effort_only_when_set(monkeypatch):
+    from test_agentic import _spec, _spy_factory
+
+    from agentd import brains
+    from macd import config
+    from macd.brain import claude_brain as cb
+
+    names = sorted({*brains.CLAUDE_ARGS, *brains.CHAT_SAFETY_ARGS, *cb.CHAT_PROFILE, "task_api",
+                    "chat_persona", "display_name", "chat_shared", "on_set_persona", "snapshot"})
+    make, seen = _spy_factory(monkeypatch, names)
+    make(_spec(brains.TASK, never_chat_names=("Timetable",), capabilities=lambda: brains.TASK_CAPS,
+               confirm_send_file=lambda: False, unattended=lambda: True, model="opus", effort="xhigh"))
+    make(_spec(brains.TASK, never_chat_names=("Timetable",), capabilities=lambda: brains.TASK_CAPS,
+               confirm_send_file=lambda: False, unattended=lambda: True))
+    assert seen[0]["_model"] == "opus" and seen[0]["effort"] == "xhigh"  # the model rides in the brain's config
+    assert seen[1]["_model"] == config.Config().brain.model and "effort" not in seen[1]  # defaults: the config decides

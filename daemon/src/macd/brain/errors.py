@@ -27,6 +27,8 @@ MESSAGES = {
     BrainErrorKind.CLI_MISSING: "I can't find Claude Code on this Mac. Please install it, then try again.",
     BrainErrorKind.TIMEOUT: "That was taking too long, so I stopped.",
     BrainErrorKind.INTERNAL: "Something went wrong on my side. Please try again.",
+    BrainErrorKind.MODEL: ("The Claude model set for this is not available. Pick another model, or go back to "
+                           "the default, in Settings."),
 }
 CONNECTION_LOST = "I lost my connection to Claude. Please try again."
 
@@ -153,6 +155,8 @@ def classify_result(result: Any, stderr_tail: str = "") -> ClassifiedError | Non
         return ClassifiedError(BrainErrorKind.RATE_LIMIT, _rate_message(text), text)
     if status in (500, 502, 503, 504, 529):
         return classify_text(f"{text} {status}", BrainErrorKind.NETWORK)
+    if status == 404 and re.search(r"\bmodel\b", text, re.IGNORECASE):  # Claude Code: "issue with the selected model"
+        return ClassifiedError(BrainErrorKind.MODEL, MESSAGES[BrainErrorKind.MODEL], text)
     if getattr(result, "subtype", "") == "error_max_turns":
         return ClassifiedError(BrainErrorKind.INTERNAL,
                                "That needed more steps than I'm allowed, so I stopped.", text)

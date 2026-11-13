@@ -321,7 +321,8 @@ class ClaudeBrain:
                  on_alive: Callable[[bool], None] | None = None,
                  on_set_persona: mac_tools.SettingCallback | None = None,
                  unattended: Callable[[], bool] | None = None,
-                 task_api: TaskApi | None = None) -> None:
+                 task_api: TaskApi | None = None,
+                 effort: str | None = None) -> None:
         self.cfg = cfg
         self.gate = gate
         self.chrome_status_cb = chrome_status_cb
@@ -345,6 +346,7 @@ class ClaudeBrain:
         self._write_claude_md = write_claude_md
         self._sources_arg = setting_sources
         self._channel = channel
+        self._effort = effort or None  # a task's own effort; None leaves Claude Code's default
         self._on_alive = on_alive  # True on every connect, False on every disconnect (idle, crash, close)
         self._channel_note = channel_note
         self._chat_persona = chat_persona  # W9.4: rendered (escaped) by prompts after the safety rules
@@ -478,7 +480,7 @@ class ClaudeBrain:
             wait = int(self._breaker_until - self._clock()) + 1
             last = self._last_error
             kind = last.kind if last else BrainErrorKind.INTERNAL
-            msg = (last.message if last and kind in (BrainErrorKind.AUTH, BrainErrorKind.RATE_LIMIT)
+            msg = (last.message if last and kind in (BrainErrorKind.AUTH, BrainErrorKind.RATE_LIMIT, BrainErrorKind.MODEL)
                    else f"I'm having trouble reaching Claude. I'll try again in about {wait} seconds.")
             self._emit(BrainEventKind.ERROR, turn_id, text=msg, is_error=True, error_kind=kind,
                        data=self._error_data(last, {"circuit_open": True, "retry_in_s": wait}))
@@ -963,6 +965,8 @@ class ClaudeBrain:
             resume=resume,
             model=cfg.model or None,
         )
+        if self._effort:
+            opts.effort = self._effort  # type: ignore[assignment]
         if resume and self._fork_next:
             opts.fork_session = True  # never write into a session Mac did not create
         if cfg.auth == "claude_cli":

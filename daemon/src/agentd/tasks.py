@@ -71,11 +71,16 @@ OPS = frozenset(TASK_OPS)
 MUTATING_OPS = OPS - {"task_list", "task_history"}
 READ_OPS = frozenset({"task_list", "task_history", "task_continue", "task_stop"})  # granted by `limit_conv`
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_MODEL = re.compile(r"^[a-z0-9][a-z0-9._:\[\]\-]{0,99}$")  # "sonnet", "opus[1m]" or a full id; no allowlist
+MIN_MODEL_WINDOW = 200_000  # the smallest context window a model has: assumed until the new model is measured
+EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
+NO_MODEL_FOR_REMINDER = "a reminder does not run Claude, so it has no model or effort."
 _TRAILING_PUNCT = ".!?,;:"
 # the words errors.py uses for the same kinds (UX-11): a notification never shows a code
 ERROR_WORDS = {"network": "Mac could not reach Claude.", "timeout": "it took too long.",
                "internal": "something went wrong on the Mac.", "auth": "Mac is not signed in to Claude.",
-               "cli_missing": "Claude Code is missing on this Mac.", "rate_limit": "the Claude usage limit was hit."}
+               "cli_missing": "Claude Code is missing on this Mac.", "rate_limit": "the Claude usage limit was hit.",
+               "model": "its model is not available. Pick another one in Settings > Tasks."}
 TaskSettings = TasksConfig  # the `[tasks]` keys of config.toml (DESIGN 10)
 
 SUMMARY_PROMPT = ("Before this task continues in a fresh session, write the notes your future self needs: "
@@ -342,6 +347,8 @@ class TaskRecord:
     context: dict[str, Any] | None = None
     limit_conv: str | None = None
     pause_reason: str = ""  # "" | "user" | "chat_off"
+    model: str = ""  # "" = the brain config's model (older records load as "")
+    effort: str = ""  # "" = Claude Code's default effort
     clock_changed: bool = False  # the next run prompt says so
     busy_op: str = ""  # memory only: "deleting"
 
@@ -396,6 +403,22 @@ def _plain(text: Any, limit: int, name: str) -> str:
     if len(out) > limit:
         raise _bad(f"{name} must be at most {limit} characters.")
     return out
+
+
+def _model(v: Any) -> str:
+    if not isinstance(v, str):
+        raise _bad("model must be text.")
+    v = v.strip().lower()
+    if v and not _MODEL.match(v):
+        raise _bad("model must be a name like sonnet, opus or haiku, or a model id made of letters, digits, "
+                   "dots and hyphens.")
+    return v
+
+
+def _effort(v: Any) -> str:
+    if not isinstance(v, str) or v.strip().lower() not in EFFORTS:
+        raise _bad("effort must be low, medium, high, xhigh or max (or empty for the default).")
+    return v.strip().lower()
 
 
 def _command(text: str) -> str:
@@ -1273,6 +1296,10 @@ class TaskManager:
         if kind not in KINDS:
             raise _bad("kind must be task or reminder.")
         schedule = validate_schedule(args.get("schedule"), now)
+        model = _model(args["model"]) if args.get("model") is not None else ""
+        effort = _effort(args["effort"]) if args.get("effort") is not None else ""
+        if kind == "reminder" and (model or effort):
+            raise _bad(NO_MODEL_FOR_REMINDER)
         bound = origin.kind == "chat"
         for t in self.tasks.values():  # I13: the same create over a lossy link is one task (the schedule may
             same_origin = t.created_by == origin.kind and t.bound == bound and (not bound or t.conv == origin.conv)
@@ -1292,7 +1319,7 @@ class TaskManager:
         report_to = origin.conv if bound else (s.VOICE_CONV if origin.kind == "voice" else "app")
         task = TaskRecord(id=tid, title=title, description=description, kind=kind, schedule=schedule, conv=conv,
                           report_to=report_to, bound=bound, created_by=origin.kind, created_at=now, updated_at=now,
-                          anchor=_anchor_for(schedule, now))
+                          anchor=_anchor_for(schedule, now), model=model, effort=effort)
         self.tasks[tid] = task
         self.by_conv[conv] = tid
         self._bump(task)
@@ -1311,11 +1338,20 @@ class TaskManager:
             patch["description"] = _plain(args["description"], DESCRIPTION_MAX_CHARS, "description")
         if args.get("schedule") is not None:
             patch["schedule"] = validate_schedule(args["schedule"], now)
+        if args.get("model") is not None:
+            patch["model"] = _model(args["model"])
+        if args.get("effort") is not None:
+            patch["effort"] = _effort(args["effort"])
+        if task.kind == "reminder" and (patch.get("model") or patch.get("effort")):
+            raise _bad(NO_MODEL_FOR_REMINDER)
         paused = args.get("paused")
         if paused is not None and not isinstance(paused, bool):
             raise _bad("paused must be true or false.")
         if not patch and paused is None:
             raise _bad("Nothing to change.")
+        if patch.get("model", task.model) != task.model and task.context:
+            # the saved window is the old model's: assume the smallest until the next run measures the new one
+            task.context = {**task.context, "window": min(int(task.context.get("window") or 0), MIN_MODEL_WINDOW)}
         for k, v in patch.items():
             setattr(task, k, v)
         if "schedule" in patch:

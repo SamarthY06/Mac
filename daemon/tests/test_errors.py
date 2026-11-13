@@ -78,6 +78,10 @@ def test_classify_result() -> None:
     assert errors.classify_result(FakeResult(api_error_status=529)).kind == K.NETWORK
     assert errors.classify_result(FakeResult(result="Invalid API key")).kind == K.AUTH
     assert errors.classify_result(FakeResult(subtype="error_max_turns")).kind == K.INTERNAL
+    gone = errors.classify_result(FakeResult(api_error_status=404, result=(
+        "There's an issue with the selected model (claude-nope-9). It may not exist or you may not have access to it.")))
+    assert gone.kind == K.MODEL and "model" in gone.message and "claude-nope-9" not in gone.message
+    assert errors.classify_result(FakeResult(api_error_status=404, result="Not found")).kind == K.INTERNAL
 
 
 def test_assistant_error_codes() -> None:

@@ -85,6 +85,8 @@ struct TaskView: Identifiable, Equatable {
     var current: TaskRun?
     var lastRun: TaskLastRun?
     var pauseReason: String
+    var model: String            // "" = default; "sonnet" | "opus" | "haiku" | a full model id
+    var effort: String           // "" = default; low | medium | high | xhigh | max
     var nextRun: Double?
     var scheduleText: String
     var whereText: String
@@ -109,6 +111,8 @@ struct TaskView: Identifiable, Equatable {
         current = (d["current"] as? [String: Any]).flatMap(TaskRun.init)
         lastRun = (d["last_run"] as? [String: Any]).flatMap(TaskLastRun.init)
         pauseReason = d["pause_reason"] as? String ?? ""
+        model = d["model"] as? String ?? ""     // absent on an older backend: default
+        effort = d["effort"] as? String ?? ""
         nextRun = JSONish.double(d["next_run"])
         // Whole days read as days, not minutes ("Every day", "Every 2 days"); everything else is the daemon's text.
         if case .every(let n) = schedule, n % 1440 == 0 {
@@ -439,21 +443,29 @@ final class TasksClient: ObservableObject {
         if !sent { done(.failure(.notConnected)) }
     }
 
-    func create(title: String, description: String, kind: String = "task", schedule: TaskSchedule, done: @escaping Done) {
-        call("task_create", ["title": title, "description": description, "kind": kind, "schedule": schedule.json]) { [weak self] r in
+    /// `model` / `effort` are sent only when set ("" = the default, which a create leaves out).
+    func create(title: String, description: String, kind: String = "task", schedule: TaskSchedule,
+                model: String = "", effort: String = "", done: @escaping Done) {
+        var args: [String: Any] = ["title": title, "description": description, "kind": kind, "schedule": schedule.json]
+        if !model.isEmpty { args["model"] = model }
+        if !effort.isEmpty { args["effort"] = effort }
+        call("task_create", args) { [weak self] r in
             if case .success(let d) = r { self?.apply(task: d) }
             done(r)
         }
     }
 
-    /// `task_update`: only the given fields; `rev` guards against edits made elsewhere.
+    /// `task_update`: only the given fields; `rev` guards against edits made elsewhere. An empty
+    /// `model` / `effort` clears that setting back to the default.
     func update(_ task: TaskView, title: String? = nil, description: String? = nil, schedule: TaskSchedule? = nil,
-                paused: Bool? = nil, done: @escaping Done) {
+                paused: Bool? = nil, model: String? = nil, effort: String? = nil, done: @escaping Done) {
         var args: [String: Any] = ["task_id": task.id, "rev": task.rev]
         if let title { args["title"] = title }
         if let description { args["description"] = description }
         if let schedule { args["schedule"] = schedule.json }
         if let paused { args["paused"] = paused }
+        if let model { args["model"] = model }
+        if let effort { args["effort"] = effort }
         call("task_update", args) { [weak self] r in
             if case .success(let d) = r { self?.apply(task: d) }
             done(r)

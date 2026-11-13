@@ -637,3 +637,35 @@ def test_task_prompt_lines_follow_the_tools(tmp_path: Path) -> None:
         assert "\u2014" not in text and "\u2013" not in text
     brain = cb.ClaudeBrain(cfg, ConfirmationGate(), cwd=tmp_path / "t", **{**cb.TASK_PROFILE, "capabilities": frozenset()})
     assert "scheduled run" in brain.build_options(None).system_prompt["append"]
+
+
+async def test_task_model_and_effort_are_validated_cleared_and_listed() -> None:
+    api = FakeTaskApi(task_create={"task": {**TASK, "model": "opus", "effort": "high"}},
+                      task_update={"task": TASK},
+                      task_list={"now": 1_900_000_000.0, "tz": "GMT", "tasks": [{**TASK, "model": "opus", "effort": "high"}, TASK]})
+    said = ["every weekday at 8 find jobs, use opus with high effort", "switch the job search back to the default model"]
+    tools = _tools(api, said=said)
+    base = {"title": "Job search", "description": "Find jobs.", "schedule": {"at": ["08:00"]},
+            "owner_words": "every weekday at 8 find jobs, use opus with high effort"}
+    res = await tools.task_create({**base, "model": " opus ", "effort": "high"})  # trimmed; agentd validates
+    assert not res.get("is_error") and api.calls[-1][1]["model"] == "opus" and api.calls[-1][1]["effort"] == "high"
+    assert "Model: opus, effort: high." in text_of(res)
+    res = await tools.task_create({**base, "model": "", "effort": " "})  # empty on a create: nothing sent
+    assert not res.get("is_error") and "model" not in api.calls[-1][1] and "effort" not in api.calls[-1][1]
+    res = await tools.task_create(base)  # unset: nothing sent
+    assert not res.get("is_error") and "model" not in api.calls[-1][1] and "effort" not in api.calls[-1][1]
+    # update: "" clears back to the default; unset leaves it alone
+    words = {"owner_words": "switch the job search back to the default model"}
+    res = await tools.task_update({"task_id": "t3f9a2c", "model": "", "effort": "", **words})
+    assert not res.get("is_error") and api.calls[-1][1] == {"task_id": "t3f9a2c", "model": "", "effort": ""}
+    res = await tools.task_update({"task_id": "t3f9a2c", "effort": "max", **words})
+    assert not res.get("is_error") and api.calls[-1][1] == {"task_id": "t3f9a2c", "effort": "max"}
+    listed = text_of(await _tools(api).task_list({})).split("\n")
+    assert "Model: opus, effort: high." in listed and listed.count("Model: opus, effort: high.") == 1
+    assert not any(line.startswith(("Model:", "Effort:")) for line in listed[-2:])  # the plain task shows nothing
+    spec = {t.name: t for t in _tools(api).tools()}
+    for name in ("task_create", "task_update"):
+        assert "model" in spec[name].input_schema["properties"] and "unless the owner asked" in spec[name].description
+    assert "" in spec["task_update"].input_schema["properties"]["effort"]["enum"]
+    voice = prompts.persona_prompt(config.Config(), tools=TASK_NAMES)
+    assert "model (sonnet, opus, haiku) and effort" in voice

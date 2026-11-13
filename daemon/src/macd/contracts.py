@@ -143,6 +143,7 @@ class BrainErrorKind(str, enum.Enum):
     CLI_MISSING = "cli_missing"
     TIMEOUT = "timeout"
     INTERNAL = "internal"
+    MODEL = "model"  # the configured model does not exist or is not available to this login
 
 
 @dataclass

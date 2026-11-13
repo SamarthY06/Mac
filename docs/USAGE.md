@@ -165,6 +165,10 @@ Rules worth knowing:
 - Settings > Tasks shows every task with its schedule, next and last run and history, and lets
   you run, pause, edit, continue, stop or delete it. "What tasks do I have?" and "pause the
   8 am one" work too.
+- A task can run on its own model and effort: pick them in the task's editor in Settings >
+  Tasks, or say "run the job scan on Opus at high effort". Model is Sonnet, Opus, Haiku or a
+  full model id; effort is low, medium, high, xhigh or max. Left alone, a task uses your
+  default model and Claude Code's default effort. A change applies from the next run.
 
 Tasks live in `~/.mac-agent/agent/state/tasks.json`, with each task's run history and notes
 under `~/.mac-agent/agent/tasks/`.

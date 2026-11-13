@@ -179,7 +179,9 @@ _TASK_LINES = {
         'pick the right day and AM or PM. Use kind "reminder" when they only want to be reminded; its '
         "description is shown word for word at that time, so write it as the message they will read. "
         "Quote their words in owner_words. Then confirm in one short line: the schedule in plain words, "
-        "when the first run is (today, tomorrow, Monday), and where the result goes."),
+        "when the first run is (today, tomorrow, Monday), and where the result goes. The user can set a "
+        "task's model (sonnet, opus, haiku) and effort (low to max) by name, at creation or later with "
+        "mcp__mac__task_update; never set them on your own."),
     "task_list": (
         "- Asked about, or to change, pause, run, continue, stop or delete a task: call "
         'mcp__mac__task_list first if you need the id, then the matching task tool. "What did it '

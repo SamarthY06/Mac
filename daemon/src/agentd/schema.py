@@ -82,6 +82,7 @@ class EventErrorKind(str, enum.Enum):
     CLI_MISSING = "cli_missing"
     TIMEOUT = "timeout"
     INTERNAL = "internal"
+    MODEL = "model"
     PAUSED = "paused"
 
 
@@ -590,6 +591,8 @@ class TaskCreate(Op):
     description: str
     schedule: dict[str, Any]
     kind: Literal["task", "reminder"] | None = None
+    model: str | None = None  # "" or unset = the default model
+    effort: str | None = None  # "" or unset = the default effort; else low | medium | high | xhigh | max
 
 
 @dataclass(kw_only=True)
@@ -601,6 +604,8 @@ class TaskUpdate(Op):
     description: str | None = None
     schedule: dict[str, Any] | None = None
     paused: bool | None = None
+    model: str | None = None  # "" clears to the default
+    effort: str | None = None
 
 
 @dataclass(kw_only=True)

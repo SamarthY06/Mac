@@ -328,11 +328,13 @@ class Conversation:
         task = self.kind == "task"
         prof = None if self.voice or task else svc.profile_of(self.conv)
         caps = pf.granted(prof)
+        own = svc.tasks.tasks.get(svc.tasks.by_conv.get(self.conv, ""))  # the task this conv runs, if any
+        model = own.model if own is not None and own.model else (vs.model if self.voice or task else "")
         spec = BrainSpec(
             conv=self.conv, profile=self.profile, cwd=cwd, setting_sources=list(sources), gate=self.gate,
             session_store=RecordSessionStore(self._session_get, self._session_put),
             memory_file=self.svc.memory_file, desktop=self.desktop, recent_user_text=lambda: list(self.recent),
-            model=vs.model if self.voice or task else "",
+            model=model, effort=(own.effort or None) if own is not None else None,
             chrome=vs.chrome if self.voice else (True if task else "chrome" in caps),
             name=vs.name, language=vs.language, on_alive=self._on_alive,
             never_chat_names=() if self.voice else svc.never.names,

@@ -273,8 +273,14 @@ struct TaskRow: View {
 
     private var isReminder: Bool { task.kind == "reminder" }
 
+    /// "Model: Opus · Effort: High" when either is set; nothing when both are the default.
+    private var modelText: String {
+        [task.model.isEmpty ? "" : "Model: \(TaskModel.label(task.model))",
+         task.effort.isEmpty ? "" : "Effort: \(TaskEffort.label(task.effort))"].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
     private var line2: String {
-        [isReminder ? "Reminder" : "", task.scheduleText, task.whereText].filter { !$0.isEmpty }.joined(separator: " · ")
+        [isReminder ? "Reminder" : "", task.scheduleText, modelText, task.whereText].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
     private var nextText: String {
@@ -535,6 +541,55 @@ struct TaskHistoryView: View {
     }
 }
 
+// MARK: - Model and effort (owner requirement; "" = default on the wire)
+
+enum TaskModel: String, CaseIterable, Identifiable {
+    case `default` = "", sonnet, opus, haiku, custom
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .default: return "Default"
+        case .sonnet: return "Sonnet"
+        case .opus: return "Opus"
+        case .haiku: return "Haiku"
+        case .custom: return "Custom"
+        }
+    }
+
+    /// The picker choice for a wire value: a known name, "" or anything else (a full model id).
+    static func choice(for wire: String) -> TaskModel {
+        TaskModel(rawValue: wire).flatMap { $0 == .custom ? nil : $0 } ?? (wire.isEmpty ? .default : .custom)
+    }
+
+    /// Row text: "Opus" for a known name, the id as typed otherwise.
+    static func label(_ wire: String) -> String {
+        let c = choice(for: wire)
+        return c == .custom ? wire : c.title
+    }
+
+    /// A custom id, as agentd accepts it (`_MODEL` in tasks.py): "claude-opus-4-1", "opus[1m]", a gateway id.
+    static func isValidId(_ s: String) -> Bool {
+        s.range(of: "^[a-z0-9][a-z0-9._:\\[\\]\\-]{0,99}$", options: .regularExpression) != nil
+    }
+}
+
+enum TaskEffort: String, CaseIterable, Identifiable {
+    case `default` = "", low, medium, high, xhigh, max
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .default: return "Default"
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        case .xhigh: return "Extra high"
+        case .max: return "Max"
+        }
+    }
+
+    static func label(_ wire: String) -> String { TaskEffort(rawValue: wire)?.title ?? wire }
+}
+
 // MARK: - Edit sheet
 
 /// The form's working copy. Each segment keeps its own values, so switching segments loses nothing.
@@ -562,6 +617,9 @@ struct TaskDraft: Equatable {
     var days: Set<String> = TaskDraft.weekdays
     var times: [Date]
     var everyMin = 30
+    var modelChoice: TaskModel = .default
+    var customModel = ""
+    var effort: TaskEffort = .default
 
     init(from task: TaskView?) {
         let cal = Calendar.current
@@ -572,6 +630,9 @@ struct TaskDraft: Equatable {
         guard let task else { return }
         title = task.title
         description = task.description
+        modelChoice = TaskModel.choice(for: task.model)
+        if modelChoice == .custom { customModel = task.model }
+        effort = TaskEffort(rawValue: task.effort) ?? .default
         switch task.schedule {
         case .once(let s):
             mode = .once
@@ -641,8 +702,23 @@ struct TaskDraft: Equatable {
         return nil
     }
 
+    var trimmedCustomModel: String { customModel.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// The wire value: "" for the default, the known name, or the custom id.
+    var modelWire: String { modelChoice == .custom ? trimmedCustomModel : modelChoice.rawValue }
+
+    var modelProblem: String? {
+        guard modelChoice == .custom else { return nil }
+        if trimmedCustomModel.isEmpty { return "Type a model id, or pick one from the list." }
+        if !TaskModel.isValidId(trimmedCustomModel) {
+            return "A model id uses lower-case letters, digits, dots and hyphens, with no spaces."
+        }
+        return nil
+    }
+
     var isValid: Bool {
         (1...60).contains(trimmedTitle.count) && (1...4000).contains(trimmedDescription.count) && schedule != nil
+            && modelProblem == nil
     }
 }
 
@@ -763,6 +839,38 @@ struct TaskEditSheet: View {
                         .accessibilityLabel("Where: \(whereText). Fixed when the task is created.")
                 }
             }
+
+            if base?.kind != "reminder" {   // a reminder shows its text; it never runs Claude
+                SectionTitle(text: "Claude")
+                Card {
+                    formRow("Model") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Picker("Model", selection: $draft.modelChoice) {
+                                ForEach(TaskModel.allCases) { m in Text(m.title).tag(m) }
+                            }
+                            .labelsHidden().frame(width: 160)
+                            .accessibilityLabel("Model")
+                            if draft.modelChoice == .custom {
+                                TextField("claude-opus-4-1", text: $draft.customModel)
+                                    .textFieldStyle(.roundedBorder).frame(width: 260)
+                                    .accessibilityLabel("Custom model id")
+                                if let p = draft.modelProblem {
+                                    Label(p, systemImage: "exclamationmark.circle.fill").font(.system(size: 11)).foregroundStyle(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                    }
+                    RowDivider()
+                    formRow("Effort") {
+                        Picker("Effort", selection: $draft.effort) {
+                            ForEach(TaskEffort.allCases) { e in Text(e.title).tag(e) }
+                        }
+                        .labelsHidden().frame(width: 160)
+                        .accessibilityLabel("Effort")
+                    }
+                }
+            }
         }
     }
 
@@ -872,10 +980,13 @@ struct TaskEditSheet: View {
             let newTitle = title == t.title ? nil : title
             let newDesc = description == t.description ? nil : description
             let newSched = schedule == t.schedule ? nil : schedule
-            if newTitle == nil, newDesc == nil, newSched == nil { saving = false; dismiss(); return }
-            client.update(t, title: newTitle, description: newDesc, schedule: newSched, done: done)
+            let newModel = draft.modelWire == t.model ? nil : draft.modelWire       // "" clears to the default
+            let newEffort = draft.effort.rawValue == t.effort ? nil : draft.effort.rawValue
+            if newTitle == nil, newDesc == nil, newSched == nil, newModel == nil, newEffort == nil { saving = false; dismiss(); return }
+            client.update(t, title: newTitle, description: newDesc, schedule: newSched, model: newModel, effort: newEffort, done: done)
         } else {
-            client.create(title: title, description: description, schedule: schedule, done: done)
+            client.create(title: title, description: description, schedule: schedule,
+                          model: draft.modelWire, effort: draft.effort.rawValue, done: done)
         }
     }
 }

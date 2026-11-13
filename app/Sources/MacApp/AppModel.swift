@@ -76,7 +76,7 @@ final class AppModel: ObservableObject {
     @Published var assistantText = ""
     @Published var activity = ""
     @Published var errorText = ""
-    @Published var errorKind = ""   // auth | rate_limit | network | cli_missing | timeout | internal
+    @Published var errorKind = ""   // auth | rate_limit | network | cli_missing | timeout | internal | model
     @Published var userFromPhone = false   // the current user line came from the phone (N7 mirror)
     @Published var lastTranscript = ""
     @Published var lastReply = ""
@@ -220,6 +220,7 @@ final class AppModel: ObservableObject {
         case "network": return "Check your internet connection and try again."
         case "cli_missing": return "Install Claude Code (claude.com/claude-code), then Troubleshoot ▸ Restart Engine."
         case "timeout": return "Try a smaller request."
+        case "model": return "Pick another model, or the default, in Settings."
         default: return "Try again. If it keeps happening, choose Open Logs."
         }
     }

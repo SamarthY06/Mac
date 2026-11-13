@@ -1386,3 +1386,18 @@ async def test_done_has_no_context_size_without_usage(make_brain) -> None:
     await brain.close()
     assert "context_tokens" not in done.data and "context_window" not in done.data
     assert cb._context_data({"input_tokens": 5}, None) == {"context_tokens": 5, "context_window": cb.DEFAULT_CONTEXT_WINDOW}
+
+
+async def test_effort_reaches_the_sdk_options(make_brain) -> None:
+    brain = make_brain(simple("ok"), effort="high")
+    await brain.start()
+    await brain.ask(1, "x")
+    await collect(brain)
+    await brain.close()
+    assert MockClient.instances[0].options.effort == "high"
+    plain = make_brain(simple("ok"), effort="")  # unset changes nothing: the SDK default effort
+    await plain.start()
+    await plain.ask(1, "x")
+    await collect(plain)
+    await plain.close()
+    assert MockClient.instances[1].options.effort is None
