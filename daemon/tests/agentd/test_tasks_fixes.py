@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 from agentd_kit import APP_TOKEN, CHAT, CHAT_TOKEN, slow
@@ -342,6 +343,40 @@ async def test_bound_run_rules_and_not_now_wording(env):
     assert s.TaskReport(task_id="t", run_id="r", title="x", body="b", status="ok").kind == "task"
 
 
+async def test_a_run_holds_the_keep_awake_process_and_lets_go_of_it(env, tmp_path):
+    a, clock = env
+    mark = tmp_path / "awake"
+    a.tasks.awake_argv = ("/bin/sh", "-c", f"echo $$ > {mark}; exec sleep 60")
+    a.scripts["*"] = lambda text: slow("w", n=40, delay=0.01)
+    task = await create(a, schedule={"every_min": 15})
+    clock.advance(901)
+    await settle(a)
+    await until(lambda: mark.exists() and mark.read_text().strip())  # held while the run is going
+    assert task.state == "running"
+    await finished(a, task)
+
+    def gone() -> bool:
+        try:
+            os.kill(int(mark.read_text()), 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    await until(gone)  # and let go of when it ends
+    mark.unlink()
+    clock.advance(900)
+    await settle(a)
+    await until(lambda: mark.exists() and mark.read_text().strip())
+    await a.tasks.call(VOICE, "task_delete", {"task_id": task.id})
+    await until(gone)  # a run cut by a delete lets go of it too
+    task = await create(a, schedule={"every_min": 15})
+    a.tasks.awake_argv = ("/nonexistent/caffeinate",)  # no such tool: the run goes on without it
+    clock.advance(901)
+    await settle(a)
+    await finished(a, task)
+    assert task.runs == 1 and task.last_run and task.last_run["status"] == "ok"
+
+
 # ----------------------------------------------------------------------------- model and effort per task
 
 
@@ -420,7 +455,7 @@ async def test_spec_carries_the_tasks_model_and_effort_and_an_update_applies_at_
     await app.close()
 
 
-async def test_deleting_a_group_task_with_a_model_gives_the_group_a_new_session(env):
+async def test_deleting_a_group_task_with_a_model_gives_the_group_a_new_session(env, monkeypatch):
     a, clock = env
     task = await create(a, IN_CHAT, schedule={"every_min": 15})
     await a.tasks.call(IN_CHAT, "task_update", {"model": "haiku"})
@@ -429,8 +464,40 @@ async def test_deleting_a_group_task_with_a_model_gives_the_group_a_new_session(
     await finished(a, task)
     r = a.svc.convs[CHAT].record
     assert r.session_id and not r.fresh_next
+    folder = a.paths.home / "Projects" / "site"
+    folder.mkdir(parents=True)
+    r.folder = str(folder)  # the folder the group was working in
     await a.tasks.call(IN_CHAT, "task_delete", {})
     assert r.fresh_next  # the session would resume on haiku: the group's next turn starts a new one
+    c, entered = a.svc.convs[CHAT], []
+    enter = c._enter
+
+    async def spy(t, folder, session):
+        entered.append((folder, session))
+        await enter(t, folder, session)
+
+    monkeypatch.setattr(c, "_enter", spy)
+    cl = await a.client(CHAT_TOKEN, [CHAT])
+    await cl.call({"op": "ask", "conv": CHAT, "turn": 1, "text": "hello"})
+    await cl.event("done")
+    assert entered == [(folder, "new")] and not r.fresh_next and not a.model.calls  # same folder, nothing asked
+    await cl.close()
+
+
+async def test_going_back_to_the_default_model_during_a_sessions_first_turn_still_starts_a_new_one(env):
+    a, clock = env
+    a.scripts[CHAT] = lambda text: slow("w", n=200, delay=0.01)
+    task = await create(a, IN_CHAT, schedule={"every_min": 15})
+    await a.tasks.call(IN_CHAT, "task_update", {"model": "haiku"})
+    clock.advance(901)
+    await settle(a)
+    await until(lambda: CHAT in a.brains and a.brain(CHAT).asks)
+    r = a.svc.convs[CHAT].record
+    assert not r.session_id  # the id is written at the result
+    await a.tasks.call(IN_CHAT, "task_update", {"model": ""})
+    assert r.fresh_next
+    await a.tasks.call(IN_CHAT, "task_stop", {})
+    await finished(a, task)
 
 
 async def test_model_change_during_a_run_applies_after_it(env):

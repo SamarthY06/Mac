@@ -169,6 +169,8 @@ Rules worth knowing:
   Tasks, or say "run the job scan on Opus at high effort". Model is Sonnet, Opus, Haiku or a
   full model id; effort is low, medium, high, xhigh or max. Left alone, a task uses your
   default model and Claude Code's default effort. A change applies from the next run.
+- A run keeps the Mac awake while it is plugged in. On battery a sleeping Mac is left asleep:
+  the run starts or carries on when the Mac wakes (up to six hours late, then it is skipped).
 
 Tasks live in `~/.mac-agent/agent/state/tasks.json`, with each task's run history and notes
 under `~/.mac-agent/agent/tasks/`.

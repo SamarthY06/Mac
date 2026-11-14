@@ -1589,13 +1589,15 @@ class ClaudeBrain:
     def _on_assistant(self, a: _Turn, msg: AssistantMessage) -> None:
         if msg.parent_tool_use_id:
             return  # sub-agent internals are not spoken
-        if msg.error:
-            a.assistant_error = str(msg.error)
+        # only an error the turn ends on fails it: Claude Code retries past the others (a sleep mid-response)
+        a.assistant_error = str(msg.error) if msg.error else None
         if isinstance(msg.usage, dict):
             a.usage = msg.usage  # the last main-thread message is the context size (D5)
         streamed = a.saw_delta
         for block in msg.content:
             if isinstance(block, TextBlock):
+                if msg.error:
+                    continue  # Claude Code's own "API Error: ..." line is never part of an answer or the notes
                 if a.summary:
                     a.texts.append(block.text)  # the notes; never emitted (negative turn id)
                 elif not streamed and block.text:

@@ -512,6 +512,14 @@ def test_task_tools_and_skill_need_no_capability() -> None:
     assert analyze("Skill", {"skill": "x", "args": "post to Timetable"}, ctx(ALL)).code == "never_chat"
 
 
+def test_a_sub_agent_can_hand_its_result_back_in_an_unattended_run() -> None:
+    # Claude Code's sub-agents return through this tool: unmapped, a scheduled run refused every hand-back
+    run = ctx(ALL - {"outward_sends"}, unattended=lambda: True)
+    assert map_rows("SubagentHandback") == [""]
+    assert analyze("SubagentHandback", {"message": "Output written: /tmp/x.json. Two roles listed."}, run).verdict == "allow"
+    assert analyze("SendMessage", {"to": "x", "message": "hi"}, run).code == "capability:outward_sends"  # still unmapped
+
+
 def _unattended_hook(c: GateContext, confirm_outward: bool) -> PreToolHook:
     return PreToolHook(ConfirmationGate(), lambda: 7, lambda t: False, lambda tool, args: (False, "no"),
                        context=c, confirm_outward=lambda: confirm_outward)

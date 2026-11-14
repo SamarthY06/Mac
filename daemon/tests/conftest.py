@@ -38,3 +38,11 @@ def _isolated_mac_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("MAC_HOME", str(home))
     monkeypatch.setenv("MAC_LOG_DIR", str(logs))
     return home
+
+
+@pytest.fixture(autouse=True)
+def _no_keep_awake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test holds the developer's Mac awake: a scheduled run starts no caffeinate."""
+    from agentd import tasks
+
+    monkeypatch.setattr(tasks, "KEEP_AWAKE_ARGV", ())

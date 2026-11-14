@@ -20,7 +20,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Awaitable
+from collections.abc import AsyncIterator, Awaitable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -47,6 +47,8 @@ NOTES_MIN_CHARS = 10  # against an empty or "OK" answer only; short honest notes
 REPORT_MAX_CHARS = 8000
 MAX_TASKS = 50
 RETRY_DELAY_S = 120.0
+# held under a run: no system sleep while the Mac is plugged in (-s is void on battery); gone with agentd (-w)
+KEEP_AWAKE_ARGV = ("/usr/bin/caffeinate", "-s", "-w", str(os.getpid()))
 RESUME_WINDOW_S = 6 * 3600.0  # a run cut by a restart this recently is resumed
 CREATE_DEDUP_S = 120.0  # the same create from the same origin within this window is one task (I13)
 DELETE_WAIT_S = 15.0
@@ -556,6 +558,7 @@ class TaskManager:
         self._finalizing: set[str] = set()
         self._started = False
         self.osascript: Any = self._osascript  # tests patch it
+        self.awake_argv: tuple[str, ...] = KEEP_AWAKE_ARGV  # tests patch it
 
     @property
     def catch_up_s(self) -> float:
@@ -950,19 +953,20 @@ class TaskManager:
             if task.kind == "reminder":
                 t.canned = text
             run.started_at, run.turn_uid = svc.clock(), t.uid
-            await self._save()  # the uid is on disk before the turn is (S4: a cut run is matched and resumed)
-            if not self._live(task):
-                return  # a delete landed during the save: the turn never starts (S1)
-            if c.running() is not None:  # an ask won the conversation during the save: same as F1
-                run.status, task.state, run.turn_uid = "queued", "queued", ""
-                self._bump(task)
-                self.save_soon()
-                return
-            await svc._start_turn(c, t, None)  # the prompt is built in prepare_turn, after any summary
-            try:
-                await asyncio.wait_for(t.done.wait(), RUN_MAX_TURN_S + RUN_WAIT_EXTRA_S)
-            except TimeoutError:
-                await c.finish(t, error=True, error_kind="timeout")
+            async with self._awake():  # entered before the last checks: no await between them and the start
+                await self._save()  # the uid is on disk before the turn is (S4: a cut run is matched and resumed)
+                if not self._live(task):
+                    return  # a delete landed during the save: the turn never starts (S1)
+                if c.running() is not None:  # an ask won the conversation during the save: same as F1
+                    run.status, task.state, run.turn_uid = "queued", "queued", ""
+                    self._bump(task)
+                    self.save_soon()
+                    return
+                await svc._start_turn(c, t, None)  # the prompt is built in prepare_turn, after any summary
+                try:
+                    await asyncio.wait_for(t.done.wait(), RUN_MAX_TURN_S + RUN_WAIT_EXTRA_S)
+                except TimeoutError:
+                    await c.finish(t, error=True, error_kind="timeout")
             await self._finalize(task, run, t.outcome or "error", "".join(t.answer), t.error_kind, torn=t.torn)
         except asyncio.CancelledError:
             raise  # shutdown or delete: the record keeps `running`; recovery decides next boot
@@ -970,6 +974,24 @@ class TaskManager:
             log.exception("tasks: run failed for %s", task.id)
             with contextlib.suppress(Exception):
                 await self._finalize(task, run, "error", "", "internal")
+
+    @contextlib.asynccontextmanager
+    async def _awake(self) -> AsyncIterator[None]:
+        """A run keeps a plugged-in Mac awake: a sleep mid-response stops the run for as long as
+        the Mac sleeps. On battery nothing is held, so a Mac asleep in a bag stays asleep and the
+        run carries on when it wakes."""
+        proc = None
+        if self.awake_argv:
+            with contextlib.suppress(OSError):  # no caffeinate: the run goes on without it
+                proc = await asyncio.create_subprocess_exec(*self.awake_argv, stdin=asyncio.subprocess.DEVNULL,
+                                                            stdout=asyncio.subprocess.DEVNULL,
+                                                            stderr=asyncio.subprocess.DEVNULL)
+        try:
+            yield
+        finally:
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
 
     def _reminder_text(self, task: TaskRecord, run: RunRecord) -> str:
         if run.note == "missed" and run.slot is not None:
@@ -1373,13 +1395,16 @@ class TaskManager:
         self.kick()
         return {"task": self.view(task), **self._clock_data(now)}
 
-    def _fresh_for_default_model(self, task: TaskRecord) -> None:
+    def _fresh_for_default_model(self, task: TaskRecord, *, deleted: bool = False) -> None:
         """Claude Code resumes a session on the model it last used, so going back to the default
         model needs a new session: the conversation's next turn starts one (a task's own turn
-        summarises the old one into the notes first, 6.4)."""
+        summarises the old one into the notes first, 6.4). A group whose task was deleted gets
+        a new chat in the folder it is in."""
         c = self.svc.convs.get(task.conv)
-        if c is not None and c.record.session_id:
+        if c is not None and (c.record.session_id or c.running() is not None):  # a first turn in flight has no id yet
             c.record.fresh_next = True
+            if deleted:
+                c.record.fresh_folder = c.record.folder  # a path: found without a question or a model call
             self.svc.save_soon()
 
     async def _op_delete(self, origin: Origin, args: dict[str, Any]) -> dict[str, Any]:
@@ -1422,7 +1447,7 @@ class TaskManager:
             await self._save()
             self._bump(task, deleted=True)
             if task.bound and task.model:
-                self._fresh_for_default_model(task)  # the group goes back to its own model
+                self._fresh_for_default_model(task, deleted=True)  # the group goes back to its own model
             if not task.bound:
                 c = svc.convs.pop(task.conv, None)
                 if c is not None:

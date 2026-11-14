@@ -364,6 +364,24 @@ async def test_result_error_maps_to_error_event(make_brain) -> None:
     assert K.DONE not in [e.kind for e in evs]
 
 
+async def test_an_error_claude_code_recovered_from_does_not_fail_the_turn(make_brain) -> None:
+    slept = AssistantMessage(content=[TextBlock("API Error: Your computer went to sleep mid-response.")],
+                             model="<synthetic>", error="server_error")
+    brain = make_brain(lambda c, p: c.push(slept, assistant(TextBlock("Two roles found.")), result()))
+    await brain.start()
+    await brain.ask(1, "x")
+    evs = await collect(brain)
+    assert evs[-1].kind == K.DONE  # the answer came after it: the run is not a failure
+    assert [e.text for e in evs if e.kind == K.TEXT] == ["Two roles found."]  # and Claude Code's error line is not in it
+    await brain.close()
+    brain = make_brain(lambda c, p: c.push(assistant(TextBlock("Looking.")), slept, result()))
+    await brain.start()
+    await brain.ask(1, "x")
+    err = (await collect(brain))[-1]  # the turn ended on the error: still one
+    assert err.kind == K.ERROR and err.error_kind == BrainErrorKind.NETWORK
+    await brain.close()
+
+
 async def test_cli_crash_emits_error_and_reconnects(make_brain) -> None:
     calls = {"n": 0}
 

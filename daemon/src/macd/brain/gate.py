@@ -1493,6 +1493,7 @@ TOOL_MAP: dict[str, tuple[str, ...]] = {
          "mcp__mac__switch_workspace", "mcp__mac__set_persona", "TodoWrite", "Task", "Agent",
          "ToolSearch",  # ToolSearch only loads deferred tools; each one is gated when called
          "Skill",  # a skill only reaches other tools, each gated by its own row (tasks D8)
+         "SubagentHandback",  # a sub-agent handing its result to its parent: nothing leaves the session
          # task tools talk to agentd's task table; grounding in the user's words is their rule (9.2)
          "mcp__mac__task_create", "mcp__mac__task_list", "mcp__mac__task_update", "mcp__mac__task_delete",
          "mcp__mac__task_run_now", "mcp__mac__task_continue", "mcp__mac__task_stop", "mcp__mac__task_history"),
