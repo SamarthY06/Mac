@@ -1349,9 +1349,11 @@ class TaskManager:
             raise _bad("paused must be true or false.")
         if not patch and paused is None:
             raise _bad("Nothing to change.")
-        if patch.get("model", task.model) != task.model and task.context:
-            # the saved window is the old model's: assume the smallest until the next run measures the new one
-            task.context = {**task.context, "window": min(int(task.context.get("window") or 0), MIN_MODEL_WINDOW)}
+        if patch.get("model", task.model) != task.model:
+            if task.context:  # the saved window is the old model's: assume the smallest until the new one is measured
+                task.context = {**task.context, "window": min(int(task.context.get("window") or 0), MIN_MODEL_WINDOW)}
+            if not patch["model"]:
+                self._fresh_for_default_model(task)
         for k, v in patch.items():
             setattr(task, k, v)
         if "schedule" in patch:
@@ -1370,6 +1372,15 @@ class TaskManager:
         await self._save()
         self.kick()
         return {"task": self.view(task), **self._clock_data(now)}
+
+    def _fresh_for_default_model(self, task: TaskRecord) -> None:
+        """Claude Code resumes a session on the model it last used, so going back to the default
+        model needs a new session: the conversation's next turn starts one (a task's own turn
+        summarises the old one into the notes first, 6.4)."""
+        c = self.svc.convs.get(task.conv)
+        if c is not None and c.record.session_id:
+            c.record.fresh_next = True
+            self.svc.save_soon()
 
     async def _op_delete(self, origin: Origin, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1410,6 +1421,8 @@ class TaskManager:
                 self.by_conv.pop(task.conv, None)
             await self._save()
             self._bump(task, deleted=True)
+            if task.bound and task.model:
+                self._fresh_for_default_model(task)  # the group goes back to its own model
             if not task.bound:
                 c = svc.convs.pop(task.conv, None)
                 if c is not None:

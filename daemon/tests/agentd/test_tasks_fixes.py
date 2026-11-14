@@ -408,12 +408,29 @@ async def test_spec_carries_the_tasks_model_and_effort_and_an_update_applies_at_
     await settle(a)
     await finished(a, task)
     assert len(a.brains[task.conv]) == 2 and a.brain(task.conv).spec.model == "opus" and a.brain(task.conv).spec.effort == "low"
+    assert c.record.session_id and not c.record.fresh_next  # opus was named: the same session resumes on it
     await a.tasks.call(VOICE, "task_update", {"task_id": task.id, "model": "", "effort": ""})  # back to the defaults
+    assert c.record.fresh_next  # a resumed session keeps its last model: the default needs a new one
     clock.advance(900)
     await settle(a)
     await finished(a, task)
     assert a.brain(task.conv).spec.model == "" and a.brain(task.conv).spec.effort is None
+    b = a.brain(task.conv)  # the new brain summarised the old session into the notes, then started fresh
+    assert not c.record.fresh_next and b.summaries == [tk.SUMMARY_PROMPT] and b.resets == 1
     await app.close()
+
+
+async def test_deleting_a_group_task_with_a_model_gives_the_group_a_new_session(env):
+    a, clock = env
+    task = await create(a, IN_CHAT, schedule={"every_min": 15})
+    await a.tasks.call(IN_CHAT, "task_update", {"model": "haiku"})
+    clock.advance(901)
+    await settle(a)
+    await finished(a, task)
+    r = a.svc.convs[CHAT].record
+    assert r.session_id and not r.fresh_next
+    await a.tasks.call(IN_CHAT, "task_delete", {})
+    assert r.fresh_next  # the session would resume on haiku: the group's next turn starts a new one
 
 
 async def test_model_change_during_a_run_applies_after_it(env):
